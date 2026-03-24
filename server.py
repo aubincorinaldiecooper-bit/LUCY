@@ -13,7 +13,9 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
-from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.services.openai.stt import OpenAISTTService
+from pipecat.services.openrouter.llm import OpenRouterLLMService
+from pipecat.services.replicate.tts import ReplicateTTSService
 from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.smallwebrtc.request_handler import (
     SmallWebRTCPatchRequest,
@@ -27,6 +29,8 @@ load_dotenv()
 API_KEY = os.getenv("API_KEY", "")
 API_BASE_URL = os.getenv("API_BASE_URL", "")
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN", "")
 
 small_webrtc_handler = SmallWebRTCRequestHandler()
 
@@ -61,10 +65,21 @@ async def run_bot(connection):
         ),
     )
 
-    llm = OpenAILLMService(
+    stt = OpenAISTTService(
         api_key=API_KEY,
         base_url=API_BASE_URL,
-        model="qwen3-omni-flash-realtime",
+        model="qwen3-asr-flash-us",
+    )
+
+    llm = OpenRouterLLMService(
+        api_key=OPENROUTER_API_KEY,
+        model="meta-llama/llama-3.3-70b-instruct",
+    )
+
+    tts = ReplicateTTSService(
+        api_token=REPLICATE_API_TOKEN,
+        model="jaaari/kokoro-82m:f559560eb822dc509045f3921a1921234918b91739db4bf3daab2169b71c7a13",
+        voice_id="af_nicole",
     )
 
     context = OpenAILLMContext(messages=[{"role": "system", "content": SYSTEM_PROMPT}])
@@ -73,8 +88,10 @@ async def run_bot(connection):
     pipeline = Pipeline(
         [
             transport.input(),
+            stt,
             context_aggregator.user(),
             llm,
+            tts,
             transport.output(),
             context_aggregator.assistant(),
         ]
