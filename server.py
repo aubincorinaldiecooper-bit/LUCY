@@ -73,7 +73,10 @@ async def run_bot(connection):
         model="meta-llama/llama-3.3-70b-instruct",
     )
 
-    tts = CartesiaTTSService(api_key=CARTESIA_API_KEY)
+    tts = CartesiaTTSService(
+        api_key=CARTESIA_API_KEY,
+        voice_id="a5136bf9-224c-4d76-b823-52bd5efcffcc",
+    )
 
     context = OpenAILLMContext(messages=[{"role": "system", "content": SYSTEM_PROMPT}])
     context_aggregator = llm.create_context_aggregator(context)
