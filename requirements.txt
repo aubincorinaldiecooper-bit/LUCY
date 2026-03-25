@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+python-dotenv
+loguru
+openai
+pipecat-ai[webrtc,deepgram,cartesia,openai,openrouter]
