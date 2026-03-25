@@ -13,7 +13,7 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
-from pipecat.services.openai.stt import OpenAISTTService
+from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.openrouter.llm import OpenRouterLLMService
 from pipecat.transports.base_transport import TransportParams
@@ -31,6 +31,7 @@ API_BASE_URL = os.getenv("API_BASE_URL", "")
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 CARTESIA_API_KEY = os.getenv("CARTESIA_API_KEY", "")
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
 
 small_webrtc_handler = SmallWebRTCRequestHandler()
 
@@ -65,11 +66,7 @@ async def run_bot(connection):
         ),
     )
 
-    stt = OpenAISTTService(
-        api_key=API_KEY,
-        base_url=API_BASE_URL,
-        model="qwen3-asr-flash-us",
-    )
+    stt = DeepgramSTTService(api_key=DEEPGRAM_API_KEY)
 
     llm = OpenRouterLLMService(
         api_key=OPENROUTER_API_KEY,
