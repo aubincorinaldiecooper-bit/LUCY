@@ -1,0 +1,9 @@
+[project]
+name = "lucy"
+version = "0.1.0"
+description = "LUCY voice server"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.100.0",
+  "uvicorn[standard]>=0.23.0",
+]
