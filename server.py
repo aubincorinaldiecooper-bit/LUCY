@@ -70,7 +70,7 @@ async def run_bot(connection):
 
     llm = OpenRouterLLMService(
         api_key=OPENROUTER_API_KEY,
-        model="meta-llama/llama-3.3-70b-instruct",
+        model="minimax/minimax-m2.7",
     )
 
     tts = CartesiaTTSService(
