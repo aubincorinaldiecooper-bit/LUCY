@@ -32,6 +32,7 @@ SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 CARTESIA_API_KEY = os.getenv("CARTESIA_API_KEY", "")
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "minimax/minimax-m2.7")
 
 small_webrtc_handler = SmallWebRTCRequestHandler()
 
@@ -70,7 +71,10 @@ async def run_bot(connection):
 
     llm = OpenRouterLLMService(
         api_key=OPENROUTER_API_KEY,
-        model="minimax/minimax-m2.7",
+        model=    llm = OpenRouterLLMService(
+        api_key=OPENROUTER_API_KEY,
+        model=OPENROUTER_MODEL,
+    ),
     )
 
     tts = CartesiaTTSService(
