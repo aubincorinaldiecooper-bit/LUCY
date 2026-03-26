@@ -26,8 +26,7 @@ from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 
 load_dotenv()
 
-API_KEY = os.getenv("API_KEY", "")
-API_BASE_URL = os.getenv("API_BASE_URL", "")
+
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 CARTESIA_API_KEY = os.getenv("CARTESIA_API_KEY", "")
@@ -136,9 +135,3 @@ async def ice_candidate(request: SmallWebRTCPatchRequest):
     return {"status": "success"}
 
 
-if __name__ == "__main__":
-    if not API_KEY:
-        logger.error("API_KEY must be set in the environment")
-        raise SystemExit(1)
-
-    uvicorn.run("server:app", host="0.0.0.0", port=8000)
