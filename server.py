@@ -68,13 +68,11 @@ async def run_bot(connection):
 
     stt = DeepgramSTTService(api_key=DEEPGRAM_API_KEY)
 
-    llm = OpenRouterLLMService(
-        api_key=OPENROUTER_API_KEY,
-        model=    llm = OpenRouterLLMService(
+        llm = OpenRouterLLMService(
         api_key=OPENROUTER_API_KEY,
         model=OPENROUTER_MODEL,
-    ),
     )
+    
 
     tts = CartesiaTTSService(
         api_key=CARTESIA_API_KEY,
