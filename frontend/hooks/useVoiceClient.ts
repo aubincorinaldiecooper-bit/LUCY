@@ -50,8 +50,7 @@ export function useVoiceClient() {
           if (!audioEl) {
             audioEl = document.createElement("audio");
             audioEl.id = "lucy-remote-audio";
-            audioEl.autoplay = true;
-            audioEl.playsInline = true;
+            audioEl.autoplay = true
             audioEl.style.display = "none";
             document.body.appendChild(audioEl);
           }
