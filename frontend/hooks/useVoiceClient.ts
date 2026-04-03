@@ -6,6 +6,17 @@ import { useCallback, useRef, useState } from "react";
 
 export type VoiceState = "idle" | "initializing" | "connecting" | "connected" | "muted";
 
+function resolveOfferUrl() {
+  const rawApiUrl = process.env.NEXT_PUBLIC_API_URL?.trim().replace(/^['"]|['"]$/g, "");
+
+  if (!rawApiUrl) {
+    throw new Error("NEXT_PUBLIC_API_URL is not configured");
+  }
+
+  const baseUrl = /^https?:\/\//i.test(rawApiUrl) ? rawApiUrl : `https://${rawApiUrl}`;
+  return new URL("/api/offer", baseUrl).toString();
+}
+
 export function useVoiceClient() {
   const [state, setState] = useState<VoiceState>("idle");
   const [isMuted, setIsMuted] = useState(false);
@@ -51,7 +62,7 @@ export function useVoiceClient() {
             audioEl = document.createElement("audio");
             audioEl.id = "lucy-remote-audio";
             audioEl.autoplay = true;
-            audioEl.playsInline = true;
+            audioEl.setAttribute("playsinline", "true");
             audioEl.style.display = "none";
             document.body.appendChild(audioEl);
           }
@@ -69,7 +80,7 @@ export function useVoiceClient() {
     clientRef.current = client;
 
     try {
-      await client.connect({ webrtcUrl: "/api/offer" });
+      await client.connect({ webrtcUrl: resolveOfferUrl() });
     } catch {
       setState("idle");
       setIsMuted(false);
