@@ -80,7 +80,11 @@ export function useVoiceClient() {
     clientRef.current = client;
 
     try {
-      await client.connect({ webrtcUrl: resolveOfferUrl() });
+      await client.connect({
+        webrtcRequestParams: {
+          endpoint: resolveOfferUrl(),
+        },
+      });
     } catch {
       setState("idle");
       setIsMuted(false);
