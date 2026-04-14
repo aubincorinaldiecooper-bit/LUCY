@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import EndFrame, LLMMessagesFrame
+from pipecat.frames.frames import EndFrame, LLMMessagesUpdateFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
@@ -36,13 +36,6 @@ CORS_ORIGINS = os.getenv(
     "CORS_ORIGINS",
     "http://localhost:3000,https://vigilant-youth-production-452c.up.railway.app",
 )
-
-
-def parse_cors_origins(origins: str) -> list[str]:
-    return [origin.strip() for origin in origins.split(",") if origin.strip()]
-
-
-ALLOWED_CORS_ORIGINS = parse_cors_origins(CORS_ORIGINS)
 
 
 def parse_cors_origins(origins: str) -> list[str]:
@@ -114,7 +107,9 @@ async def run_bot(room_url: str, token: str):
     @transport.event_handler("on_first_participant_joined")
     async def on_first_participant_joined(_transport, _participant):
         logger.info("First participant joined")
-        await task.queue_frame(LLMMessagesFrame([{"role": "user", "content": "Hello"}]))
+        await task.queue_frame(
+            LLMMessagesUpdateFrame([{"role": "user", "content": "Hello"}], run_llm=True)
+        )
 
     @transport.event_handler("on_participant_left")
     async def on_participant_left(_transport, _participant, _reason):
