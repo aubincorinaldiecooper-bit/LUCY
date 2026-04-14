@@ -32,6 +32,14 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 CARTESIA_API_KEY = os.getenv("CARTESIA_API_KEY", "")
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "minimax/minimax-m2.7")
+CORS_ORIGINS = os.getenv(
+    "CORS_ORIGINS",
+    "http://localhost:3000,https://vigilant-youth-production-452c.up.railway.app",
+)
+
+
+def parse_cors_origins(origins: str) -> list[str]:
+    return [origin.strip() for origin in origins.split(",") if origin.strip()]
 
 small_webrtc_handler = SmallWebRTCRequestHandler()
 
@@ -46,7 +54,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=parse_cors_origins(CORS_ORIGINS),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -131,5 +139,4 @@ async def offer(request: SmallWebRTCRequest, background_tasks: BackgroundTasks):
 async def ice_candidate(request: SmallWebRTCPatchRequest):
     await small_webrtc_handler.handle_patch_request(request)
     return {"status": "success"}
-
 
