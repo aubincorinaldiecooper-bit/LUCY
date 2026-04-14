@@ -1,6 +1,6 @@
 FROM python:3.11-slim
 WORKDIR /app
-ARG CACHE_BUST=1
+ARG CACHE_BUST=2
 RUN echo "Cache bust: $CACHE_BUST"
 # 1. Install system dependencies required for OpenCV and WebRTC
 # Even 'headless' OpenCV needs these libs in a slim Linux environment
