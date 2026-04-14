@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI
+from fastapi import BackgroundTasks, FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from loguru import logger
@@ -41,6 +41,9 @@ CORS_ORIGINS = os.getenv(
 def parse_cors_origins(origins: str) -> list[str]:
     return [origin.strip() for origin in origins.split(",") if origin.strip()]
 
+
+ALLOWED_CORS_ORIGINS = parse_cors_origins(CORS_ORIGINS)
+
 small_webrtc_handler = SmallWebRTCRequestHandler()
 
 
@@ -54,7 +57,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=parse_cors_origins(CORS_ORIGINS),
+    allow_origins=ALLOWED_CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -135,8 +138,25 @@ async def offer(request: SmallWebRTCRequest, background_tasks: BackgroundTasks):
     return answer
 
 
+@app.options("/api/offer")
+@app.options("/api/offer/")
+async def offer_preflight(request: Request) -> Response:
+    origin = request.headers.get("origin", "")
+    response = Response(status_code=204)
+
+    if origin in ALLOWED_CORS_ORIGINS:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Access-Control-Allow-Methods"] = "POST, PATCH, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = request.headers.get(
+            "access-control-request-headers", "*"
+        )
+        response.headers["Vary"] = "Origin"
+
+    return response
+
+
 @app.patch("/api/offer")
 async def ice_candidate(request: SmallWebRTCPatchRequest):
     await small_webrtc_handler.handle_patch_request(request)
     return {"status": "success"}
-
