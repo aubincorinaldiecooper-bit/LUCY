@@ -10,5 +10,5 @@ dependencies = [
   "loguru",
   "openai",
   "opencv-python-headless>=4.9.0.80",
-  "pipecat-ai[webrtc,deepgram,cartesia,openai,openrouter]",
+  "pipecat-ai[daily,deepgram,cartesia,openai,openrouter]",
 ]
