@@ -45,6 +45,13 @@ def parse_cors_origins(origins: str) -> list[str]:
 ALLOWED_CORS_ORIGINS = parse_cors_origins(CORS_ORIGINS)
 
 
+def parse_cors_origins(origins: str) -> list[str]:
+    return [origin.strip() for origin in origins.split(",") if origin.strip()]
+
+
+ALLOWED_CORS_ORIGINS = parse_cors_origins(CORS_ORIGINS)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     yield
