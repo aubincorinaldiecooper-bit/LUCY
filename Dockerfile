@@ -1,7 +1,5 @@
 FROM python:3.11-slim
 WORKDIR /app
-ARG CACHE_BUST=2
-RUN echo "Cache bust: $CACHE_BUST"
 # 1. Install system dependencies required for OpenCV and WebRTC
 # Even 'headless' OpenCV needs these libs in a slim Linux environment
 RUN apt-get update && apt-get install -y \
@@ -16,10 +14,12 @@ RUN apt-get update && apt-get install -y \
 # 2. Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
+# 3. Copy application source after dependency install so code changes
+# invalidate only this layer (no manual cache busting required).
 COPY . .
 ENV PYTHONUNBUFFERED=1
 EXPOSE 8000
 CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]
-
 
 
