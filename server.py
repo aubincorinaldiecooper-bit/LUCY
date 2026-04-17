@@ -13,7 +13,8 @@ from pipecat.frames.frames import EndFrame, LLMMessagesUpdateFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
-from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.openrouter.llm import OpenRouterLLMService
@@ -87,8 +88,8 @@ async def run_bot(room_url: str, token: str):
         voice_id="a5136bf9-224c-4d76-b823-52bd5efcffcc",
     )
 
-    context = OpenAILLMContext(messages=[{"role": "system", "content": SYSTEM_PROMPT}])
-    context_aggregator = llm.create_context_aggregator(context)
+    context = LLMContext(messages=[{"role": "system", "content": SYSTEM_PROMPT}])
+    context_aggregator = LLMContextAggregatorPair(context)
 
     pipeline = Pipeline(
         [
