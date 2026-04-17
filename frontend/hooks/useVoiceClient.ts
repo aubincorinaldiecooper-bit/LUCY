@@ -1,19 +1,16 @@
 "use client";
 
-import { PipecatClient } from "@pipecat-ai/client-js";
-import { SmallWebRTCTransport } from "@pipecat-ai/small-webrtc-transport";
+import DailyIframe, { type DailyCall } from "@daily-co/daily-js";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 export type VoiceState = "idle" | "initializing" | "connecting" | "connected" | "muted";
 
-type VoiceTransportOptions = {
-  iceServers: RTCIceServer[];
-  enableMic: boolean;
-  enableCam: boolean;
-  micDeviceId?: string;
+type DailySessionResponse = {
+  room_url: string;
+  token: string;
 };
 
-function resolveOfferUrl() {
+function resolveSessionUrl() {
   const rawApiUrl = process.env.NEXT_PUBLIC_API_URL?.trim().replace(/^['"]|['"]$/g, "");
 
   if (!rawApiUrl) {
@@ -21,37 +18,53 @@ function resolveOfferUrl() {
   }
 
   const baseUrl = /^https?:\/\//i.test(rawApiUrl) ? rawApiUrl : `https://${rawApiUrl}`;
-  return new URL("/api/offer", baseUrl).toString();
+  return new URL("/api/daily/session", baseUrl).toString();
+}
+
+async function createDailySession(): Promise<DailySessionResponse> {
+  const response = await fetch(resolveSessionUrl(), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`Failed to create Daily session (${response.status})`);
+  }
+
+  return response.json() as Promise<DailySessionResponse>;
 }
 
 export function useVoiceClient() {
   const [state, setState] = useState<VoiceState>("idle");
   const [isMuted, setIsMuted] = useState(false);
-  const clientRef = useRef<PipecatClient | null>(null);
+  const callRef = useRef<DailyCall | null>(null);
   const activeMicDeviceIdRef = useRef<string | undefined>(undefined);
 
-  const cleanupAudioElement = useCallback(() => {
-    const audioEl = document.getElementById("lucy-remote-audio") as HTMLAudioElement | null;
-    if (!audioEl) {
+  const disconnect = useCallback(async () => {
+    const call = callRef.current;
+
+    if (!call) {
+      activeMicDeviceIdRef.current = undefined;
       return;
     }
 
-    audioEl.srcObject = null;
-    audioEl.remove();
+    try {
+      if (call.meetingState() === "joined-meeting") {
+        await call.leave();
+      }
+    } finally {
+      await call.destroy();
+      callRef.current = null;
+      activeMicDeviceIdRef.current = undefined;
+      setState("idle");
+      setIsMuted(false);
+    }
   }, []);
 
-  const disconnect = useCallback(async () => {
-    try {
-      await clientRef.current?.disconnect();
-    } finally {
-      clientRef.current = null;
-      activeMicDeviceIdRef.current = undefined;
-      cleanupAudioElement();
-    }
-  }, [cleanupAudioElement]);
-
   const connect = useCallback(async (micDeviceId?: string) => {
-    if (clientRef.current) {
+    if (callRef.current) {
       if (activeMicDeviceIdRef.current === micDeviceId) {
         return;
       }
@@ -61,86 +74,68 @@ export function useVoiceClient() {
 
     setState("initializing");
 
-    const transportOptions: VoiceTransportOptions = {
-      iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
-      enableMic: true,
-      enableCam: false,
-      ...(micDeviceId ? { micDeviceId } : {}),
-    };
-
-    const transport = new SmallWebRTCTransport(transportOptions);
-
-    const client = new PipecatClient({
-      transport,
-      callbacks: {
-        onTransportStateChanged: (s) => {
-          if (s === "authenticating" || s === "connecting") {
-            setState("connecting");
-          }
-        },
-        onConnected: () => {
-          setState("connected");
-        },
-        onDisconnected: () => {
-          setState("idle");
-          setIsMuted(false);
-          clientRef.current = null;
-          activeMicDeviceIdRef.current = undefined;
-        },
-        onTrackStarted: (track, participant) => {
-          if (participant?.local) {
-            return;
-          }
-
-          let audioEl = document.getElementById("lucy-remote-audio") as HTMLAudioElement | null;
-          if (!audioEl) {
-            audioEl = document.createElement("audio");
-            audioEl.id = "lucy-remote-audio";
-            audioEl.autoplay = true;
-            audioEl.setAttribute("playsinline", "true");
-            audioEl.style.display = "none";
-            document.body.appendChild(audioEl);
-          }
-
-          audioEl.srcObject = new MediaStream([track]);
-        },
-        onError: () => {
-          setState("idle");
-          setIsMuted(false);
-          clientRef.current = null;
-          activeMicDeviceIdRef.current = undefined;
-        },
-      },
-    });
-
-    clientRef.current = client;
-
     try {
-      await client.connect({
-        webrtcRequestParams: {
-          endpoint: resolveOfferUrl(),
-        },
+      const session = await createDailySession();
+      const call = DailyIframe.createCallObject({
+        audioSource: true,
+        videoSource: false,
       });
+
+      (call as any).on("joined-meeting", () => {
+        setState(isMuted ? "muted" : "connected");
+      });
+
+      (call as any).on("left-meeting", () => {
+        setState("idle");
+        setIsMuted(false);
+        callRef.current = null;
+        activeMicDeviceIdRef.current = undefined;
+      });
+
+      (call as any).on("error", () => {
+        setState("idle");
+        setIsMuted(false);
+        callRef.current = null;
+        activeMicDeviceIdRef.current = undefined;
+      });
+
+      callRef.current = call;
+      setState("connecting");
+
+      if (micDeviceId) {
+        await call.setInputDevicesAsync({ audioDeviceId: micDeviceId });
+      }
+
+      await call.join({
+        url: session.room_url,
+        token: session.token,
+      });
+
       activeMicDeviceIdRef.current = micDeviceId;
+      call.setLocalAudio(!isMuted);
+      setState(isMuted ? "muted" : "connected");
     } catch {
-      setState("idle");
-      setIsMuted(false);
-      clientRef.current = null;
+      if (callRef.current) {
+        await callRef.current.destroy();
+      }
+
+      callRef.current = null;
       activeMicDeviceIdRef.current = undefined;
+      setIsMuted(false);
+      setState("idle");
     }
-  }, [disconnect]);
+  }, [disconnect, isMuted]);
 
   useEffect(() => {
     return () => {
       void disconnect();
-      cleanupAudioElement();
     };
-  }, [cleanupAudioElement, disconnect]);
+  }, [disconnect]);
 
   const toggleMute = useCallback(() => {
     const nextMuted = !isMuted;
     setIsMuted(nextMuted);
-    clientRef.current?.enableMic(!nextMuted);
+    callRef.current?.setLocalAudio(!nextMuted);
     setState(nextMuted ? "muted" : "connected");
   }, [isMuted]);
 
