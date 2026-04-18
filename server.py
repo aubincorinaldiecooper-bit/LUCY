@@ -100,7 +100,8 @@ async def run_bot(room_url: str, token: str):
             tts,
             transport.output(),
             context_aggregator.assistant(),
-        ]
+        ],
+        preemptive_generation=True,
     )
 
     task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True))
