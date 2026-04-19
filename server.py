@@ -80,12 +80,12 @@ async def run_bot(room_url: str, token: str):
 
     llm = OpenRouterLLMService(
         api_key=OPENROUTER_API_KEY,
-        model=OPENROUTER_MODEL,
+        settings=OpenRouterLLMService.Settings(model=OPENROUTER_MODEL),
     )
 
     tts = CartesiaTTSService(
         api_key=CARTESIA_API_KEY,
-        voice_id="a5136bf9-224c-4d76-b823-52bd5efcffcc",
+        settings=CartesiaTTSService.Settings(voice="a5136bf9-224c-4d76-b823-52bd5efcffcc"),
     )
 
     context = LLMContext(messages=[{"role": "system", "content": SYSTEM_PROMPT}])
