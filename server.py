@@ -17,6 +17,7 @@ from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.mcp_service import MCPClient
 from pipecat.services.openrouter.llm import OpenRouterLLMService
 from pipecat.transports.daily.transport import DailyParams, DailyTransport
 from pipecat.transports.daily.utils import DailyRESTHelper, DailyRoomParams
@@ -32,6 +33,7 @@ OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "minimax/minimax-m2.7")
 DAILY_API_KEY = os.getenv("DAILY_API_KEY", "")
 DAILY_API_URL = os.getenv("DAILY_API_URL", "https://api.daily.co/v1")
 DAILY_ROOM_URL = os.getenv("DAILY_ROOM_URL", "")
+TAVILY_MCP_URL = os.getenv("TAVILY_MCP_URL", "")
 BOT_NAME = os.getenv("BOT_NAME", "Lucy")
 CORS_ORIGINS = os.getenv(
     "CORS_ORIGINS",
@@ -80,12 +82,20 @@ async def run_bot(room_url: str, token: str):
 
     llm = OpenRouterLLMService(
         api_key=OPENROUTER_API_KEY,
-        model=OPENROUTER_MODEL,
+        settings=OpenRouterLLMService.Settings(model=OPENROUTER_MODEL),
     )
+
+    tavily_mcp_url = os.getenv("TAVILY_MCP_URL", TAVILY_MCP_URL)
+    if tavily_mcp_url:
+        mcp_client = MCPClient(server_params=tavily_mcp_url)
+        await mcp_client.register_tools(llm)
+        logger.info("Registered Tavily MCP tools with OpenRouterLLMService")
+    else:
+        logger.warning("TAVILY_MCP_URL is not configured; Tavily MCP tools were not registered")
 
     tts = CartesiaTTSService(
         api_key=CARTESIA_API_KEY,
-        voice_id="a5136bf9-224c-4d76-b823-52bd5efcffcc",
+        settings=CartesiaTTSService.Settings(voice="a5136bf9-224c-4d76-b823-52bd5efcffcc"),
     )
 
     context = LLMContext(messages=[{"role": "system", "content": SYSTEM_PROMPT}])
