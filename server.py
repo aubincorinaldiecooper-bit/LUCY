@@ -10,6 +10,8 @@ from fastapi.responses import JSONResponse
 from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import EndFrame, LLMMessagesUpdateFrame
+from pipecat.observers.metrics_log_observer import MetricsLogObserver
+from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
@@ -113,7 +115,28 @@ async def run_bot(room_url: str, token: str):
         ]
     )
 
-    task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True))
+    user_bot_latency_observer = UserBotLatencyObserver()
+
+    @user_bot_latency_observer.event_handler("on_latency_measured")
+    async def on_latency_measured(*args, **kwargs):
+        logger.info(f"User-to-bot latency measured: args={args}, kwargs={kwargs}")
+
+    @user_bot_latency_observer.event_handler("on_latency_breakdown")
+    async def on_latency_breakdown(*args, **kwargs):
+        logger.info(f"User-to-bot latency breakdown: args={args}, kwargs={kwargs}")
+
+    task = PipelineTask(
+        pipeline,
+        params=PipelineParams(
+            allow_interruptions=True,
+            enable_metrics=True,
+            enable_usage_metrics=True,
+        ),
+        observers=[
+            MetricsLogObserver(),
+            user_bot_latency_observer,
+        ],
+    )
 
     @transport.event_handler("on_first_participant_joined")
     async def on_first_participant_joined(_transport, _participant):
