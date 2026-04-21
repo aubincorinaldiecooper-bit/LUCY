@@ -1,4 +1,5 @@
 import os
+import time
 from contextlib import asynccontextmanager
 
 import aiohttp
@@ -19,6 +20,7 @@ from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services import mcp_service
 from pipecat.services.mcp_service import MCPClient
 from pipecat.services.openrouter.llm import OpenRouterLLMService
 from pipecat.transports.daily.transport import DailyParams, DailyTransport
@@ -67,6 +69,7 @@ app.add_middleware(
 
 
 async def run_bot(room_url: str, token: str):
+    run_started_at = time.monotonic()
     logger.info(f"Starting Daily session for room: {room_url}")
 
     transport = DailyTransport(
@@ -89,9 +92,18 @@ async def run_bot(room_url: str, token: str):
 
     tavily_mcp_url = os.getenv("TAVILY_MCP_URL", TAVILY_MCP_URL)
     if tavily_mcp_url:
-        mcp_client = MCPClient(server_params=tavily_mcp_url)
-        await mcp_client.register_tools(llm)
-        logger.info("Registered Tavily MCP tools with OpenRouterLLMService")
+        try:
+            streamable_http_parameters = getattr(mcp_service, "StreamableHttpParameters", None)
+            if streamable_http_parameters is None:
+                raise RuntimeError("StreamableHttpParameters is unavailable in this Pipecat build")
+
+            mcp_client = MCPClient(
+                server_params=streamable_http_parameters(url=tavily_mcp_url)
+            )
+            await mcp_client.register_tools(llm)
+            logger.info("Registered Tavily MCP tools with OpenRouterLLMService")
+        except Exception as e:
+            logger.exception(f"Failed to register Tavily MCP tools: {e}")
     else:
         logger.warning("TAVILY_MCP_URL is not configured; Tavily MCP tools were not registered")
 
@@ -140,7 +152,8 @@ async def run_bot(room_url: str, token: str):
 
     @transport.event_handler("on_first_participant_joined")
     async def on_first_participant_joined(_transport, _participant):
-        logger.info("First participant joined")
+        join_delay_seconds = time.monotonic() - run_started_at
+        logger.info(f"First participant joined ({join_delay_seconds:.2f}s after run_bot start)")
         await task.queue_frame(
             LLMMessagesUpdateFrame([{"role": "user", "content": "Hello"}], run_llm=True)
         )
@@ -151,6 +164,7 @@ async def run_bot(room_url: str, token: str):
         await task.queue_frame(EndFrame())
 
     runner = PipelineRunner()
+    logger.info("Pipeline runner started; waiting for Daily participants to join")
     await runner.run(task)
 
 
