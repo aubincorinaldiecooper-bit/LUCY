@@ -18,11 +18,12 @@ from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
-from pipecat.services.cartesia.tts import CartesiaTTSService, TextAggregationMode
 from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.kokoro import KokoroTTSService
 from pipecat.services import mcp_service
 from pipecat.services.mcp_service import MCPClient
 from pipecat.services.openrouter.llm import OpenRouterLLMService
+from pipecat.transcriptions.language import Language
 from pipecat.transports.daily.transport import DailyParams, DailyTransport
 from pipecat.transports.daily.utils import DailyRESTHelper, DailyRoomParams
 
@@ -114,13 +115,11 @@ async def run_bot(room_url: str, token: str):
                 "TAVILY_MCP_URL is not configured; Tavily MCP tools were not registered"
             )
 
-        tts = CartesiaTTSService(
-            api_key=CARTESIA_API_KEY,
-            settings=CartesiaTTSService.Settings(
-                model="sonic-3",
-                voice="a5136bf9-224c-4d76-b823-52bd5efcffcc",
-            ),
-            text_aggregation_mode=TextAggregationMode.TOKEN,
+        tts = KokoroTTSService(
+            settings=KokoroTTSService.Settings(
+                voice="bf_emma",
+                language=Language.EN_GB,
+            )
         )
 
         context = LLMContext(messages=[{"role": "system", "content": SYSTEM_PROMPT}])
