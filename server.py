@@ -18,7 +18,7 @@ from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
-from pipecat.services.cartesia.tts import CartesiaTTSService
+from pipecat.services.cartesia.tts import CartesiaTTSService, TextAggregationMode
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services import mcp_service
 from pipecat.services.mcp_service import MCPClient
@@ -116,7 +116,11 @@ async def run_bot(room_url: str, token: str):
 
         tts = CartesiaTTSService(
             api_key=CARTESIA_API_KEY,
-            settings=CartesiaTTSService.Settings(voice="a5136bf9-224c-4d76-b823-52bd5efcffcc"),
+            settings=CartesiaTTSService.Settings(
+                model="sonic-3",
+                voice="a5136bf9-224c-4d76-b823-52bd5efcffcc",
+            ),
+            text_aggregation_mode=TextAggregationMode.TOKEN,
         )
 
         context = LLMContext(messages=[{"role": "system", "content": SYSTEM_PROMPT}])
