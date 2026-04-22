@@ -32,7 +32,6 @@ load_dotenv()
 
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-CARTESIA_API_KEY = os.getenv("CARTESIA_API_KEY", "")
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "minimax/minimax-m2.7")
 DAILY_API_KEY = os.getenv("DAILY_API_KEY", "")
