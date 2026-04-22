@@ -1,8 +1,0 @@
-fastapi
-uvicorn
-python-dotenv
-loguru
-openai
-opencv-python-headless
-pipecat-ai[daily,deepgram,openrouter,kokoro,mcp]>=0.0.101
-tavily-python
