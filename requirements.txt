@@ -4,4 +4,5 @@ python-dotenv
 loguru
 openai
 opencv-python-headless
-pipecat-ai[daily,deepgram,cartesia,openai,openrouter]
+pipecat-ai[kokoro]>=0.0.101
+tavily-python
