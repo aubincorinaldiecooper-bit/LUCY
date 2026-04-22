@@ -1,5 +1,6 @@
 import os
-from contextlib import asynccontextmanager
+import time
+from contextlib import AsyncExitStack, asynccontextmanager
 
 import aiohttp
 import uvicorn
@@ -10,14 +11,19 @@ from fastapi.responses import JSONResponse
 from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import EndFrame, LLMMessagesUpdateFrame
+from pipecat.observers.loggers.metrics_log_observer import MetricsLogObserver
+from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
-from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.kokoro import KokoroTTSService
+from pipecat.services import mcp_service
+from pipecat.services.mcp_service import MCPClient
 from pipecat.services.openrouter.llm import OpenRouterLLMService
+from pipecat.transcriptions.language import Language
 from pipecat.transports.daily.transport import DailyParams, DailyTransport
 from pipecat.transports.daily.utils import DailyRESTHelper, DailyRoomParams
 
@@ -32,6 +38,7 @@ OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "minimax/minimax-m2.7")
 DAILY_API_KEY = os.getenv("DAILY_API_KEY", "")
 DAILY_API_URL = os.getenv("DAILY_API_URL", "https://api.daily.co/v1")
 DAILY_ROOM_URL = os.getenv("DAILY_ROOM_URL", "")
+TAVILY_MCP_URL = os.getenv("TAVILY_MCP_URL", "")
 BOT_NAME = os.getenv("BOT_NAME", "Lucy")
 CORS_ORIGINS = os.getenv(
     "CORS_ORIGINS",
@@ -63,6 +70,7 @@ app.add_middleware(
 
 
 async def run_bot(room_url: str, token: str):
+    run_started_at = time.monotonic()
     logger.info(f"Starting Daily session for room: {room_url}")
 
     transport = DailyTransport(
@@ -80,45 +88,94 @@ async def run_bot(room_url: str, token: str):
 
     llm = OpenRouterLLMService(
         api_key=OPENROUTER_API_KEY,
-        model=OPENROUTER_MODEL,
+        settings=OpenRouterLLMService.Settings(model=OPENROUTER_MODEL),
     )
 
-    tts = CartesiaTTSService(
-        api_key=CARTESIA_API_KEY,
-        voice_id="a5136bf9-224c-4d76-b823-52bd5efcffcc",
-    )
+    async with AsyncExitStack() as exit_stack:
+        tavily_mcp_url = os.getenv("TAVILY_MCP_URL", TAVILY_MCP_URL)
+        if tavily_mcp_url:
+            try:
+                streamable_http_parameters = getattr(
+                    mcp_service, "StreamableHttpParameters", None
+                )
+                if streamable_http_parameters is None:
+                    raise RuntimeError(
+                        "StreamableHttpParameters is unavailable in this Pipecat build"
+                    )
 
-    context = LLMContext(messages=[{"role": "system", "content": SYSTEM_PROMPT}])
-    context_aggregator = LLMContextAggregatorPair(context)
+                mcp_client = await exit_stack.enter_async_context(
+                    MCPClient(server_params=streamable_http_parameters(url=tavily_mcp_url))
+                )
+                await mcp_client.register_tools(llm)
+                logger.info("Registered Tavily MCP tools with OpenRouterLLMService")
+            except Exception as e:
+                logger.exception(f"Failed to register Tavily MCP tools: {e}")
+        else:
+            logger.warning(
+                "TAVILY_MCP_URL is not configured; Tavily MCP tools were not registered"
+            )
 
-    pipeline = Pipeline(
-        [
-            transport.input(),
-            stt,
-            context_aggregator.user(),
-            llm,
-            tts,
-            transport.output(),
-            context_aggregator.assistant(),
-        ]
-    )
-
-    task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True))
-
-    @transport.event_handler("on_first_participant_joined")
-    async def on_first_participant_joined(_transport, _participant):
-        logger.info("First participant joined")
-        await task.queue_frame(
-            LLMMessagesUpdateFrame([{"role": "user", "content": "Hello"}], run_llm=True)
+        tts = KokoroTTSService(
+            settings=KokoroTTSService.Settings(
+                voice="bf_emma",
+                language=Language.EN_GB,
+            )
         )
 
-    @transport.event_handler("on_participant_left")
-    async def on_participant_left(_transport, _participant, _reason):
-        logger.info("Participant left")
-        await task.queue_frame(EndFrame())
+        context = LLMContext(messages=[{"role": "system", "content": SYSTEM_PROMPT}])
+        context_aggregator = LLMContextAggregatorPair(context)
 
-    runner = PipelineRunner()
-    await runner.run(task)
+        pipeline = Pipeline(
+            [
+                transport.input(),
+                stt,
+                context_aggregator.user(),
+                llm,
+                tts,
+                transport.output(),
+                context_aggregator.assistant(),
+            ]
+        )
+
+        user_bot_latency_observer = UserBotLatencyObserver()
+
+        @user_bot_latency_observer.event_handler("on_latency_measured")
+        async def on_latency_measured(*args, **kwargs):
+            logger.info(f"User-to-bot latency measured: args={args}, kwargs={kwargs}")
+
+        @user_bot_latency_observer.event_handler("on_latency_breakdown")
+        async def on_latency_breakdown(*args, **kwargs):
+            logger.info(f"User-to-bot latency breakdown: args={args}, kwargs={kwargs}")
+
+        task = PipelineTask(
+            pipeline,
+            params=PipelineParams(
+                allow_interruptions=True,
+                enable_metrics=True,
+                enable_usage_metrics=True,
+            ),
+            observers=[
+                MetricsLogObserver(),
+                user_bot_latency_observer,
+            ],
+        )
+
+        @transport.event_handler("on_first_participant_joined")
+        async def on_first_participant_joined(_transport, _participant):
+            join_delay_seconds = time.monotonic() - run_started_at
+            logger.info(f"First participant joined ({join_delay_seconds:.2f}s after run_bot start)")
+            await task.queue_frame(
+                LLMMessagesUpdateFrame([{"role": "user", "content": "Hello"}], run_llm=True)
+            )
+
+        @transport.event_handler("on_participant_left")
+        async def on_participant_left(_transport, _participant, _reason):
+            logger.info("Participant left")
+            await task.queue_frame(EndFrame())
+
+        runner = PipelineRunner()
+        logger.info("Pipeline runner started; waiting for Daily participants to join")
+        await runner.run(task)
 
 
 async def create_daily_session() -> tuple[str, str, str]:
