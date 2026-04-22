@@ -1,6 +1,6 @@
 import os
 import time
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 
 import aiohttp
 import uvicorn
@@ -90,82 +90,89 @@ async def run_bot(room_url: str, token: str):
         settings=OpenRouterLLMService.Settings(model=OPENROUTER_MODEL),
     )
 
-    tavily_mcp_url = os.getenv("TAVILY_MCP_URL", TAVILY_MCP_URL)
-    if tavily_mcp_url:
-        try:
-            streamable_http_parameters = getattr(mcp_service, "StreamableHttpParameters", None)
-            if streamable_http_parameters is None:
-                raise RuntimeError("StreamableHttpParameters is unavailable in this Pipecat build")
+    async with AsyncExitStack() as exit_stack:
+        tavily_mcp_url = os.getenv("TAVILY_MCP_URL", TAVILY_MCP_URL)
+        if tavily_mcp_url:
+            try:
+                streamable_http_parameters = getattr(
+                    mcp_service, "StreamableHttpParameters", None
+                )
+                if streamable_http_parameters is None:
+                    raise RuntimeError(
+                        "StreamableHttpParameters is unavailable in this Pipecat build"
+                    )
 
-            mcp_client = MCPClient(
-                server_params=streamable_http_parameters(url=tavily_mcp_url)
+                mcp_client = await exit_stack.enter_async_context(
+                    MCPClient(server_params=streamable_http_parameters(url=tavily_mcp_url))
+                )
+                await mcp_client.register_tools(llm)
+                logger.info("Registered Tavily MCP tools with OpenRouterLLMService")
+            except Exception as e:
+                logger.exception(f"Failed to register Tavily MCP tools: {e}")
+        else:
+            logger.warning(
+                "TAVILY_MCP_URL is not configured; Tavily MCP tools were not registered"
             )
-            await mcp_client.register_tools(llm)
-            logger.info("Registered Tavily MCP tools with OpenRouterLLMService")
-        except Exception as e:
-            logger.exception(f"Failed to register Tavily MCP tools: {e}")
-    else:
-        logger.warning("TAVILY_MCP_URL is not configured; Tavily MCP tools were not registered")
 
-    tts = CartesiaTTSService(
-        api_key=CARTESIA_API_KEY,
-        settings=CartesiaTTSService.Settings(voice="a5136bf9-224c-4d76-b823-52bd5efcffcc"),
-    )
-
-    context = LLMContext(messages=[{"role": "system", "content": SYSTEM_PROMPT}])
-    context_aggregator = LLMContextAggregatorPair(context)
-
-    pipeline = Pipeline(
-        [
-            transport.input(),
-            stt,
-            context_aggregator.user(),
-            llm,
-            tts,
-            transport.output(),
-            context_aggregator.assistant(),
-        ]
-    )
-
-    user_bot_latency_observer = UserBotLatencyObserver()
-
-    @user_bot_latency_observer.event_handler("on_latency_measured")
-    async def on_latency_measured(*args, **kwargs):
-        logger.info(f"User-to-bot latency measured: args={args}, kwargs={kwargs}")
-
-    @user_bot_latency_observer.event_handler("on_latency_breakdown")
-    async def on_latency_breakdown(*args, **kwargs):
-        logger.info(f"User-to-bot latency breakdown: args={args}, kwargs={kwargs}")
-
-    task = PipelineTask(
-        pipeline,
-        params=PipelineParams(
-            allow_interruptions=True,
-            enable_metrics=True,
-            enable_usage_metrics=True,
-        ),
-        observers=[
-            MetricsLogObserver(),
-            user_bot_latency_observer,
-        ],
-    )
-
-    @transport.event_handler("on_first_participant_joined")
-    async def on_first_participant_joined(_transport, _participant):
-        join_delay_seconds = time.monotonic() - run_started_at
-        logger.info(f"First participant joined ({join_delay_seconds:.2f}s after run_bot start)")
-        await task.queue_frame(
-            LLMMessagesUpdateFrame([{"role": "user", "content": "Hello"}], run_llm=True)
+        tts = CartesiaTTSService(
+            api_key=CARTESIA_API_KEY,
+            settings=CartesiaTTSService.Settings(voice="a5136bf9-224c-4d76-b823-52bd5efcffcc"),
         )
 
-    @transport.event_handler("on_participant_left")
-    async def on_participant_left(_transport, _participant, _reason):
-        logger.info("Participant left")
-        await task.queue_frame(EndFrame())
+        context = LLMContext(messages=[{"role": "system", "content": SYSTEM_PROMPT}])
+        context_aggregator = LLMContextAggregatorPair(context)
 
-    runner = PipelineRunner()
-    logger.info("Pipeline runner started; waiting for Daily participants to join")
-    await runner.run(task)
+        pipeline = Pipeline(
+            [
+                transport.input(),
+                stt,
+                context_aggregator.user(),
+                llm,
+                tts,
+                transport.output(),
+                context_aggregator.assistant(),
+            ]
+        )
+
+        user_bot_latency_observer = UserBotLatencyObserver()
+
+        @user_bot_latency_observer.event_handler("on_latency_measured")
+        async def on_latency_measured(*args, **kwargs):
+            logger.info(f"User-to-bot latency measured: args={args}, kwargs={kwargs}")
+
+        @user_bot_latency_observer.event_handler("on_latency_breakdown")
+        async def on_latency_breakdown(*args, **kwargs):
+            logger.info(f"User-to-bot latency breakdown: args={args}, kwargs={kwargs}")
+
+        task = PipelineTask(
+            pipeline,
+            params=PipelineParams(
+                allow_interruptions=True,
+                enable_metrics=True,
+                enable_usage_metrics=True,
+            ),
+            observers=[
+                MetricsLogObserver(),
+                user_bot_latency_observer,
+            ],
+        )
+
+        @transport.event_handler("on_first_participant_joined")
+        async def on_first_participant_joined(_transport, _participant):
+            join_delay_seconds = time.monotonic() - run_started_at
+            logger.info(f"First participant joined ({join_delay_seconds:.2f}s after run_bot start)")
+            await task.queue_frame(
+                LLMMessagesUpdateFrame([{"role": "user", "content": "Hello"}], run_llm=True)
+            )
+
+        @transport.event_handler("on_participant_left")
+        async def on_participant_left(_transport, _participant, _reason):
+            logger.info("Participant left")
+            await task.queue_frame(EndFrame())
+
+        runner = PipelineRunner()
+        logger.info("Pipeline runner started; waiting for Daily participants to join")
+        await runner.run(task)
 
 
 async def create_daily_session() -> tuple[str, str, str]:
