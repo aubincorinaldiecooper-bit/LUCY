@@ -15,9 +15,10 @@ from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
-from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.kokoro.tts import KokoroTTSService
 from pipecat.services.openrouter.llm import OpenRouterLLMService
+from pipecat.transcriptions.language import Language
 from pipecat.transports.daily.transport import DailyParams, DailyTransport
 from pipecat.transports.daily.utils import DailyRESTHelper, DailyRoomParams
 
@@ -26,7 +27,6 @@ load_dotenv()
 
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-CARTESIA_API_KEY = os.getenv("CARTESIA_API_KEY", "")
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "minimax/minimax-m2.7")
 DAILY_API_KEY = os.getenv("DAILY_API_KEY", "")
@@ -83,9 +83,11 @@ async def run_bot(room_url: str, token: str):
         model=OPENROUTER_MODEL,
     )
 
-    tts = CartesiaTTSService(
-        api_key=CARTESIA_API_KEY,
-        voice_id="a5136bf9-224c-4d76-b823-52bd5efcffcc",
+    tts = KokoroTTSService(
+        settings=KokoroTTSService.Settings(
+            voice="bf_emma",
+            language=Language.EN_GB,
+        )
     )
 
     context = LLMContext(messages=[{"role": "system", "content": SYSTEM_PROMPT}])
