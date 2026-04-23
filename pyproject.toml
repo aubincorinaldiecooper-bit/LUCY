@@ -4,11 +4,13 @@ version = "0.1.0"
 description = "LUCY voice server"
 requires-python = ">=3.11"
 dependencies = [
-  "fastapi>=0.100.0",
-  "uvicorn[standard]>=0.23.0",
+  "pipecat-ai[daily,deepgram,openrouter,kokoro,mcp]==1.0.0",
+  "transformers>=4.41,<6",
+  "torch>=2.2,<3",
+  "tavily-python",
   "python-dotenv",
+  "fastapi",
+  "uvicorn",
+  "aiohttp",
   "loguru",
-  "openai",
-  "opencv-python-headless>=4.9.0.80",
-  "pipecat-ai[daily,deepgram,cartesia,openai,openrouter]",
 ]
