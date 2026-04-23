@@ -1,6 +1,13 @@
 import os
+os.environ["ORT_INTRA_OP_NUM_THREADS"] = "2"
+os.environ["ORT_INTER_OP_NUM_THREADS"] = "1"
+os.environ["ONNXRUNTIME_LOG_LEVEL"] = "3"
+
+import asyncio
 import time
-from contextlib import AsyncExitStack, asynccontextmanager
+import re
+from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack
 
 import aiohttp
 import uvicorn
@@ -10,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import EndFrame, LLMMessagesUpdateFrame
+from pipecat.frames.frames import EndFrame, LLMMessagesUpdateFrame, Frame, TextFrame
 from pipecat.observers.loggers.metrics_log_observer import MetricsLogObserver
 from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
 from pipecat.pipeline.pipeline import Pipeline
@@ -18,6 +25,7 @@ from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.kokoro.tts import KokoroTTSService
 from pipecat.services import mcp_service
@@ -29,8 +37,7 @@ from pipecat.transports.daily.utils import DailyRESTHelper, DailyRoomParams
 
 load_dotenv()
 
-
-SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "")
+SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "You are Lucy, a chill and straightforward friend who keeps conversations light and insightful. Respond in one or two natural sentences with clear punctuation for smooth pacing. Keep your tone casual and conversational, avoiding corporate or overly formal phrasing. When politics, religion, or strong opinions come up, stay neutral and gently turn the focus back by asking one quick question about their perspective. Prioritize learning about them through intuitive questioning rather than agreeing just to be polite, and skip generic validation like I can see that or that is an interesting perspective. If asked about your origins or how you work, casually say you are not sure about the technical details but your creator built you to make daily conversations more meaningful. When you need current information, always briefly acknowledge it first with a natural phrase like let me look that up or give me a sec, then keep your summary tight. Stay in character, keep it real, and focus on natural back-and-forth dialogue.")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "minimax/minimax-m2.7")
@@ -44,17 +51,52 @@ CORS_ORIGINS = os.getenv(
     "http://localhost:3000,https://vigilant-youth-production-452c.up.railway.app",
 )
 
-
 def parse_cors_origins(origins: str) -> list[str]:
     return [origin.strip() for origin in origins.split(",") if origin.strip()]
 
-
 ALLOWED_CORS_ORIGINS = parse_cors_origins(CORS_ORIGINS)
 
+_KOKORO_TTS_POOL: asyncio.LifoQueue[KokoroTTSService] = asyncio.LifoQueue(maxsize=2)
+_WARMED_VAD_ANALYZER: SileroVADAnalyzer | None = None
 
-import re
-from pipecat.frames.frames import Frame, TextFrame
-from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
+def create_tts_service() -> KokoroTTSService:
+    return KokoroTTSService(
+        settings=KokoroTTSService.Settings(
+            voice="af_sarah",
+            speed=0.92,
+            language=Language.EN_GB,
+        )
+    )
+
+async def warmup_tts_service(tts: KokoroTTSService) -> None:
+    async for _ in tts.run_tts("Warmup.", context_id="startup-warmup"):
+        break
+
+async def get_tts_service() -> tuple[KokoroTTSService, bool]:
+    try:
+        return _KOKORO_TTS_POOL.get_nowait(), True
+    except asyncio.QueueEmpty:
+        return create_tts_service(), False
+
+def return_tts_service(tts: KokoroTTSService) -> None:
+    if _KOKORO_TTS_POOL.full():
+        return
+    _KOKORO_TTS_POOL.put_nowait(tts)
+
+async def warmup_models() -> None:
+    global _WARMED_VAD_ANALYZER
+    warmup_start = time.perf_counter()
+    logger.info("Starting startup model warm-up")
+    _WARMED_VAD_ANALYZER = SileroVADAnalyzer()
+    logger.info("Silero/Smart Turn model warm-up complete")
+    try:
+        tts = create_tts_service()
+        await warmup_tts_service(tts)
+        return_tts_service(tts)
+        logger.info("Kokoro TTS model warm-up complete")
+    except Exception as e:
+        logger.warning(f"Kokoro warm-up failed (continuing without cache): {e}")
+    logger.info(f"Startup model warm-up finished in {time.perf_counter() - warmup_start:.2f}s")
 
 class TextNormalizer(FrameProcessor):
     def __init__(self):
@@ -70,9 +112,9 @@ class TextNormalizer(FrameProcessor):
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    await warmup_models()
     yield
     logger.info("Shutting down")
-
 
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(
@@ -83,10 +125,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 async def run_bot(room_url: str, token: str):
     run_started_at = time.monotonic()
     logger.info(f"Starting Daily session for room: {room_url}")
+
+    tts, _ = await get_tts_service()
 
     transport = DailyTransport(
         room_url=room_url,
@@ -95,7 +138,7 @@ async def run_bot(room_url: str, token: str):
         params=DailyParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
-            vad_analyzer=SileroVADAnalyzer(),
+            vad_analyzer=_WARMED_VAD_ANALYZER or SileroVADAnalyzer(),
         ),
     )
 
@@ -106,20 +149,14 @@ async def run_bot(room_url: str, token: str):
         settings=OpenRouterLLMService.Settings(model=OPENROUTER_MODEL),
         system_prompt=SYSTEM_PROMPT,
     )
-    context = LLMContext( messages=[])
 
     async with AsyncExitStack() as exit_stack:
-        tavily_mcp_url = os.getenv("TAVILY_MCP_URL", TAVILY_MCP_URL)
+        tavily_mcp_url = os.getenv("TAVILY_MCP_URL", "")
         if tavily_mcp_url:
             try:
-                streamable_http_parameters = getattr(
-                    mcp_service, "StreamableHttpParameters", None
-                )
+                streamable_http_parameters = getattr(mcp_service, "StreamableHttpParameters", None)
                 if streamable_http_parameters is None:
-                    raise RuntimeError(
-                        "StreamableHttpParameters is unavailable in this Pipecat build"
-                    )
-
+                    raise RuntimeError("StreamableHttpParameters is unavailable in this Pipecat build")
                 mcp_client = await exit_stack.enter_async_context(
                     MCPClient(server_params=streamable_http_parameters(url=tavily_mcp_url))
                 )
@@ -128,33 +165,21 @@ async def run_bot(room_url: str, token: str):
             except Exception as e:
                 logger.exception(f"Failed to register Tavily MCP tools: {e}")
         else:
-            logger.warning(
-                "TAVILY_MCP_URL is not configured; Tavily MCP tools were not registered"
-            )
+            logger.warning("TAVILY_MCP_URL is not configured; Tavily MCP tools were not registered")
 
-        tts = KokoroTTSService(
-            settings=KokoroTTSService.Settings(
-                voice="af_sarah",
-                speed=0.92,
-                language=Language.EN_GB,
-            )
-        )
-
-        context = LLMContext(messages=[{"role": "system", "content": SYSTEM_PROMPT}])
+        context = LLMContext(messages=[])
         context_aggregator = LLMContextAggregatorPair(context)
 
-        pipeline = Pipeline(
-            [
-                transport.input(),
-                stt,
-                context_aggregator.user(),
-                llm,
-                TextNormalizer(),
-                tts,
-                transport.output(),
-                context_aggregator.assistant(),
-            ]
-        )
+        pipeline = Pipeline([
+            transport.input(),
+            stt,
+            context_aggregator.user(),
+            llm,
+            TextNormalizer(),
+            tts,
+            transport.output(),
+            context_aggregator.assistant(),
+        ])
 
         user_bot_latency_observer = UserBotLatencyObserver()
 
@@ -173,10 +198,7 @@ async def run_bot(room_url: str, token: str):
                 enable_metrics=True,
                 enable_usage_metrics=True,
             ),
-            observers=[
-                MetricsLogObserver(),
-                user_bot_latency_observer,
-            ],
+            observers=[MetricsLogObserver(), user_bot_latency_observer],
         )
 
         @transport.event_handler("on_first_participant_joined")
@@ -195,37 +217,30 @@ async def run_bot(room_url: str, token: str):
         runner = PipelineRunner()
         logger.info("Pipeline runner started; waiting for Daily participants to join")
         try:
-        await runner.run(task)
-finally:
-return_tts_service(tts)
-
+            await runner.run(task)
+        finally:
+            return_tts_service(tts)
 
 async def create_daily_session() -> tuple[str, str, str]:
     if not DAILY_API_KEY:
         raise HTTPException(status_code=500, detail="DAILY_API_KEY is not configured")
-
     async with aiohttp.ClientSession() as aiohttp_session:
         helper = DailyRESTHelper(
             daily_api_key=DAILY_API_KEY,
             daily_api_url=DAILY_API_URL,
             aiohttp_session=aiohttp_session,
         )
-
         room_url = DAILY_ROOM_URL
         if not room_url:
             room = await helper.create_room(DailyRoomParams())
             room_url = room.url
-
         bot_token = await helper.get_token(room_url, owner=True)
         user_token = await helper.get_token(room_url, owner=False)
-
     return room_url, user_token, bot_token
-
 
 @app.get("/health")
 async def health() -> JSONResponse:
     return JSONResponse({"status": "ok"})
-
 
 @app.post("/api/daily/session")
 async def daily_session(background_tasks: BackgroundTasks):
@@ -233,24 +248,18 @@ async def daily_session(background_tasks: BackgroundTasks):
     background_tasks.add_task(run_bot, room_url, bot_token)
     return JSONResponse({"room_url": room_url, "token": user_token})
 
-
 @app.options("/api/daily/session")
 @app.options("/api/daily/session/")
 async def daily_session_preflight(request: Request) -> Response:
     origin = request.headers.get("origin", "")
     response = Response(status_code=204)
-
     if origin in ALLOWED_CORS_ORIGINS:
         response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Access-Control-Allow-Credentials"] = "true"
         response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
-        response.headers["Access-Control-Allow-Headers"] = request.headers.get(
-            "access-control-request-headers", "*"
-        )
+        response.headers["Access-Control-Allow-Headers"] = request.headers.get("access-control-request-headers", "*")
         response.headers["Vary"] = "Origin"
-
     return response
-
 
 if __name__ == "__main__":
     uvicorn.run("server:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
