@@ -1,4 +1,10 @@
 import os
+os.environ["ORT_INTRA_OP_NUM_THREADS"] = "2"
+os.environ["ORT_INTER_OP_NUM_THREADS"] = "1"
+os.environ["ONNXRUNTIME_LOG_LEVEL"] = "3"
+
+import asyncio
+import time
 from contextlib import asynccontextmanager
 
 import aiohttp
@@ -15,9 +21,10 @@ from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
-from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.kokoro.tts import KokoroTTSService
 from pipecat.services.openrouter.llm import OpenRouterLLMService
+from pipecat.transcriptions.language import Language
 from pipecat.transports.daily.transport import DailyParams, DailyTransport
 from pipecat.transports.daily.utils import DailyRESTHelper, DailyRoomParams
 
@@ -26,7 +33,6 @@ load_dotenv()
 
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-CARTESIA_API_KEY = os.getenv("CARTESIA_API_KEY", "")
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "minimax/minimax-m2.7")
 DAILY_API_KEY = os.getenv("DAILY_API_KEY", "")
@@ -45,9 +51,60 @@ def parse_cors_origins(origins: str) -> list[str]:
 
 ALLOWED_CORS_ORIGINS = parse_cors_origins(CORS_ORIGINS)
 
+_KOKORO_TTS_POOL: asyncio.LifoQueue[KokoroTTSService] = asyncio.LifoQueue(maxsize=2)
+_WARMED_VAD_ANALYZER: SileroVADAnalyzer | None = None
+
+
+def create_tts_service() -> KokoroTTSService:
+    return KokoroTTSService(
+        settings=KokoroTTSService.Settings(
+            voice="bf_emma",
+            language=Language.EN_GB,
+        )
+    )
+
+
+async def warmup_tts_service(tts: KokoroTTSService) -> None:
+    async for _ in tts.run_tts("Warmup.", context_id="startup-warmup"):
+        break
+
+
+async def get_tts_service() -> tuple[KokoroTTSService, bool]:
+    try:
+        return _KOKORO_TTS_POOL.get_nowait(), True
+    except asyncio.QueueEmpty:
+        return create_tts_service(), False
+
+
+def return_tts_service(tts: KokoroTTSService) -> None:
+    if _KOKORO_TTS_POOL.full():
+        return
+    _KOKORO_TTS_POOL.put_nowait(tts)
+
+
+async def warmup_models() -> None:
+    global _WARMED_VAD_ANALYZER
+
+    warmup_start = time.perf_counter()
+    logger.info("Starting startup model warm-up")
+
+    _WARMED_VAD_ANALYZER = SileroVADAnalyzer()
+    logger.info("Silero/Smart Turn model warm-up complete")
+
+    try:
+        tts = create_tts_service()
+        await warmup_tts_service(tts)
+        return_tts_service(tts)
+        logger.info("Kokoro TTS model warm-up complete")
+    except Exception as e:
+        logger.warning(f"Kokoro warm-up failed (continuing without cache): {e}")
+
+    logger.info(f"Startup model warm-up finished in {time.perf_counter() - warmup_start:.2f}s")
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    await warmup_models()
     yield
     logger.info("Shutting down")
 
@@ -65,6 +122,8 @@ app.add_middleware(
 async def run_bot(room_url: str, token: str):
     logger.info(f"Starting Daily session for room: {room_url}")
 
+    tts, _ = await get_tts_service()
+
     transport = DailyTransport(
         room_url=room_url,
         token=token,
@@ -72,7 +131,7 @@ async def run_bot(room_url: str, token: str):
         params=DailyParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
-            vad_analyzer=SileroVADAnalyzer(),
+            vad_analyzer=_WARMED_VAD_ANALYZER or SileroVADAnalyzer(),
         ),
     )
 
@@ -81,11 +140,6 @@ async def run_bot(room_url: str, token: str):
     llm = OpenRouterLLMService(
         api_key=OPENROUTER_API_KEY,
         model=OPENROUTER_MODEL,
-    )
-
-    tts = CartesiaTTSService(
-        api_key=CARTESIA_API_KEY,
-        voice_id="a5136bf9-224c-4d76-b823-52bd5efcffcc",
     )
 
     context = LLMContext(messages=[{"role": "system", "content": SYSTEM_PROMPT}])
@@ -118,7 +172,10 @@ async def run_bot(room_url: str, token: str):
         await task.queue_frame(EndFrame())
 
     runner = PipelineRunner()
-    await runner.run(task)
+    try:
+        await runner.run(task)
+    finally:
+        return_tts_service(tts)
 
 
 async def create_daily_session() -> tuple[str, str, str]:
