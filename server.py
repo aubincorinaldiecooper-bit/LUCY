@@ -52,6 +52,22 @@ def parse_cors_origins(origins: str) -> list[str]:
 ALLOWED_CORS_ORIGINS = parse_cors_origins(CORS_ORIGINS)
 
 
+import re
+from pipecat.frames.frames import Frame, TextFrame
+from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
+
+class TextNormalizer(FrameProcessor):
+    def __init__(self):
+        super().__init__()
+        self._markdown_pattern = re.compile(r'[*_`#~>]|```|^\s*[-*•]\s+')
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        if isinstance(frame, TextFrame):
+            clean = self._markdown_pattern.sub('', frame.text)
+            clean = re.sub(r'\s+', ' ', clean).strip()
+            if clean:
+                frame = TextFrame(text=clean, user_id=frame.user_id)
+        await self.push_frame(frame, direction)
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     yield
@@ -88,7 +104,9 @@ async def run_bot(room_url: str, token: str):
     llm = OpenRouterLLMService(
         api_key=OPENROUTER_API_KEY,
         settings=OpenRouterLLMService.Settings(model=OPENROUTER_MODEL),
+        system_prompt=SYSTEM_PROMPT,
     )
+    context = LLMContext( messages=[])
 
     async with AsyncExitStack() as exit_stack:
         tavily_mcp_url = os.getenv("TAVILY_MCP_URL", TAVILY_MCP_URL)
@@ -116,7 +134,8 @@ async def run_bot(room_url: str, token: str):
 
         tts = KokoroTTSService(
             settings=KokoroTTSService.Settings(
-                voice="bf_emma",
+                voice="af_sarah",
+                speed=0.92,
                 language=Language.EN_GB,
             )
         )
@@ -130,6 +149,7 @@ async def run_bot(room_url: str, token: str):
                 stt,
                 context_aggregator.user(),
                 llm,
+                TextNormalizer(),
                 tts,
                 transport.output(),
                 context_aggregator.assistant(),
@@ -174,7 +194,10 @@ async def run_bot(room_url: str, token: str):
 
         runner = PipelineRunner()
         logger.info("Pipeline runner started; waiting for Daily participants to join")
+        try:
         await runner.run(task)
+finally:
+return_tts_service(tts)
 
 
 async def create_daily_session() -> tuple[str, str, str]:
