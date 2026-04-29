@@ -1,14 +1,21 @@
 "use client";
 
+import dynamic from "next/dynamic";
 import { motion } from "framer-motion";
 import { DotLottieReact } from "@lottiefiles/dotlottie-react";
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { ConversationBar } from "@/components/ui/conversation-bar";
+import { useAudioDevices } from "@/hooks/useAudioDevices";
 import { useVoiceClient } from "@/hooks/useVoiceClient";
 import { useWaveform } from "@/hooks/useWaveform";
 
+const SettingsPanel = dynamic(() => import("@/components/SettingsPanel"), { ssr: false });
+
 export default function HomePage() {
   const { state, connect, disconnect, toggleMute } = useVoiceClient();
+  const { mics, speakers } = useAudioDevices();
+  const [selectedMic, setSelectedMic] = useState("");
+  const [selectedSpeaker, setSelectedSpeaker] = useState("");
 
   const active = state === "connected" || state === "muted";
   const { barHeights, micAmplitude, startWaveform, stopWaveform } = useWaveform(15, active);
@@ -39,7 +46,7 @@ export default function HomePage() {
   const glowOpacity = useMemo(() => 0.12 + micAmplitude * 0.28, [micAmplitude]);
 
   return (
-    <main className="relative min-h-screen overflow-hidden bg-[#FAFAF8]">
+    <main className="relative min-h-screen w-full overflow-hidden bg-[#FAFAF8] flex items-center justify-center px-4">
       <div
         className="absolute inset-0 -z-10"
         style={{
@@ -49,7 +56,7 @@ export default function HomePage() {
       />
 
       <motion.div
-        className="absolute inset-0 -z-10 pointer-events-none"
+        className="absolute inset-0 -z-10"
         style={{
           background:
             "radial-gradient(circle at center, rgba(10,147,150,0.38) 0%, rgba(10,147,150,0.18) 28%, rgba(10,147,150,0) 58%)",
@@ -67,12 +74,12 @@ export default function HomePage() {
         <h1 className="text-[#1E293B] font-semibold text-lg tracking-[0.12em] uppercase">Paw</h1>
       </motion.div>
 
-      <div className="relative z-10 min-h-screen pt-[16vh]">
+      <div className="w-full h-full flex flex-col items-center justify-center pb-24 sm:pb-28">
         <motion.div
           initial={{ opacity: 0, scale: 0.92, y: 16 }}
           animate={{ opacity: 1, scale: 1, y: 0 }}
           transition={{ duration: 1, delay: 0.3, ease: [0.25, 0.1, 0.25, 1] }}
-          className="absolute left-1/2 -translate-x-1/2 w-72 h-72 md:w-80 md:h-80"
+          className="w-72 h-72 md:w-80 md:h-80"
           style={{ filter: "drop-shadow(0 4px 12px rgba(0,0,0,0.08))" }}
         >
           <DotLottieReact
@@ -83,23 +90,32 @@ export default function HomePage() {
             style={{ width: "100%", height: "100%" }}
           />
         </motion.div>
-
-        <motion.div
-          initial={{ opacity: 0, y: 16 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.55, delay: 0.45 }}
-          className="absolute left-1/2 -translate-x-1/2 top-[calc(16vh+20rem)] w-full max-w-[560px] px-4"
-        >
-          <ConversationBar
-            className="w-full"
-            state={state}
-            barHeights={barHeights}
-            onConnect={connect}
-            onDisconnect={disconnect}
-            onToggleMute={toggleMute}
-          />
-        </motion.div>
       </div>
+
+      <motion.div
+        initial={{ opacity: 0, y: 16 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.55, delay: 0.45 }}
+        className="absolute bottom-10 left-1/2 -translate-x-1/2 z-20 w-full max-w-[560px] px-4"
+      >
+        <ConversationBar
+          state={state}
+          barHeights={barHeights}
+          onConnect={connect}
+          onDisconnect={disconnect}
+          onToggleMute={toggleMute}
+          rightSlot={
+            <SettingsPanel
+              mics={mics}
+              speakers={speakers}
+              selectedMic={selectedMic}
+              selectedSpeaker={selectedSpeaker}
+              onMicChange={setSelectedMic}
+              onSpeakerChange={setSelectedSpeaker}
+            />
+          }
+        />
+      </motion.div>
     </main>
   );
 }
