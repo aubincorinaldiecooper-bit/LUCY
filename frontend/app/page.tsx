@@ -25,9 +25,7 @@ export default function HomePage() {
     const run = async () => {
       if (active && state === "connected") {
         try {
-          stream = await navigator.mediaDevices.getUserMedia({
-            audio: selectedMic ? { deviceId: { exact: selectedMic } } : true,
-          });
+          stream = await navigator.mediaDevices.getUserMedia({ audio: true });
           await startWaveform(stream);
         } catch {
           await stopWaveform();
@@ -43,13 +41,19 @@ export default function HomePage() {
       stream?.getTracks().forEach((track) => track.stop());
       void stopWaveform();
     };
-  }, [active, selectedMic, startWaveform, state, stopWaveform]);
+  }, [active, startWaveform, state, stopWaveform]);
 
   const glowOpacity = useMemo(() => 0.12 + micAmplitude * 0.28, [micAmplitude]);
 
-  const handleConnect = async () => {
-    await connect(selectedMic || undefined);
-  };
+  return (
+    <main className="relative min-h-screen w-full overflow-hidden bg-[#FAFAF8] flex items-center justify-center px-4">
+      <div
+        className="absolute inset-0 -z-10"
+        style={{
+          background:
+            "radial-gradient(circle at center, #FDFDFB 0%, #FAFAF8 45%, #F1EFE8 100%)",
+        }}
+      />
 
   return (
     <main className="relative min-h-screen w-full overflow-hidden bg-[#FAFAF8] flex items-center justify-center px-4">
