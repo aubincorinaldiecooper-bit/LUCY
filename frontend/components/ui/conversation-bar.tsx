@@ -1,6 +1,8 @@
 "use client";
 
 import { motion } from "framer-motion";
+import { ArrowUp, Keyboard, Mic, MicOff, X } from "lucide-react";
+import { type KeyboardEvent, useCallback, useState } from "react";
 import { ArrowUp, ChevronDown, Keyboard, Mic, MicOff, Phone, X } from "lucide-react";
 import { type KeyboardEvent, type ReactNode, useCallback, useMemo, useState } from "react";
 import type { VoiceState } from "@/hooks/useVoiceClient";
@@ -23,6 +25,16 @@ type ConversationBarProps = {
   onMessage?: (message: ConversationMessage) => void;
   onSendMessage?: (message: string) => void;
 };
+
+function DotPlaceholder() {
+  return (
+    <div className="w-full h-full flex items-center justify-center gap-[6px] px-3">
+      {Array.from({ length: 18 }).map((_, i) => (
+        <span key={i} className="w-[3px] h-[3px] rounded-full bg-[#CBD5E1]" />
+      ))}
+    </div>
+  );
+}
 
 export function ConversationBar({
   state,
