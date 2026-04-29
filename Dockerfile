@@ -19,6 +19,7 @@ RUN uv sync --frozen --no-dev
 RUN uv cache clean 2>/dev/null; rm -rf /root/.cache /tmp/* /var/cache/apt/archives/*.deb
 RUN python -c "from pipecat.services.kokoro.tts import KokoroTTSService; import torch; print('✅ Build imports OK')" || exit 1
 
+ARG CACHE_BUST=3
 COPY . .
 
 EXPOSE 8080
