@@ -55,16 +55,6 @@ export default function HomePage() {
         }}
       />
 
-  return (
-    <main className="relative min-h-screen w-full overflow-hidden bg-[#FAFAF8] flex items-center justify-center px-4">
-      <div
-        className="absolute inset-0 -z-10"
-        style={{
-          background:
-            "radial-gradient(circle at center, #FDFDFB 0%, #FAFAF8 45%, #F1EFE8 100%)",
-        }}
-      />
-
       <motion.div
         className="absolute inset-0 -z-10"
         style={{
@@ -111,7 +101,7 @@ export default function HomePage() {
         <ConversationBar
           state={state}
           barHeights={barHeights}
-          onConnect={handleConnect}
+          onConnect={connect}
           onDisconnect={disconnect}
           onToggleMute={toggleMute}
           rightSlot={
