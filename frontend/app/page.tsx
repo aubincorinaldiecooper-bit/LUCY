@@ -1,51 +1,24 @@
 "use client";
 
-import dynamic from "next/dynamic";
-import { AnimatePresence, motion } from "framer-motion";
-import { Mic, Moon, Sun } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
-import { useAudioDevices } from "@/hooks/useAudioDevices";
+import { motion } from "framer-motion";
+import { DotLottieReact } from "@lottiefiles/dotlottie-react";
+import { useEffect, useMemo } from "react";
+import { ConversationBar } from "@/components/ui/conversation-bar";
 import { useVoiceClient } from "@/hooks/useVoiceClient";
 import { useWaveform } from "@/hooks/useWaveform";
 
-const ConnectButton = dynamic(() => import("@/components/ConnectButton"), { ssr: false });
-const MicPill = dynamic(() => import("@/components/MicPill"), { ssr: false });
-const SettingsPanel = dynamic(() => import("@/components/SettingsPanel"), { ssr: false });
-const Waveform = dynamic(() => import("@/components/Waveform"), { ssr: false });
-
-const item = (delay: number) => ({
-  initial: { opacity: 0, y: 8 },
-  animate: { opacity: 1, y: 0 },
-  transition: { duration: 0.35, delay },
-});
-
 export default function HomePage() {
   const { state, connect, disconnect, toggleMute } = useVoiceClient();
-  const { mics, speakers } = useAudioDevices();
-  const [selectedMic, setSelectedMic] = useState("");
-  const [selectedSpeaker, setSelectedSpeaker] = useState("");
-  const [darkMode, setDarkMode] = useState(false);
-  const [canHover, setCanHover] = useState(false);
 
   const active = state === "connected" || state === "muted";
-  const { barHeights, startWaveform, stopWaveform } = useWaveform(15, active);
-
-  useEffect(() => {
-    const query = window.matchMedia("(hover: hover)");
-    const update = () => setCanHover(query.matches);
-    update();
-    query.addEventListener("change", update);
-    return () => query.removeEventListener("change", update);
-  }, []);
+  const { barHeights, micAmplitude, startWaveform, stopWaveform } = useWaveform(15, active);
 
   useEffect(() => {
     let stream: MediaStream | null = null;
     const run = async () => {
       if (active && state === "connected") {
         try {
-          stream = await navigator.mediaDevices.getUserMedia({
-            audio: selectedMic ? { deviceId: { exact: selectedMic } } : true,
-          });
+          stream = await navigator.mediaDevices.getUserMedia({ audio: true });
           await startWaveform(stream);
         } catch {
           await stopWaveform();
@@ -61,97 +34,72 @@ export default function HomePage() {
       stream?.getTracks().forEach((track) => track.stop());
       void stopWaveform();
     };
-  }, [active, selectedMic, startWaveform, state, stopWaveform]);
+  }, [active, startWaveform, state, stopWaveform]);
 
-  const radial = useMemo(
-    () =>
-      darkMode
-        ? "radial-gradient(circle at top right, rgba(74,222,128,0.04), transparent 45%)"
-        : "radial-gradient(circle at top right, rgba(74,222,128,0.06), transparent 45%)",
-    [darkMode]
-  );
-
-  const handleConnect = async () => {
-    await connect(selectedMic || undefined);
-  };
-
-  const toggleTheme = () => {
-    const html = document.documentElement;
-    const nextDark = html.getAttribute("data-theme") !== "dark";
-    html.setAttribute("data-theme", nextDark ? "dark" : "light");
-    setDarkMode(nextDark);
-  };
+  const glowOpacity = useMemo(() => 0.12 + micAmplitude * 0.28, [micAmplitude]);
 
   return (
-    <main className="min-h-screen w-full px-4 flex flex-col items-center justify-center gap-3 bg-bg" style={{ backgroundImage: radial }}>
-      <motion.div
-        {...item(0)}
-        className="inline-flex items-center gap-2 px-4 py-2 rounded-full border border-border bg-surface backdrop-blur shadow-sm"
-      >
-        <Mic size={16} strokeWidth={1.75} className="text-text-primary" />
-        <span className="font-bold tracking-tight text-text-primary">LUCY</span>
-      </motion.div>
-
-      <motion.p {...item(0.08)} className="text-sm text-text-secondary text-center">
-        Your voice. Your conversation.
-      </motion.p>
-
-      <motion.h1 {...item(0.14)} className="text-text-primary text-2xl sm:text-3xl font-bold tracking-tight text-center">
-        Try it
-      </motion.h1>
+    <main className="relative min-h-screen overflow-hidden bg-[#FAFAF8]">
+      <div
+        className="absolute inset-0 -z-10"
+        style={{
+          background:
+            "radial-gradient(circle at center, #FDFDFB 0%, #FAFAF8 45%, #F1EFE8 100%)",
+        }}
+      />
 
       <motion.div
-        {...item(0.2)}
-        className="w-full max-w-[400px] rounded-2xl p-4 sm:p-5 bg-surface backdrop-blur-md border border-border shadow-md"
-        whileHover={canHover ? { y: -2 } : undefined}
+        className="absolute inset-0 -z-10 pointer-events-none"
+        style={{
+          background:
+            "radial-gradient(circle at center, rgba(10,147,150,0.38) 0%, rgba(10,147,150,0.18) 28%, rgba(10,147,150,0) 58%)",
+        }}
+        animate={{ opacity: glowOpacity }}
+        transition={{ duration: 0.12, ease: "easeOut" }}
+      />
+
+      <motion.div
+        initial={{ opacity: 0, x: -12 }}
+        animate={{ opacity: 1, x: 0 }}
+        transition={{ duration: 0.8, delay: 0.2 }}
+        className="absolute top-8 left-6 md:left-10 z-20"
       >
-        <div className="flex flex-col gap-2.5">
-          <div className="flex gap-2 items-stretch">
-            <ConnectButton state={state} onConnect={handleConnect} onDisconnect={disconnect} />
-            <MicPill state={state} onToggleMute={toggleMute} />
-            <SettingsPanel
-              mics={mics}
-              speakers={speakers}
-              selectedMic={selectedMic}
-              selectedSpeaker={selectedSpeaker}
-              onMicChange={setSelectedMic}
-              onSpeakerChange={setSelectedSpeaker}
-            />
-          </div>
-          <Waveform barHeights={barHeights} active={state === "connected"} />
-        </div>
+        <h1 className="text-[#1E293B] font-semibold text-lg tracking-[0.12em] uppercase">Paw</h1>
       </motion.div>
 
-      <motion.div {...item(0.26)} className="flex items-center gap-3 text-sm text-text-secondary text-center">
-        <a href="#" className="hover:text-text-primary transition-colors">
-          Privacy
-        </a>
-        <span className="opacity-40">•</span>
-        <a href="#" className="hover:text-text-primary transition-colors">
-          Support
-        </a>
-      </motion.div>
+      <div className="relative z-10 min-h-screen flex flex-col items-center justify-start pt-[16vh]">
+        <motion.div
+          initial={{ opacity: 0, scale: 0.92, y: 16 }}
+          animate={{ opacity: 1, scale: 1, y: 0 }}
+          transition={{ duration: 1, delay: 0.3, ease: [0.25, 0.1, 0.25, 1] }}
+          className="w-72 h-72 md:w-80 md:h-80"
+          style={{ filter: "drop-shadow(0 4px 12px rgba(0,0,0,0.08))" }}
+        >
+          <DotLottieReact
+            src="/assets/cat-ocean.json"
+            loop
+            autoplay
+            speed={0.3}
+            style={{ width: "100%", height: "100%" }}
+          />
+        </motion.div>
 
-      <motion.button
-        type="button"
-        onClick={toggleTheme}
-        className="fixed bottom-5 right-5 z-50 w-[38px] h-[38px] rounded-full border border-border bg-surface-solid shadow-sm flex items-center justify-center"
-        whileHover={canHover ? { scale: 1.08 } : undefined}
-        whileTap={{ scale: 0.95 }}
-      >
-        <AnimatePresence mode="wait" initial={false}>
-          <motion.span
-            key={darkMode ? "moon" : "sun"}
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            transition={{ duration: 0.18 }}
-            className="text-text-primary"
-          >
-            {darkMode ? <Moon size={16} strokeWidth={1.75} /> : <Sun size={16} strokeWidth={1.75} />}
-          </motion.span>
-        </AnimatePresence>
-      </motion.button>
+        <motion.div
+          initial={{ opacity: 0, y: 16 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.55, delay: 0.45 }}
+          className="mt-10 w-full max-w-[560px] px-4 mx-auto flex justify-center"
+        >
+          <ConversationBar
+            className="w-full"
+            state={state}
+            barHeights={barHeights}
+            onConnect={connect}
+            onDisconnect={disconnect}
+            onToggleMute={toggleMute}
+          />
+        </motion.div>
+      </div>
     </main>
   );
 }
