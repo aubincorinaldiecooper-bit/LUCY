@@ -1,8 +1,6 @@
 "use client";
 
 import { motion } from "framer-motion";
-import { ArrowUp, Keyboard, Mic, MicOff, X } from "lucide-react";
-import { type KeyboardEvent, useCallback, useState } from "react";
 import { ArrowUp, ChevronDown, Keyboard, Mic, MicOff, Phone, X } from "lucide-react";
 import { type KeyboardEvent, type ReactNode, useCallback, useMemo, useState } from "react";
 import type { VoiceState } from "@/hooks/useVoiceClient";
