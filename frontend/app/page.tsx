@@ -1,14 +1,21 @@
 "use client";
 
+import dynamic from "next/dynamic";
 import { motion } from "framer-motion";
 import { DotLottieReact } from "@lottiefiles/dotlottie-react";
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { ConversationBar } from "@/components/ui/conversation-bar";
+import { useAudioDevices } from "@/hooks/useAudioDevices";
 import { useVoiceClient } from "@/hooks/useVoiceClient";
 import { useWaveform } from "@/hooks/useWaveform";
 
+const SettingsPanel = dynamic(() => import("@/components/SettingsPanel"), { ssr: false });
+
 export default function HomePage() {
   const { state, connect, disconnect, toggleMute } = useVoiceClient();
+  const { mics, speakers } = useAudioDevices();
+  const [selectedMic, setSelectedMic] = useState("");
+  const [selectedSpeaker, setSelectedSpeaker] = useState("");
 
   const active = state === "connected" || state === "muted";
   const { barHeights, micAmplitude, startWaveform, stopWaveform } = useWaveform(15, active);
@@ -37,6 +44,16 @@ export default function HomePage() {
   }, [active, startWaveform, state, stopWaveform]);
 
   const glowOpacity = useMemo(() => 0.12 + micAmplitude * 0.28, [micAmplitude]);
+
+  return (
+    <main className="relative min-h-screen w-full overflow-hidden bg-[#FAFAF8] flex items-center justify-center px-4">
+      <div
+        className="absolute inset-0 -z-10"
+        style={{
+          background:
+            "radial-gradient(circle at center, #FDFDFB 0%, #FAFAF8 45%, #F1EFE8 100%)",
+        }}
+      />
 
   return (
     <main className="relative min-h-screen w-full overflow-hidden bg-[#FAFAF8] flex items-center justify-center px-4">
@@ -94,9 +111,19 @@ export default function HomePage() {
         <ConversationBar
           state={state}
           barHeights={barHeights}
-          onConnect={connect}
+          onConnect={handleConnect}
           onDisconnect={disconnect}
           onToggleMute={toggleMute}
+          rightSlot={
+            <SettingsPanel
+              mics={mics}
+              speakers={speakers}
+              selectedMic={selectedMic}
+              selectedSpeaker={selectedSpeaker}
+              onMicChange={setSelectedMic}
+              onSpeakerChange={setSelectedSpeaker}
+            />
+          }
         />
       </motion.div>
     </main>
