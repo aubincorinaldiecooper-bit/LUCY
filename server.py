@@ -63,7 +63,6 @@ def create_tts_service() -> KokoroTTSService:
     return KokoroTTSService(
         settings=KokoroTTSService.Settings(
             voice="af_sarah",
-            speed=0.92,
             language=Language.EN_GB,
         )
     )
