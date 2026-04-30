@@ -3,7 +3,6 @@ os.environ["ORT_INTRA_OP_NUM_THREADS"] = "2"
 os.environ["ORT_INTER_OP_NUM_THREADS"] = "1"
 os.environ["ONNXRUNTIME_LOG_LEVEL"] = "3"
 
-import asyncio
 import time
 import re
 from contextlib import asynccontextmanager
@@ -68,7 +67,6 @@ logger.info(f"DEEPGRAM_API_KEY {'is set' if DEEPGRAM_API_KEY else 'is NOT set �
 logger.info(f"OPENROUTER_API_KEY {'is set' if OPENROUTER_API_KEY else 'is NOT set'}")
 logger.info(f"DAILY_API_KEY {'is set' if DAILY_API_KEY else 'is NOT set'}")
 
-_KOKORO_TTS_POOL: asyncio.LifoQueue[KokoroTTSService] = asyncio.LifoQueue(maxsize=2)
 _WARMED_VAD_ANALYZER: SileroVADAnalyzer | None = None
 
 def create_tts_service() -> KokoroTTSService:
@@ -83,17 +81,6 @@ async def warmup_tts_service(tts: KokoroTTSService) -> None:
     async for _ in tts.run_tts("Warmup.", context_id="startup-warmup"):
         break
 
-async def get_tts_service() -> tuple[KokoroTTSService, bool]:
-    try:
-        return _KOKORO_TTS_POOL.get_nowait(), True
-    except asyncio.QueueEmpty:
-        return create_tts_service(), False
-
-def return_tts_service(tts: KokoroTTSService) -> None:
-    if _KOKORO_TTS_POOL.full():
-        return
-    _KOKORO_TTS_POOL.put_nowait(tts)
-
 async def warmup_models() -> None:
     global _WARMED_VAD_ANALYZER
     warmup_start = time.perf_counter()
@@ -103,30 +90,19 @@ async def warmup_models() -> None:
     try:
         tts = create_tts_service()
         await warmup_tts_service(tts)
-        return_tts_service(tts)
         logger.info("Kokoro TTS model warm-up complete")
     except Exception as e:
         logger.warning(f"Kokoro warm-up failed (continuing without cache): {e}")
     logger.info(f"Startup model warm-up finished in {time.perf_counter() - warmup_start:.2f}s")
 
 class TextNormalizer(FrameProcessor):
-    """Strips markdown characters from TextFrames and passes all other frames through.
-
-    Overrides _check_started() as a no-op so that FrameProcessor never blocks
-    frames (e.g. UserAudioRawFrame) that arrive before StartFrame has propagated
-    through the full pipeline.  All frame pushing goes directly through
-    push_frame(); super().process_frame() is never called, so the StartFrame
-    guard in the parent class is bypassed entirely.
-    """
+    """Strips markdown characters from TextFrames and passes all other frames through."""
 
     def __init__(self):
         super().__init__()
         self._markdown_pattern = re.compile(r'[*_`#~>]|```|^\s*[-*•]\s+', re.MULTILINE)
 
     def _check_started(self, frame: Frame) -> None:
-        # Intentionally a no-op: this processor must never block frames due to
-        # StartFrame ordering.  Audio and system frames must flow freely at all
-        # times, regardless of pipeline start state.
         pass
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
@@ -142,15 +118,8 @@ class TextNormalizer(FrameProcessor):
 
 
 class STTDebugProcessor(FrameProcessor):
-    """Sits immediately upstream of DeepgramSTTService to log audio frames going
-    in, and immediately downstream to log transcripts coming out.  A single
-    instance is used for both roles by inserting it twice in the pipeline:
-
-        transport.input() → STTDebugProcessor (upstream) → stt → STTDebugProcessor (downstream) → …
-
-    Because the same object is reused, audio-in and transcript-out counters are
-    shared, making it easy to correlate the two in logs.
-    """
+    """Development-only processor for frame-level STT debugging.
+    Kept in file for easy reactivation, but removed from production pipeline."""
 
     def __init__(self, label: str = "STTDebug"):
         super().__init__()
@@ -159,7 +128,6 @@ class STTDebugProcessor(FrameProcessor):
         self._transcripts_out: int = 0
 
     def _check_started(self, frame: Frame) -> None:
-        # No-op: must not block audio frames that arrive before StartFrame.
         pass
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
@@ -203,7 +171,7 @@ async def run_bot(room_url: str, token: str):
     run_started_at = time.monotonic()
     logger.info(f"Starting Daily session for room: {room_url}")
 
-    tts, _ = await get_tts_service()
+    tts = create_tts_service()
 
     transport = DailyTransport(
         room_url=room_url,
@@ -230,7 +198,6 @@ async def run_bot(room_url: str, token: str):
             utterance_end_ms=1000,
         ),
     )
-    stt_debug = STTDebugProcessor(label="DeepgramSTT")
 
     llm = OpenRouterLLMService(
         api_key=OPENROUTER_API_KEY,
@@ -260,9 +227,7 @@ async def run_bot(room_url: str, token: str):
 
         pipeline = Pipeline([
             transport.input(),
-            stt_debug,       # log audio frames before they enter STT
             stt,
-            stt_debug,       # log transcripts after they leave STT (same instance)
             TextNormalizer(),
             context_aggregator.user(),
             llm,
@@ -316,10 +281,8 @@ async def run_bot(room_url: str, token: str):
         logger.info("Pipeline runner started; waiting for Daily participants to join")
         try:
             await runner.run(task)
-               except Exception as e:
+        except Exception as e:
             logger.exception(f"Pipeline runner failed unexpectedly: {e}")
-        finally:
-            return_tts_service(tts)
 
 async def create_daily_session() -> tuple[str, str, str]:
     if not DAILY_API_KEY:

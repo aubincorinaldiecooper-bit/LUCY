@@ -15,6 +15,19 @@ type ModelOption = {
   bg: string;
 };
 
+type ConversationBarProps = {
+  state: VoiceState;
+  barHeights: number[];
+  className?: string;
+  waveformClassName?: string;
+  rightSlot?: ReactNode;
+  onConnect: () => void;
+  onDisconnect: () => void;
+  onToggleMute: () => void;
+  selectedModelId?: string;
+  onModelChange?: (modelId: string) => void;
+};
+
 const MODEL_OPTIONS: ModelOption[] = [
   { id: "gpt-4.1", name: "GPT-4.1", provider: "openai", badge: "G", tone: "#4A6CF7", bg: "#F0F4FF" },
   { id: "gpt-4o", name: "GPT-4o", provider: "openai", badge: "G", tone: "#4A6CF7", bg: "#F0F4FF" },
@@ -31,19 +44,6 @@ const PROVIDER_LABEL: Record<ModelOption["provider"], string> = {
   anthropic: "Anthropic",
   minimax: "MiniMax",
   deepseek: "DeepSeek",
-};
-
-type ConversationBarProps = {
-  state: VoiceState;
-  barHeights: number[];
-  className?: string;
-  waveformClassName?: string;
-  rightSlot?: ReactNode;
-  onConnect: () => void;
-  onDisconnect: () => void;
-  onToggleMute: () => void;
-  selectedModelId?: string;
-  onModelChange?: (modelId: string) => void;
 };
 
 function DotPlaceholder() {
