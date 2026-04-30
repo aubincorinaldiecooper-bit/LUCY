@@ -101,13 +101,19 @@ class TextNormalizer(FrameProcessor):
     def __init__(self):
         super().__init__()
         self._markdown_pattern = re.compile(r'[*_`#~>]|```|^\s*[-*•]\s+')
+
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         if isinstance(frame, TextFrame):
+            # Only TextFrames go through the parent's validated path (StartFrame check).
             clean = self._markdown_pattern.sub('', frame.text)
             clean = re.sub(r'\s+', ' ', clean).strip()
             if clean:
-                frame = TextFrame(text=clean, user_id=frame.user_id)
-        await self.push_frame(frame, direction)
+                await super().process_frame(TextFrame(text=clean, user_id=frame.user_id), direction)
+        else:
+            # All other frame types (e.g. UserAudioRawFrame) are pushed directly,
+            # bypassing FrameProcessor._check_started() so they are never blocked
+            # by the StartFrame propagation order in the pipeline.
+            await self.push_frame(frame, direction)
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
