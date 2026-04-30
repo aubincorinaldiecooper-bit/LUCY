@@ -187,6 +187,7 @@ async def run_bot(room_url: str, token: str):
     if not DEEPGRAM_API_KEY:
         logger.error("DEEPGRAM_API_KEY is not set — DeepgramSTTService will not produce transcripts")
 
+    # FIX: Removed interim_results and utterance_end_ms to fix 400 WebSocket error
     stt = DeepgramSTTService(
         api_key=DEEPGRAM_API_KEY,
         settings=DeepgramSTTService.Settings(
@@ -194,8 +195,6 @@ async def run_bot(room_url: str, token: str):
             model="nova-2",
             smart_format=True,
             punctuate=True,
-            interim_results=False,
-            utterance_end_ms=1000,
         ),
     )
 
