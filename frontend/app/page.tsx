@@ -1,15 +1,22 @@
 "use client";
 
+import dynamic from "next/dynamic";
 import { motion } from "framer-motion";
 import { DotLottieReact } from "@lottiefiles/dotlottie-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { ConversationBar } from "@/components/ui/conversation-bar";
+import { useAudioDevices } from "@/hooks/useAudioDevices";
 import { useVoiceClient } from "@/hooks/useVoiceClient";
 import { useWaveform } from "@/hooks/useWaveform";
 
+const SettingsPanel = dynamic(() => import("@/components/SettingsPanel"), { ssr: false });
+
 export default function HomePage() {
   const { state, connect, disconnect, toggleMute } = useVoiceClient();
+  const { mics, speakers } = useAudioDevices();
   const [selectedModelId, setSelectedModelId] = useState("gpt-4o");
+  const [selectedMic, setSelectedMic] = useState("");
+  const [selectedSpeaker, setSelectedSpeaker] = useState("");
 
   const active = state === "connected" || state === "muted";
   const { barHeights, micAmplitude, startWaveform, stopWaveform } = useWaveform(15, active);
@@ -72,6 +79,7 @@ export default function HomePage() {
         <h1 className="text-[#1E293B] font-semibold text-lg tracking-[0.12em] uppercase">Paw</h1>
       </motion.div>
 
+      {/* Shared flex column → cat and bar share exact same center */}
       <div className="relative z-10 min-h-screen flex flex-col items-center justify-start pt-[16vh]">
         <motion.div
           initial={{ opacity: 0, scale: 0.92, y: 16 }}
@@ -104,6 +112,16 @@ export default function HomePage() {
             onToggleMute={toggleMute}
             selectedModelId={selectedModelId}
             onModelChange={setSelectedModelId}
+            rightSlot={
+              <SettingsPanel
+                mics={mics}
+                speakers={speakers}
+                selectedMic={selectedMic}
+                selectedSpeaker={selectedSpeaker}
+                onMicChange={setSelectedMic}
+                onSpeakerChange={setSelectedSpeaker}
+              />
+            }
           />
         </motion.div>
       </div>
