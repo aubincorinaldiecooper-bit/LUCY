@@ -3,7 +3,7 @@
 import dynamic from "next/dynamic";
 import { motion } from "framer-motion";
 import { DotLottieReact } from "@lottiefiles/dotlottie-react";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { ConversationBar } from "@/components/ui/conversation-bar";
 import { useAudioDevices } from "@/hooks/useAudioDevices";
 import { useVoiceClient } from "@/hooks/useVoiceClient";
@@ -14,6 +14,7 @@ const SettingsPanel = dynamic(() => import("@/components/SettingsPanel"), { ssr:
 export default function HomePage() {
   const { state, connect, disconnect, toggleMute } = useVoiceClient();
   const { mics, speakers } = useAudioDevices();
+  const [selectedModelId, setSelectedModelId] = useState("gpt-4o");
   const [selectedMic, setSelectedMic] = useState("");
   const [selectedSpeaker, setSelectedSpeaker] = useState("");
 
@@ -44,6 +45,10 @@ export default function HomePage() {
   }, [active, startWaveform, state, stopWaveform]);
 
   const glowOpacity = useMemo(() => 0.12 + micAmplitude * 0.28, [micAmplitude]);
+
+  const handleConnect = useCallback(() => {
+    void connect(selectedModelId);
+  }, [connect, selectedModelId]);
 
   return (
     <main className="relative min-h-screen overflow-hidden bg-[#FAFAF8]">
@@ -102,9 +107,11 @@ export default function HomePage() {
             className="w-full"
             state={state}
             barHeights={barHeights}
-            onConnect={connect}
+            onConnect={handleConnect}
             onDisconnect={disconnect}
             onToggleMute={toggleMute}
+            selectedModelId={selectedModelId}
+            onModelChange={setSelectedModelId}
             rightSlot={
               <SettingsPanel
                 mics={mics}
