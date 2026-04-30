@@ -1,31 +1,10 @@
 "use client";
 
 import { motion } from "framer-motion";
-import {
-  ArrowUp,
-  Check,
-  ChevronDown,
-  Keyboard,
-  Mic,
-  MicOff,
-  Phone,
-  Search,
-  X,
-} from "lucide-react";
-import {
-  type KeyboardEvent,
-  type ReactNode,
-  useCallback,
-  useMemo,
-  useState,
-} from "react";
+import { Check, ChevronDown, Mic, MicOff, Phone, Search, X } from "lucide-react";
+import { type ReactNode, useMemo, useState } from "react";
 import type { VoiceState } from "@/hooks/useVoiceClient";
 import Waveform from "@/components/Waveform";
-
-type ConversationMessage = {
-  source: "user" | "ai";
-  message: string;
-};
 
 type ModelOption = {
   id: string;
@@ -63,17 +42,16 @@ type ConversationBarProps = {
   onConnect: () => void;
   onDisconnect: () => void;
   onToggleMute: () => void;
-  onMessage?: (message: ConversationMessage) => void;
-  onSendMessage?: (message: string) => void;
   selectedModelId?: string;
   onModelChange?: (modelId: string) => void;
 };
 
 function DotPlaceholder() {
+  const heights = [4,5,6,7,8,9,10,12,14,16,18,20,22,24,22,20,18,16,14,12,10,9,8,7,6,5,4];
   return (
-    <div className="w-full h-full flex items-center justify-center gap-[6px] px-3">
-      {Array.from({ length: 18 }).map((_, i) => (
-        <span key={i} className="w-[3px] h-[3px] rounded-full bg-[#CBD5E1]" />
+    <div className="w-full h-full flex items-center justify-center gap-[4px] px-3">
+      {heights.map((height, i) => (
+        <span key={i} className="w-[4px] rounded-full bg-[#D5D0C8]" style={{ height }} />
       ))}
     </div>
   );
@@ -88,13 +66,9 @@ export function ConversationBar({
   onConnect,
   onDisconnect,
   onToggleMute,
-  onMessage,
-  onSendMessage,
   selectedModelId = "gpt-4o",
   onModelChange,
 }: ConversationBarProps) {
-  const [keyboardOpen, setKeyboardOpen] = useState(false);
-  const [textInput, setTextInput] = useState("");
   const [search, setSearch] = useState("");
   const [dropdownOpen, setDropdownOpen] = useState(false);
 
@@ -125,45 +99,26 @@ export function ConversationBar({
     return groups;
   }, [filteredModels]);
 
-  const handleStartOrEnd = useCallback(() => {
+  const handleConnectOrDisconnect = () => {
     if (isConnected || isLoading) {
       onDisconnect();
       return;
     }
     onConnect();
-  }, [isConnected, isLoading, onConnect, onDisconnect]);
+  };
 
-  const handleSend = useCallback(() => {
-    const trimmed = textInput.trim();
-    if (!trimmed || !isConnected) return;
-
-    onSendMessage?.(trimmed);
-    onMessage?.({ source: "user", message: trimmed });
-    setTextInput("");
-  }, [isConnected, onMessage, onSendMessage, textInput]);
-
-  const handleTextKeyDown = useCallback(
-    (event: KeyboardEvent<HTMLTextAreaElement>) => {
-      if (event.key === "Enter" && !event.shiftKey) {
-        event.preventDefault();
-        handleSend();
-      }
-    },
-    [handleSend]
-  );
-
-  const statusLabel = useMemo(() => {
-    if (state === "initializing") return "Initializing…";
-    if (state === "connecting") return "Connecting…";
-    if (state === "connected") return "Connected";
-    if (state === "muted") return "Muted";
-    return "Ready";
-  }, [state]);
+  const statusText = isLoading
+    ? "CONNECTING"
+    : isConnected
+    ? isMuted
+      ? "MUTED"
+      : "LISTENING"
+    : "READY";
+  const statusColor = isConnected ? "#D9934E" : "#6DB87A";
 
   return (
     <div className={className}>
-      <div className="rounded-[2rem] border border-[#CBD5E1] bg-[#F8FAFC]/85 backdrop-blur-md shadow-[0_10px_30px_rgba(15,23,42,0.12)] p-2.5 sm:p-3">
-        {/* Click-away overlay for model dropdown */}
+      <div className="relative rounded-[2.1rem] border border-white/90 bg-white/75 backdrop-blur-[24px] p-5 shadow-[0_1px_2px_rgba(120,110,95,0.04),0_4px_12px_rgba(120,110,95,0.06),0_16px_48px_rgba(120,110,95,0.08)]">
         {dropdownOpen && (
           <button
             type="button"
@@ -173,182 +128,141 @@ export function ConversationBar({
           />
         )}
 
-        <div className="flex flex-col-reverse">
-          {/* Collapsible text input (above the bar) */}
-          <motion.div
-            initial={false}
-            animate={{ maxHeight: keyboardOpen ? 132 : 0, opacity: keyboardOpen ? 1 : 0 }}
-            transition={{ duration: 0.22, ease: "easeOut" }}
-            className="overflow-hidden"
-          >
-            <div className="relative pb-2 px-1">
-              <textarea
-                value={textInput}
-                onChange={(event) => setTextInput(event.target.value)}
-                onKeyDown={handleTextKeyDown}
-                placeholder="Send a text update..."
-                className="w-full min-h-[96px] resize-none rounded-xl border border-[#E2E8F0] bg-white px-3 py-2 pr-12 text-sm text-[#1E293B] outline-none focus:border-[#94A3B8]"
-                disabled={!isConnected}
+        <div className="relative z-50 flex items-center justify-between">
+          <div className="h-12 w-[62%] rounded-2xl border border-[#EAE6DF] bg-[#FAFAF8] px-3 flex items-center justify-center overflow-hidden shadow-[0_1px_2px_rgba(0,0,0,0.02)]">
+            {isConnected ? (
+              <div className={`w-full ${waveformClassName ?? ""}`}>
+                <Waveform barHeights={barHeights} active={!isMuted} />
+              </div>
+            ) : (
+              <DotPlaceholder />
+            )}
+          </div>
+
+          <div className="ml-4 flex items-center gap-3">
+            <button
+              type="button"
+              onClick={onToggleMute}
+              disabled={!isConnected}
+              className="h-[34px] w-[34px] rounded-[10px] border border-[#DCD7CD]/80 bg-[#FAF8F5]/90 text-[#A8A296] hover:text-[#D9934E] disabled:opacity-50"
+              aria-label={isMuted ? "Unmute mic" : "Mute mic"}
+            >
+              <span className="flex items-center justify-center">
+                {isMuted ? <MicOff size={16} /> : <Mic size={16} />}
+              </span>
+            </button>
+
+            <button
+              type="button"
+              onClick={handleConnectOrDisconnect}
+              className="h-[34px] w-[34px] rounded-[10px] border border-[#DCD7CD]/80 bg-[#FAF8F5]/90 text-[#A8A296] hover:text-[#D9934E]"
+              aria-label={isConnected || isLoading ? "Disconnect" : "Connect"}
+            >
+              <span className="flex items-center justify-center">
+                {isConnected || isLoading ? <X size={16} /> : <Phone size={16} />}
+              </span>
+            </button>
+
+            {/* External slot (e.g., SettingsPanel) */}
+            {rightSlot}
+          </div>
+        </div>
+
+        <div className="relative z-50 mt-3 border-t border-[#DCD7CD]/60 pt-3 flex items-center gap-2">
+          <div
+            className="h-3 w-3 rounded-full shadow-[0_0_12px_rgba(109,184,122,0.35)]"
+            style={{ backgroundColor: statusColor }}
+          />
+          <span className="text-[10px] font-medium uppercase tracking-[0.15em] text-[#A8A296]">
+            {statusText === "LISTENING" ? "CONNECTED" : statusText}
+          </span>
+          <div className="mx-1 h-3 w-px bg-[#DCD7CD]" />
+
+          <div className="relative">
+            <button
+              type="button"
+              onClick={() => {
+                if (isConnected || isLoading) return;
+                setDropdownOpen((prev) => !prev);
+              }}
+              className="inline-flex items-center gap-1 rounded-md px-1 py-0.5 hover:bg-[#FAF8F5]"
+              aria-expanded={dropdownOpen}
+              aria-haspopup="listbox"
+              disabled={isConnected || isLoading}
+            >
+              <span
+                className="inline-flex h-[18px] w-[18px] items-center justify-center rounded text-[9px] font-semibold"
+                style={{ backgroundColor: selectedModel.bg, color: selectedModel.tone }}
+              >
+                {selectedModel.badge}
+              </span>
+              <span className="text-[10px] text-[#8A8578]">{selectedModel.name}</span>
+              <ChevronDown
+                size={12}
+                className={`text-[#C8C3BA] transition-transform ${dropdownOpen ? "rotate-180" : ""}`}
               />
-              <button
-                type="button"
-                className="absolute right-4 bottom-5 h-8 w-8 rounded-full flex items-center justify-center text-[#334155] hover:bg-[#F1F5F9] disabled:opacity-35"
-                onClick={handleSend}
-                disabled={!isConnected || !textInput.trim()}
-                aria-label="Send message"
-              >
-                <ArrowUp size={16} />
-              </button>
-            </div>
-          </motion.div>
+            </button>
 
-          {/* Main bar + status */}
-          <div>
-            <div className="flex items-center gap-2">
-              {/* Waveform area */}
-              <div className="flex-1 h-[50px] rounded-2xl border border-[#E2E8F0] bg-[#EFF3F7] px-3 flex items-center justify-center overflow-hidden">
-                <div className={`w-full ${waveformClassName ?? ""}`}>
-                  <Waveform barHeights={barHeights} active={isConnected && !isMuted} />
-                </div>
-              </div>
-
-              {/* Mute button */}
-              <button
-                type="button"
-                className="h-10 w-10 rounded-full flex items-center justify-center text-[#64748B] hover:bg-[#E2E8F0] disabled:opacity-40 disabled:cursor-not-allowed"
-                onClick={onToggleMute}
-                disabled={!isConnected}
-                aria-pressed={isMuted}
-                aria-label={isMuted ? "Unmute microphone" : "Mute microphone"}
-              >
-                {isMuted ? <MicOff size={19} /> : <Mic size={19} />}
-              </button>
-
-              {/* Keyboard toggle */}
-              <button
-                type="button"
-                className="h-10 w-10 rounded-full flex items-center justify-center text-[#475569] hover:bg-[#E2E8F0] disabled:opacity-40 disabled:cursor-not-allowed"
-                onClick={() => setKeyboardOpen((prev) => !prev)}
-                disabled={!isConnected}
-                aria-pressed={keyboardOpen}
-                aria-label="Toggle keyboard"
-              >
-                <Keyboard
-                  className={`absolute transition-all duration-200 ${
-                    keyboardOpen ? "opacity-0 scale-75" : "opacity-100 scale-100"
-                  }`}
-                  size={19}
-                />
-                <ChevronDown
-                  className={`absolute transition-all duration-200 ${
-                    keyboardOpen ? "opacity-100 scale-100" : "opacity-0 scale-75"
-                  }`}
-                  size={19}
-                />
-              </button>
-
-              {/* Model selector button (only when not connected) */}
-              <div className="relative">
-                <button
-                  type="button"
-                  onClick={() => {
-                    if (isConnected || isLoading) return;
-                    setDropdownOpen((prev) => !prev);
-                  }}
-                  className="inline-flex items-center gap-1 h-10 px-2 rounded-full text-[#475569] hover:bg-[#E2E8F0] disabled:opacity-40 disabled:cursor-not-allowed"
-                  disabled={isConnected || isLoading}
-                  aria-expanded={dropdownOpen}
-                  aria-haspopup="listbox"
-                >
-                  <span
-                    className="inline-flex h-[18px] w-[18px] items-center justify-center rounded text-[9px] font-semibold"
-                    style={{ backgroundColor: selectedModel.bg, color: selectedModel.tone }}
-                  >
-                    {selectedModel.badge}
-                  </span>
-                  <span className="text-[11px] hidden sm:inline">{selectedModel.name}</span>
-                  <ChevronDown
-                    size={14}
-                    className={`transition-transform ${dropdownOpen ? "rotate-180" : ""}`}
+            <div
+              className={`absolute bottom-[calc(100%+8px)] left-1/2 z-50 w-[210px] -translate-x-1/2 rounded-xl border border-white/90 bg-white/95 shadow-xl transition-all ${
+                dropdownOpen ? "visible opacity-100 translate-y-0" : "invisible opacity-0 translate-y-1"
+              }`}
+            >
+              <div className="p-2 border-b border-[#DCD7CD]/40">
+                <div className="relative">
+                  <Search size={12} className="absolute left-2 top-1/2 -translate-y-1/2 text-[#C8C3BA]" />
+                  <input
+                    value={search}
+                    onChange={(event) => setSearch(event.target.value)}
+                    placeholder="Search model..."
+                    className="w-full rounded-md border border-[#DCD7CD]/50 bg-[#FAF8F5]/50 py-1 pl-6 pr-2 text-[10px] text-[#3D3A35] outline-none focus:border-[#D9934E]/40"
                   />
-                </button>
-
-                {/* Model dropdown (opens above the button) */}
-                <div
-                  className={`absolute bottom-[calc(100%+8px)] right-0 z-50 w-[210px] rounded-xl border border-[#E2E8F0] bg-white shadow-xl transition-all ${
-                    dropdownOpen ? "visible opacity-100 translate-y-0" : "invisible opacity-0 translate-y-1"
-                  }`}
-                >
-                  <div className="p-2 border-b border-[#E2E8F0]">
-                    <div className="relative">
-                      <Search size={12} className="absolute left-2 top-1/2 -translate-y-1/2 text-[#94A3B8]" />
-                      <input
-                        value={search}
-                        onChange={(event) => setSearch(event.target.value)}
-                        placeholder="Search model..."
-                        className="w-full rounded-md border border-[#E2E8F0] bg-[#F8FAFC] py-1 pl-6 pr-2 text-[10px] text-[#1E293B] outline-none focus:border-[#94A3B8]"
-                      />
-                    </div>
-                  </div>
-
-                  <div className="max-h-[220px] overflow-y-auto p-1">
-                    {(Object.keys(groupedModels) as ModelOption["provider"][]).map((provider) => {
-                      const models = groupedModels[provider];
-                      if (!models.length) return null;
-
-                      return (
-                        <div key={provider} className="mb-1">
-                          <div className="px-2 py-1 text-[8px] uppercase tracking-widest text-[#94A3B8]">
-                            {PROVIDER_LABEL[provider]}
-                          </div>
-                          {models.map((model) => (
-                            <button
-                              key={model.id}
-                              type="button"
-                              className={`w-full flex items-center gap-2 rounded-md px-2 py-1 text-left hover:bg-[#F1F5F9] ${
-                                selectedModelId === model.id ? "bg-[#F1F5F9]" : ""
-                              }`}
-                              onClick={() => {
-                                onModelChange?.(model.id);
-                                setDropdownOpen(false);
-                                setSearch("");
-                              }}
-                            >
-                              <span
-                                className="inline-flex h-[18px] w-[18px] items-center justify-center rounded text-[9px] font-semibold"
-                                style={{ backgroundColor: model.bg, color: model.tone }}
-                              >
-                                {model.badge}
-                              </span>
-                              <span className="flex-1 text-[10px] text-[#334155]">{model.name}</span>
-                              {selectedModelId === model.id && <Check size={12} className="text-[#3B82F6]" />}
-                            </button>
-                          ))}
-                        </div>
-                      );
-                    })}
-                    {!filteredModels.length && (
-                      <div className="px-3 py-5 text-center text-[10px] text-[#94A3B8]">No models found</div>
-                    )}
-                  </div>
                 </div>
               </div>
 
-              {/* Connect / Disconnect button */}
-              <button
-                type="button"
-                className="relative h-10 w-10 rounded-full flex items-center justify-center text-[#475569] hover:bg-[#E2E8F0] disabled:opacity-40 disabled:cursor-not-allowed"
-                onClick={handleStartOrEnd}
-                aria-label={isConnected || isLoading ? "End conversation" : "Start conversation"}
-              >
-                {isConnected || isLoading ? <X size={19} /> : <Phone size={19} />}
-              </button>
+              <div className="max-h-[220px] overflow-y-auto p-1">
+                {(Object.keys(groupedModels) as ModelOption["provider"][]).map((provider) => {
+                  const models = groupedModels[provider];
+                  if (!models.length) return null;
 
-              {/* External slot (e.g., SettingsPanel) */}
-              {rightSlot}
+                  return (
+                    <div key={provider} className="mb-1">
+                      <div className="px-2 py-1 text-[8px] uppercase tracking-widest text-[#C8C3BA]">
+                        {PROVIDER_LABEL[provider]}
+                      </div>
+                      {models.map((model) => (
+                        <button
+                          key={model.id}
+                          type="button"
+                          className={`w-full flex items-center gap-2 rounded-md px-2 py-1 text-left hover:bg-[#FFF8F0] ${
+                            selectedModelId === model.id ? "bg-[#FFF5E6]/70" : ""
+                          }`}
+                          onClick={() => {
+                            onModelChange?.(model.id);
+                            setDropdownOpen(false);
+                            setSearch("");
+                          }}
+                        >
+                          <span
+                            className="inline-flex h-[18px] w-[18px] items-center justify-center rounded text-[9px] font-semibold"
+                            style={{ backgroundColor: model.bg, color: model.tone }}
+                          >
+                            {model.badge}
+                          </span>
+                          <span className="flex-1 text-[10px] text-[#5C5A56]">{model.name}</span>
+                          {selectedModelId === model.id && (
+                            <Check size={12} className="text-[#D9934E]" />
+                          )}
+                        </button>
+                      ))}
+                    </div>
+                  );
+                })}
+                {!filteredModels.length && (
+                  <div className="px-3 py-5 text-center text-[10px] text-[#A8A296]">No models found</div>
+                )}
+              </div>
             </div>
-
-            <p className="mt-1 px-1 text-[11px] tracking-wide uppercase text-[#64748B]">{statusLabel}</p>
           </div>
         </div>
       </div>
