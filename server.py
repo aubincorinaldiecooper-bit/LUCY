@@ -316,6 +316,8 @@ async def run_bot(room_url: str, token: str):
         logger.info("Pipeline runner started; waiting for Daily participants to join")
         try:
             await runner.run(task)
+               except Exception as e:
+            logger.exception(f"Pipeline runner failed unexpectedly: {e}")
         finally:
             return_tts_service(tts)
 
