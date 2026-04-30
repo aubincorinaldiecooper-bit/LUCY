@@ -110,10 +110,11 @@ export function ConversationBar({
   const statusText = isLoading
     ? "CONNECTING"
     : isConnected
-    ? isMuted
-      ? "MUTED"
-      : "LISTENING"
-    : "READY";
+      ? isMuted
+        ? "MUTED"
+        : "LISTENING"
+      : "READY";
+      
   const statusColor = isConnected ? "#D9934E" : "#6DB87A";
 
   return (
@@ -163,7 +164,6 @@ export function ConversationBar({
               </span>
             </button>
 
-            {/* External slot (e.g., SettingsPanel) */}
             {rightSlot}
           </div>
         </div>
@@ -215,4 +215,57 @@ export function ConversationBar({
                     value={search}
                     onChange={(event) => setSearch(event.target.value)}
                     placeholder="Search model..."
-                    className="w-full rounded-md border border-[#DC
+                    className="w-full rounded-md border border-[#DCD7CD]/50 bg-[#FAF8F5]/50 py-1 pl-6 pr-2 text-[10px] text-[#3D3A35] outline-none focus:border-[#D9934E]/40"
+                  />
+                </div>
+              </div>
+
+              <div className="max-h-[220px] overflow-y-auto p-1">
+                {(Object.keys(groupedModels) as ModelOption["provider"][]).map((provider) => {
+                  const models = groupedModels[provider];
+                  if (!models.length) return null;
+
+                  return (
+                    <div key={provider} className="mb-1">
+                      <div className="px-2 py-1 text-[8px] uppercase tracking-widest text-[#C8C3BA]">
+                        {PROVIDER_LABEL[provider]}
+                      </div>
+                      {models.map((model) => (
+                        <button
+                          key={model.id}
+                          type="button"
+                          className={`w-full flex items-center gap-2 rounded-md px-2 py-1 text-left hover:bg-[#FFF8F0] ${
+                            selectedModelId === model.id ? "bg-[#FFF5E6]/70" : ""
+                          }`}
+                          onClick={() => {
+                            onModelChange?.(model.id);
+                            setDropdownOpen(false);
+                            setSearch("");
+                          }}
+                        >
+                          <span
+                            className="inline-flex h-[18px] w-[18px] items-center justify-center rounded text-[9px] font-semibold"
+                            style={{ backgroundColor: model.bg, color: model.tone }}
+                          >
+                            {model.badge}
+                          </span>
+                          <span className="flex-1 text-[10px] text-[#5C5A56]">{model.name}</span>
+                          {selectedModelId === model.id && (
+                            <Check size={12} className="text-[#D9934E]" />
+                          )}
+                        </button>
+                      ))}
+                    </div>
+                  );
+                })}
+                {!filteredModels.length && (
+                  <div className="px-3 py-5 text-center text-[10px] text-[#A8A296]">No models found</div>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
