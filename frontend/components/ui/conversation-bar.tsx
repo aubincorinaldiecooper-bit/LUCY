@@ -76,7 +76,7 @@ export function ConversationBar({
   const isMuted = state === "muted";
   const isLoading = state === "initializing" || state === "connecting";
 
-  const selectedModel = useMemo(
+   const selectedModel = useMemo(
     () => MODEL_OPTIONS.find((m) => m.id === selectedModelId) ?? MODEL_OPTIONS[0],
     [selectedModelId]
   );
@@ -159,12 +159,8 @@ export function ConversationBar({
               className="h-[34px] w-[34px] rounded-[10px] border border-[#DCD7CD]/80 bg-[#FAF8F5]/90 text-[#A8A296] hover:text-[#D9934E]"
               aria-label={isConnected || isLoading ? "Disconnect" : "Connect"}
             >
-              <span className="flex items-center justify-center">
-                {isConnected || isLoading ? <X size={16} /> : <Phone size={16} />}
-              </span>
+              <span className="flex items-center justify-center">{isConnected || isLoading ? <X size={16} /> : <Phone size={16} />}</span>
             </button>
-
-            {rightSlot}
           </div>
         </div>
 
