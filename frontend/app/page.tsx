@@ -1,3 +1,5 @@
+"use client"
+
 import dynamic from "next/dynamic";
 import { motion } from "framer-motion";
 import { DotLottieReact } from "@lottiefiles/dotlottie-react";
