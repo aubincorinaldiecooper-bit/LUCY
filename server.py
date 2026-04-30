@@ -3,7 +3,6 @@ os.environ["ORT_INTRA_OP_NUM_THREADS"] = "2"
 os.environ["ORT_INTER_OP_NUM_THREADS"] = "1"
 os.environ["ONNXRUNTIME_LOG_LEVEL"] = "3"
 
-import asyncio
 import time
 import re
 from contextlib import asynccontextmanager
@@ -17,7 +16,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import EndFrame, LLMMessagesUpdateFrame, Frame, TextFrame
+from pipecat.frames.frames import (
+    EndFrame,
+    ErrorFrame,
+    LLMMessagesUpdateFrame,
+    Frame,
+    TextFrame,
+    TranscriptionFrame,
+    UserAudioRawFrame,
+)
 from pipecat.observers.loggers.metrics_log_observer import MetricsLogObserver
 from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
 from pipecat.pipeline.pipeline import Pipeline
@@ -56,6 +63,10 @@ def parse_cors_origins(origins: str) -> list[str]:
 
 ALLOWED_CORS_ORIGINS = parse_cors_origins(CORS_ORIGINS)
 
+logger.info(f"DEEPGRAM_API_KEY {'is set' if DEEPGRAM_API_KEY else 'is NOT set — STT will fail'}")
+logger.info(f"OPENROUTER_API_KEY {'is set' if OPENROUTER_API_KEY else 'is NOT set'}")
+logger.info(f"DAILY_API_KEY {'is set' if DAILY_API_KEY else 'is NOT set'}")
+
 _WARMED_VAD_ANALYZER: SileroVADAnalyzer | None = None
 
 def create_tts_service() -> KokoroTTSService:
@@ -85,16 +96,61 @@ async def warmup_models() -> None:
     logger.info(f"Startup model warm-up finished in {time.perf_counter() - warmup_start:.2f}s")
 
 class TextNormalizer(FrameProcessor):
+    """Strips markdown characters from TextFrames and passes all other frames through."""
+
     def __init__(self):
         super().__init__()
-        self._markdown_pattern = re.compile(r'[*_`#~>]|```|^\s*[-*•]\s+')
+        self._markdown_pattern = re.compile(r'[*_`#~>]|```|^\s*[-*•]\s+', re.MULTILINE)
+
+    def _check_started(self, frame: Frame) -> None:
+        pass
+
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         if isinstance(frame, TextFrame):
             clean = self._markdown_pattern.sub('', frame.text)
             clean = re.sub(r'\s+', ' ', clean).strip()
-            if clean:
-                frame = TextFrame(text=clean, user_id=frame.user_id)
+            await self.push_frame(
+                TextFrame(text=clean, user_id=frame.user_id) if clean else frame,
+                direction,
+            )
+        else:
+            await self.push_frame(frame, direction)
+
+
+class STTDebugProcessor(FrameProcessor):
+    """Development-only processor for frame-level STT debugging.
+    Kept in file for easy reactivation, but removed from production pipeline."""
+
+    def __init__(self, label: str = "STTDebug"):
+        super().__init__()
+        self._label = label
+        self._audio_frames_in: int = 0
+        self._transcripts_out: int = 0
+
+    def _check_started(self, frame: Frame) -> None:
+        pass
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        if isinstance(frame, UserAudioRawFrame):
+            self._audio_frames_in += 1
+            if self._audio_frames_in == 1 or self._audio_frames_in % 100 == 0:
+                logger.debug(
+                    f"[{self._label}] Audio frame #{self._audio_frames_in} → STT "
+                    f"(size={len(frame.audio)} bytes, "
+                    f"sample_rate={frame.sample_rate}, "
+                    f"channels={frame.num_channels})"
+                )
+        elif isinstance(frame, TranscriptionFrame):
+            self._transcripts_out += 1
+            logger.info(
+                f"[{self._label}] Transcript #{self._transcripts_out} ← STT: "
+                f"text={frame.text!r} user_id={frame.user_id!r}"
+            )
+        elif isinstance(frame, ErrorFrame):
+            logger.error(f"[{self._label}] ErrorFrame from STT: {frame.error!r}")
+
         await self.push_frame(frame, direction)
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -128,7 +184,20 @@ async def run_bot(room_url: str, token: str):
         ),
     )
 
-    stt = DeepgramSTTService(api_key=DEEPGRAM_API_KEY)
+    if not DEEPGRAM_API_KEY:
+        logger.error("DEEPGRAM_API_KEY is not set — DeepgramSTTService will not produce transcripts")
+
+    stt = DeepgramSTTService(
+        api_key=DEEPGRAM_API_KEY,
+        settings=DeepgramSTTService.Settings(
+            language="en",
+            model="nova-2",
+            smart_format=True,
+            punctuate=True,
+            interim_results=False,
+            utterance_end_ms=1000,
+        ),
+    )
 
     llm = OpenRouterLLMService(
         api_key=OPENROUTER_API_KEY,
@@ -159,9 +228,9 @@ async def run_bot(room_url: str, token: str):
         pipeline = Pipeline([
             transport.input(),
             stt,
+            TextNormalizer(),
             context_aggregator.user(),
             llm,
-            TextNormalizer(),
             tts,
             transport.output(),
             context_aggregator.assistant(),
@@ -187,10 +256,18 @@ async def run_bot(room_url: str, token: str):
             observers=[MetricsLogObserver(), user_bot_latency_observer],
         )
 
+        @stt.event_handler("on_connection_error")
+        async def on_stt_connection_error(_stt, error):
+            logger.error(f"Deepgram STT connection error: {error!r}")
+
         @transport.event_handler("on_first_participant_joined")
         async def on_first_participant_joined(_transport, _participant):
             join_delay_seconds = time.monotonic() - run_started_at
             logger.info(f"First participant joined ({join_delay_seconds:.2f}s after run_bot start)")
+            logger.info(
+                f"Deepgram STT configured: model=nova-2, language=en, "
+                f"api_key={'set' if DEEPGRAM_API_KEY else 'MISSING'}"
+            )
             await task.queue_frame(
                 LLMMessagesUpdateFrame([{"role": "user", "content": "Hello"}], run_llm=True)
             )
@@ -202,8 +279,11 @@ async def run_bot(room_url: str, token: str):
 
         runner = PipelineRunner()
         logger.info("Pipeline runner started; waiting for Daily participants to join")
-        await runner.run(task)
-    
+        try:
+            await runner.run(task)
+        except Exception as e:
+            logger.exception(f"Pipeline runner failed unexpectedly: {e}")
+
 async def create_daily_session() -> tuple[str, str, str]:
     if not DAILY_API_KEY:
         raise HTTPException(status_code=500, detail="DAILY_API_KEY is not configured")
