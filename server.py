@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import (
@@ -167,7 +168,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-async def run_bot(room_url: str, token: str):
+async def run_bot(room_url: str, token: str, model_id: str | None = None):
     run_started_at = time.monotonic()
     logger.info(f"Starting Daily session for room: {room_url}")
 
@@ -187,7 +188,6 @@ async def run_bot(room_url: str, token: str):
     if not DEEPGRAM_API_KEY:
         logger.error("DEEPGRAM_API_KEY is not set — DeepgramSTTService will not produce transcripts")
 
-    # FIX: Removed interim_results and utterance_end_ms to fix 400 WebSocket error
     stt = DeepgramSTTService(
         api_key=DEEPGRAM_API_KEY,
         settings=DeepgramSTTService.Settings(
@@ -198,9 +198,12 @@ async def run_bot(room_url: str, token: str):
         ),
     )
 
+    selected_model = model_id or OPENROUTER_MODEL
+    logger.info(f"Using model for session: {selected_model}")
+
     llm = OpenRouterLLMService(
         api_key=OPENROUTER_API_KEY,
-        settings=OpenRouterLLMService.Settings(model=OPENROUTER_MODEL),
+        settings=OpenRouterLLMService.Settings(model=selected_model),
         system_prompt=SYSTEM_PROMPT,
     )
 
@@ -269,59 +272,4 @@ async def run_bot(room_url: str, token: str):
             )
             await task.queue_frame(
                 LLMMessagesUpdateFrame([{"role": "user", "content": "Hello"}], run_llm=True)
-            )
-
-        @transport.event_handler("on_participant_left")
-        async def on_participant_left(_transport, _participant, _reason):
-            logger.info("Participant left")
-            await task.queue_frame(EndFrame())
-
-        runner = PipelineRunner()
-        logger.info("Pipeline runner started; waiting for Daily participants to join")
-        try:
-            await runner.run(task)
-        except Exception as e:
-            logger.exception(f"Pipeline runner failed unexpectedly: {e}")
-
-async def create_daily_session() -> tuple[str, str, str]:
-    if not DAILY_API_KEY:
-        raise HTTPException(status_code=500, detail="DAILY_API_KEY is not configured")
-    async with aiohttp.ClientSession() as aiohttp_session:
-        helper = DailyRESTHelper(
-            daily_api_key=DAILY_API_KEY,
-            daily_api_url=DAILY_API_URL,
-            aiohttp_session=aiohttp_session,
-        )
-        room_url = DAILY_ROOM_URL
-        if not room_url:
-            room = await helper.create_room(DailyRoomParams())
-            room_url = room.url
-        bot_token = await helper.get_token(room_url, owner=True)
-        user_token = await helper.get_token(room_url, owner=False)
-    return room_url, user_token, bot_token
-
-@app.get("/health")
-async def health() -> JSONResponse:
-    return JSONResponse({"status": "ok"})
-
-@app.post("/api/daily/session")
-async def daily_session(background_tasks: BackgroundTasks):
-    room_url, user_token, bot_token = await create_daily_session()
-    background_tasks.add_task(run_bot, room_url, bot_token)
-    return JSONResponse({"room_url": room_url, "token": user_token})
-
-@app.options("/api/daily/session")
-@app.options("/api/daily/session/")
-async def daily_session_preflight(request: Request) -> Response:
-    origin = request.headers.get("origin", "")
-    response = Response(status_code=204)
-    if origin in ALLOWED_CORS_ORIGINS:
-        response.headers["Access-Control-Allow-Origin"] = origin
-        response.headers["Access-Control-Allow-Credentials"] = "true"
-        response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
-        response.headers["Access-Control-Allow-Headers"] = request.headers.get("access-control-request-headers", "*")
-        response.headers["Vary"] = "Origin"
-    return response
-
-if __name__ == "__main__":
-    uvicorn.run("server:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+           

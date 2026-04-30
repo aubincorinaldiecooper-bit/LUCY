@@ -10,8 +10,6 @@ type DailySessionResponse = {
   token: string;
 };
 
-const REMOTE_AUDIO_ELEMENT_ID = "lucy-remote-audio";
-
 function resolveSessionUrl() {
   const rawApiUrl = process.env.NEXT_PUBLIC_API_URL?.trim().replace(/^['"]|['"]$/g, "");
 
@@ -43,32 +41,7 @@ export function useVoiceClient() {
   const [state, setState] = useState<VoiceState>("idle");
   const [isMuted, setIsMuted] = useState(false);
   const callRef = useRef<DailyCall | null>(null);
-
-  const ensureRemoteAudioElement = useCallback(() => {
-    let audioEl = document.getElementById(REMOTE_AUDIO_ELEMENT_ID) as HTMLAudioElement | null;
-
-    if (!audioEl) {
-      audioEl = document.createElement("audio");
-      audioEl.id = REMOTE_AUDIO_ELEMENT_ID;
-      audioEl.autoplay = true;
-      audioEl.setAttribute("playsinline", "true");
-      audioEl.style.display = "none";
-      document.body.appendChild(audioEl);
-    }
-
-    return audioEl;
-  }, []);
-
-  const clearRemoteAudioElement = useCallback(() => {
-    const audioEl = document.getElementById(REMOTE_AUDIO_ELEMENT_ID) as HTMLAudioElement | null;
-    if (!audioEl) {
-      return;
-    }
-
-    audioEl.pause();
-    audioEl.srcObject = null;
-    audioEl.remove();
-  }, []);
+  const joinStartedAtRef = useRef<number | null>(null);
 
   const disconnect = useCallback(async () => {
     const call = callRef.current;
@@ -94,11 +67,11 @@ export function useVoiceClient() {
       }
 
       callRef.current = null;
-      clearRemoteAudioElement();
+      joinStartedAtRef.current = null;
       setState("idle");
       setIsMuted(false);
     }
-  }, [clearRemoteAudioElement]);
+  }, []);
 
   const connect = useCallback(async (modelId?: string) => {
     if (callRef.current) {
@@ -113,12 +86,12 @@ export function useVoiceClient() {
         audioSource: true,
         videoSource: false,
         startAudioOff: false,
-        subscribeToTracksAutomatically: true,
+        subscribeToTracksAutomatically: true, // ✅ Daily.js handles remote audio natively & safely
       });
 
       (call as any).on("joined-meeting", () => {
         console.debug("[daily] joined meeting");
-        setState(isMuted ? "muted" : "connected");
+        setState("connecting");
       });
 
       (call as any).on("left-meeting", () => {
@@ -126,15 +99,15 @@ export function useVoiceClient() {
         setState("idle");
         setIsMuted(false);
         callRef.current = null;
-        clearRemoteAudioElement();
+        joinStartedAtRef.current = null;
       });
 
       (call as any).on("error", () => {
         console.debug("[daily] meeting error");
-        clearRemoteAudioElement();
         setState("idle");
         setIsMuted(false);
         callRef.current = null;
+        joinStartedAtRef.current = null;
       });
 
       (call as any).on("track-started", (event: { participant: { local: boolean } | null; track: MediaStreamTrack; type: string }) => {
@@ -142,21 +115,24 @@ export function useVoiceClient() {
           return;
         }
 
-        const audioEl = ensureRemoteAudioElement();
-        audioEl.srcObject = new MediaStream([event.track]);
-        void audioEl.play().catch((error) => {
-          console.debug("[daily] remote audio playback blocked", error);
-        });
-      });
-
-      (call as any).on("track-stopped", (event: { type: string }) => {
-        if (event.type === "audio") {
-          clearRemoteAudioElement();
+        // ✅ Latency tracking preserved from codex branch
+        const joinStartedAt = joinStartedAtRef.current;
+        if (joinStartedAt) {
+          const firstResponseLatencyMs = performance.now() - joinStartedAt;
+          if (firstResponseLatencyMs > 2000) {
+            console.warn(`[daily] first response latency ${Math.round(firstResponseLatencyMs)}ms (>2000ms target)`);
+          } else {
+            console.debug(`[daily] first response latency ${Math.round(firstResponseLatencyMs)}ms`);
+          }
+          joinStartedAtRef.current = null;
         }
+
+        setState(isMuted ? "muted" : "connected");
       });
 
       callRef.current = call;
       setState("connecting");
+      joinStartedAtRef.current = performance.now();
 
       await call.join({
         url: session.room_url,
@@ -165,12 +141,7 @@ export function useVoiceClient() {
       });
 
       call.setLocalAudio(!isMuted);
-      const audioEl = ensureRemoteAudioElement();
-      void audioEl.play().catch((error) => {
-        console.debug("[daily] remote audio element not ready to play yet", error);
-      });
 
-      setState(isMuted ? "muted" : "connected");
     } catch {
       if (callRef.current && !callRef.current.isDestroyed()) {
         try {
@@ -183,18 +154,17 @@ export function useVoiceClient() {
       }
 
       callRef.current = null;
-      clearRemoteAudioElement();
+      joinStartedAtRef.current = null;
       setIsMuted(false);
       setState("idle");
     }
-  }, [clearRemoteAudioElement, ensureRemoteAudioElement, isMuted]);
+  }, [isMuted]);
 
   useEffect(() => {
     return () => {
       void disconnect();
-      clearRemoteAudioElement();
     };
-  }, [clearRemoteAudioElement, disconnect]);
+  }, [disconnect]);
 
   const toggleMute = useCallback(() => {
     const nextMuted = !isMuted;
