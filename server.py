@@ -172,9 +172,9 @@ async def run_bot(room_url: str, token: str):
         pipeline = Pipeline([
             transport.input(),
             stt,
+            TextNormalizer(),
             context_aggregator.user(),
             llm,
-            TextNormalizer(),
             tts,
             transport.output(),
             context_aggregator.assistant(),
