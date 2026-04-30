@@ -17,7 +17,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import EndFrame, LLMMessagesUpdateFrame, Frame, TextFrame
+from pipecat.frames.frames import (
+    EndFrame,
+    ErrorFrame,
+    LLMMessagesUpdateFrame,
+    Frame,
+    TextFrame,
+    TranscriptionFrame,
+    UserAudioRawFrame,
+)
 from pipecat.observers.loggers.metrics_log_observer import MetricsLogObserver
 from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
 from pipecat.pipeline.pipeline import Pipeline
@@ -55,6 +63,10 @@ def parse_cors_origins(origins: str) -> list[str]:
     return [origin.strip() for origin in origins.split(",") if origin.strip()]
 
 ALLOWED_CORS_ORIGINS = parse_cors_origins(CORS_ORIGINS)
+
+logger.info(f"DEEPGRAM_API_KEY {'is set' if DEEPGRAM_API_KEY else 'is NOT set — STT will fail'}")
+logger.info(f"OPENROUTER_API_KEY {'is set' if OPENROUTER_API_KEY else 'is NOT set'}")
+logger.info(f"DAILY_API_KEY {'is set' if DAILY_API_KEY else 'is NOT set'}")
 
 _KOKORO_TTS_POOL: asyncio.LifoQueue[KokoroTTSService] = asyncio.LifoQueue(maxsize=2)
 _WARMED_VAD_ANALYZER: SileroVADAnalyzer | None = None
@@ -129,6 +141,49 @@ class TextNormalizer(FrameProcessor):
             await self.push_frame(frame, direction)
 
 
+class STTDebugProcessor(FrameProcessor):
+    """Sits immediately upstream of DeepgramSTTService to log audio frames going
+    in, and immediately downstream to log transcripts coming out.  A single
+    instance is used for both roles by inserting it twice in the pipeline:
+
+        transport.input() → STTDebugProcessor (upstream) → stt → STTDebugProcessor (downstream) → …
+
+    Because the same object is reused, audio-in and transcript-out counters are
+    shared, making it easy to correlate the two in logs.
+    """
+
+    def __init__(self, label: str = "STTDebug"):
+        super().__init__()
+        self._label = label
+        self._audio_frames_in: int = 0
+        self._transcripts_out: int = 0
+
+    def _check_started(self, frame: Frame) -> None:
+        # No-op: must not block audio frames that arrive before StartFrame.
+        pass
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        if isinstance(frame, UserAudioRawFrame):
+            self._audio_frames_in += 1
+            if self._audio_frames_in == 1 or self._audio_frames_in % 100 == 0:
+                logger.debug(
+                    f"[{self._label}] Audio frame #{self._audio_frames_in} → STT "
+                    f"(size={len(frame.audio)} bytes, "
+                    f"sample_rate={frame.sample_rate}, "
+                    f"channels={frame.num_channels})"
+                )
+        elif isinstance(frame, TranscriptionFrame):
+            self._transcripts_out += 1
+            logger.info(
+                f"[{self._label}] Transcript #{self._transcripts_out} ← STT: "
+                f"text={frame.text!r} user_id={frame.user_id!r}"
+            )
+        elif isinstance(frame, ErrorFrame):
+            logger.error(f"[{self._label}] ErrorFrame from STT: {frame.error!r}")
+
+        await self.push_frame(frame, direction)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     await warmup_models()
@@ -161,7 +216,22 @@ async def run_bot(room_url: str, token: str):
         ),
     )
 
-    stt = DeepgramSTTService(api_key=DEEPGRAM_API_KEY)
+    if not DEEPGRAM_API_KEY:
+        logger.error("DEEPGRAM_API_KEY is not set — DeepgramSTTService will not produce transcripts")
+
+    stt = DeepgramSTTService(
+        api_key=DEEPGRAM_API_KEY,
+        settings=DeepgramSTTService.Settings(
+            language="en",
+            model="nova-2",
+            smart_format=True,
+            punctuate=True,
+            interim_results=False,
+            utterance_end_ms="1000",
+            vad_events=True,
+        ),
+    )
+    stt_debug = STTDebugProcessor(label="DeepgramSTT")
 
     llm = OpenRouterLLMService(
         api_key=OPENROUTER_API_KEY,
@@ -191,7 +261,9 @@ async def run_bot(room_url: str, token: str):
 
         pipeline = Pipeline([
             transport.input(),
+            stt_debug,       # log audio frames before they enter STT
             stt,
+            stt_debug,       # log transcripts after they leave STT (same instance)
             TextNormalizer(),
             context_aggregator.user(),
             llm,
@@ -220,10 +292,18 @@ async def run_bot(room_url: str, token: str):
             observers=[MetricsLogObserver(), user_bot_latency_observer],
         )
 
+        @stt.event_handler("on_connection_error")
+        async def on_stt_connection_error(_stt, error):
+            logger.error(f"Deepgram STT connection error: {error!r}")
+
         @transport.event_handler("on_first_participant_joined")
         async def on_first_participant_joined(_transport, _participant):
             join_delay_seconds = time.monotonic() - run_started_at
             logger.info(f"First participant joined ({join_delay_seconds:.2f}s after run_bot start)")
+            logger.info(
+                f"Deepgram STT configured: model=nova-2, language=en, "
+                f"api_key={'set' if DEEPGRAM_API_KEY else 'MISSING'}"
+            )
             await task.queue_frame(
                 LLMMessagesUpdateFrame([{"role": "user", "content": "Hello"}], run_llm=True)
             )
