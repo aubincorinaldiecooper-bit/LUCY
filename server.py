@@ -98,22 +98,36 @@ async def warmup_models() -> None:
     logger.info(f"Startup model warm-up finished in {time.perf_counter() - warmup_start:.2f}s")
 
 class TextNormalizer(FrameProcessor):
+    """Strips markdown characters from TextFrames and passes all other frames through.
+
+    Overrides _check_started() as a no-op so that FrameProcessor never blocks
+    frames (e.g. UserAudioRawFrame) that arrive before StartFrame has propagated
+    through the full pipeline.  All frame pushing goes directly through
+    push_frame(); super().process_frame() is never called, so the StartFrame
+    guard in the parent class is bypassed entirely.
+    """
+
     def __init__(self):
         super().__init__()
-        self._markdown_pattern = re.compile(r'[*_`#~>]|```|^\s*[-*•]\s+')
+        self._markdown_pattern = re.compile(r'[*_`#~>]|```|^\s*[-*•]\s+', re.MULTILINE)
+
+    def _check_started(self, frame: Frame) -> None:
+        # Intentionally a no-op: this processor must never block frames due to
+        # StartFrame ordering.  Audio and system frames must flow freely at all
+        # times, regardless of pipeline start state.
+        pass
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         if isinstance(frame, TextFrame):
-            # Only TextFrames go through the parent's validated path (StartFrame check).
             clean = self._markdown_pattern.sub('', frame.text)
             clean = re.sub(r'\s+', ' ', clean).strip()
-            if clean:
-                await super().process_frame(TextFrame(text=clean, user_id=frame.user_id), direction)
+            await self.push_frame(
+                TextFrame(text=clean, user_id=frame.user_id) if clean else frame,
+                direction,
+            )
         else:
-            # All other frame types (e.g. UserAudioRawFrame) are pushed directly,
-            # bypassing FrameProcessor._check_started() so they are never blocked
-            # by the StartFrame propagation order in the pipeline.
             await self.push_frame(frame, direction)
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
