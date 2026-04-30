@@ -227,8 +227,7 @@ async def run_bot(room_url: str, token: str):
             smart_format=True,
             punctuate=True,
             interim_results=False,
-            utterance_end_ms="1000",
-            vad_events=True,
+            utterance_end_ms=1000,
         ),
     )
     stt_debug = STTDebugProcessor(label="DeepgramSTT")
