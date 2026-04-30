@@ -23,12 +23,13 @@ function resolveSessionUrl() {
   return new URL("/api/daily/session", baseUrl).toString();
 }
 
-async function createDailySession(): Promise<DailySessionResponse> {
+async function createDailySession(modelId?: string): Promise<DailySessionResponse> {
   const response = await fetch(resolveSessionUrl(), {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
     },
+    body: JSON.stringify(modelId ? { model_id: modelId } : {}),
   });
 
   if (!response.ok) {
@@ -42,7 +43,6 @@ export function useVoiceClient() {
   const [state, setState] = useState<VoiceState>("idle");
   const [isMuted, setIsMuted] = useState(false);
   const callRef = useRef<DailyCall | null>(null);
-  const activeMicDeviceIdRef = useRef<string | undefined>(undefined);
 
   const ensureRemoteAudioElement = useCallback(() => {
     let audioEl = document.getElementById(REMOTE_AUDIO_ELEMENT_ID) as HTMLAudioElement | null;
@@ -74,7 +74,6 @@ export function useVoiceClient() {
     const call = callRef.current;
 
     if (!call) {
-      activeMicDeviceIdRef.current = undefined;
       return;
     }
 
@@ -95,26 +94,21 @@ export function useVoiceClient() {
       }
 
       callRef.current = null;
-      activeMicDeviceIdRef.current = undefined;
       clearRemoteAudioElement();
       setState("idle");
       setIsMuted(false);
     }
   }, [clearRemoteAudioElement]);
 
-  const connect = useCallback(async (micDeviceId?: string) => {
+  const connect = useCallback(async (modelId?: string) => {
     if (callRef.current) {
-      if (activeMicDeviceIdRef.current === micDeviceId) {
-        return;
-      }
-
-      await disconnect();
+      return;
     }
 
     setState("initializing");
 
     try {
-      const session = await createDailySession();
+      const session = await createDailySession(modelId);
       const call = DailyIframe.createCallObject({
         audioSource: true,
         videoSource: false,
@@ -132,7 +126,6 @@ export function useVoiceClient() {
         setState("idle");
         setIsMuted(false);
         callRef.current = null;
-        activeMicDeviceIdRef.current = undefined;
         clearRemoteAudioElement();
       });
 
@@ -142,12 +135,9 @@ export function useVoiceClient() {
         setState("idle");
         setIsMuted(false);
         callRef.current = null;
-        activeMicDeviceIdRef.current = undefined;
       });
 
       (call as any).on("track-started", (event: { participant: { local: boolean } | null; track: MediaStreamTrack; type: string }) => {
-        console.debug("[daily] track started", event.type);
-
         if (event.participant?.local || event.type !== "audio") {
           return;
         }
@@ -160,8 +150,6 @@ export function useVoiceClient() {
       });
 
       (call as any).on("track-stopped", (event: { type: string }) => {
-        console.debug("[daily] track stopped", event.type);
-
         if (event.type === "audio") {
           clearRemoteAudioElement();
         }
@@ -170,17 +158,12 @@ export function useVoiceClient() {
       callRef.current = call;
       setState("connecting");
 
-      if (micDeviceId) {
-        await call.setInputDevicesAsync({ audioDeviceId: micDeviceId });
-      }
-
       await call.join({
         url: session.room_url,
         token: session.token,
         startAudioOff: false,
       });
 
-      activeMicDeviceIdRef.current = micDeviceId;
       call.setLocalAudio(!isMuted);
       const audioEl = ensureRemoteAudioElement();
       void audioEl.play().catch((error) => {
@@ -189,25 +172,22 @@ export function useVoiceClient() {
 
       setState(isMuted ? "muted" : "connected");
     } catch {
-      if (callRef.current) {
-        if (!callRef.current.isDestroyed()) {
-          try {
-            await callRef.current.destroy();
-          } catch (error) {
-            if (!(error instanceof DOMException && error.name === "InvalidStateError")) {
-              throw error;
-            }
+      if (callRef.current && !callRef.current.isDestroyed()) {
+        try {
+          await callRef.current.destroy();
+        } catch (error) {
+          if (!(error instanceof DOMException && error.name === "InvalidStateError")) {
+            throw error;
           }
         }
       }
 
       callRef.current = null;
-      activeMicDeviceIdRef.current = undefined;
       clearRemoteAudioElement();
       setIsMuted(false);
       setState("idle");
     }
-  }, [clearRemoteAudioElement, disconnect, ensureRemoteAudioElement, isMuted]);
+  }, [clearRemoteAudioElement, ensureRemoteAudioElement, isMuted]);
 
   useEffect(() => {
     return () => {

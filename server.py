@@ -56,14 +56,12 @@ def parse_cors_origins(origins: str) -> list[str]:
 
 ALLOWED_CORS_ORIGINS = parse_cors_origins(CORS_ORIGINS)
 
-_KOKORO_TTS_POOL: asyncio.LifoQueue[KokoroTTSService] = asyncio.LifoQueue(maxsize=2)
 _WARMED_VAD_ANALYZER: SileroVADAnalyzer | None = None
 
 def create_tts_service() -> KokoroTTSService:
     return KokoroTTSService(
         settings=KokoroTTSService.Settings(
             voice="af_sarah",
-            speed=0.92,
             language=Language.EN_GB,
         )
     )
@@ -71,17 +69,6 @@ def create_tts_service() -> KokoroTTSService:
 async def warmup_tts_service(tts: KokoroTTSService) -> None:
     async for _ in tts.run_tts("Warmup.", context_id="startup-warmup"):
         break
-
-async def get_tts_service() -> tuple[KokoroTTSService, bool]:
-    try:
-        return _KOKORO_TTS_POOL.get_nowait(), True
-    except asyncio.QueueEmpty:
-        return create_tts_service(), False
-
-def return_tts_service(tts: KokoroTTSService) -> None:
-    if _KOKORO_TTS_POOL.full():
-        return
-    _KOKORO_TTS_POOL.put_nowait(tts)
 
 async def warmup_models() -> None:
     global _WARMED_VAD_ANALYZER
@@ -92,7 +79,6 @@ async def warmup_models() -> None:
     try:
         tts = create_tts_service()
         await warmup_tts_service(tts)
-        return_tts_service(tts)
         logger.info("Kokoro TTS model warm-up complete")
     except Exception as e:
         logger.warning(f"Kokoro warm-up failed (continuing without cache): {e}")
@@ -129,7 +115,7 @@ async def run_bot(room_url: str, token: str):
     run_started_at = time.monotonic()
     logger.info(f"Starting Daily session for room: {room_url}")
 
-    tts, _ = await get_tts_service()
+    tts = create_tts_service()
 
     transport = DailyTransport(
         room_url=room_url,
@@ -216,11 +202,8 @@ async def run_bot(room_url: str, token: str):
 
         runner = PipelineRunner()
         logger.info("Pipeline runner started; waiting for Daily participants to join")
-        try:
-            await runner.run(task)
-        finally:
-            return_tts_service(tts)
-
+        await runner.run(task)
+    
 async def create_daily_session() -> tuple[str, str, str]:
     if not DAILY_API_KEY:
         raise HTTPException(status_code=500, detail="DAILY_API_KEY is not configured")
