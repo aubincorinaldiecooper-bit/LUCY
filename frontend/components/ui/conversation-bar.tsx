@@ -2,7 +2,7 @@
 
 import { motion } from "framer-motion";
 import { Check, ChevronDown, Mic, MicOff, Phone, Search, X } from "lucide-react";
-import { type ReactNode, useMemo, useState } from "react";
+import { useEffect, useRef, type ReactNode, useMemo, useState } from "react";
 import type { VoiceState } from "@/hooks/useVoiceClient";
 import Waveform from "@/components/Waveform";
 
@@ -46,11 +46,13 @@ const PROVIDER_LABEL: Record<ModelOption["provider"], string> = {
   deepseek: "DeepSeek",
 };
 
+const DEFAULT_MODEL_ID = "gpt-4o"; // aligned with main's model list
+const DOT_PLACEHOLDER_HEIGHTS = [4,5,6,7,8,9,10,12,14,16,18,20,22,24,22,20,18,16,14,12,10,9,8,7,6,5,4];
+
 function DotPlaceholder() {
-  const heights = [4,5,6,7,8,9,10,12,14,16,18,20,22,24,22,20,18,16,14,12,10,9,8,7,6,5,4];
   return (
     <div className="w-full h-full flex items-center justify-center gap-[4px] px-3">
-      {heights.map((height, i) => (
+      {DOT_PLACEHOLDER_HEIGHTS.map((height, i) => (
         <span key={i} className="w-[4px] rounded-full bg-[#D5D0C8]" style={{ height }} />
       ))}
     </div>
@@ -66,20 +68,29 @@ export function ConversationBar({
   onConnect,
   onDisconnect,
   onToggleMute,
-  selectedModelId = "gpt-4o",
+  selectedModelId = DEFAULT_MODEL_ID,
   onModelChange,
 }: ConversationBarProps) {
   const [search, setSearch] = useState("");
   const [dropdownOpen, setDropdownOpen] = useState(false);
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
 
   const isConnected = state === "connected" || state === "muted";
   const isMuted = state === "muted";
   const isLoading = state === "initializing" || state === "connecting";
+  const hasKnownState = isConnected || isLoading || state === "idle";
+  const hasErrorState = !hasKnownState;
 
-   const selectedModel = useMemo(
-    () => MODEL_OPTIONS.find((m) => m.id === selectedModelId) ?? MODEL_OPTIONS[0],
-    [selectedModelId]
-  );
+  const selectedModel = useMemo(() => {
+    const explicitModel = MODEL_OPTIONS.find((m) => m.id === selectedModelId);
+    if (explicitModel) return explicitModel;
+
+    const defaultModel = MODEL_OPTIONS.find((m) => m.id === DEFAULT_MODEL_ID);
+    if (process.env.NODE_ENV !== "production" && selectedModelId) {
+      console.warn(`[ConversationBar] Unknown model id "${selectedModelId}". Falling back to "${defaultModel?.id ?? MODEL_OPTIONS[0]?.id}".`);
+    }
+    return defaultModel ?? MODEL_OPTIONS[0];
+  }, [selectedModelId]);
 
   const filteredModels = useMemo(() => {
     const query = search.trim().toLowerCase();
@@ -99,23 +110,46 @@ export function ConversationBar({
     return groups;
   }, [filteredModels]);
 
+  const closeDropdown = () => {
+    setDropdownOpen(false);
+    setSearch("");
+  };
+
   const handleConnectOrDisconnect = () => {
-    if (isConnected || isLoading) {
+    if (isConnected) {
       onDisconnect();
       return;
     }
+    if (isLoading || hasErrorState) return;
     onConnect();
   };
 
-  const statusText = isLoading
-    ? "CONNECTING"
-    : isConnected
-      ? isMuted
+  const statusText = hasErrorState
+    ? "ERROR"
+    : isLoading
+      ? "CONNECTING"
+      : isMuted
         ? "MUTED"
-        : "LISTENING"
-      : "READY";
-      
-  const statusColor = isConnected ? "#D9934E" : "#6DB87A";
+        : isConnected
+          ? "CONNECTED"
+          : "READY";
+  const statusColor = hasErrorState ? "#E27D60" : isConnected ? "#D9934E" : "#6DB87A";
+
+  useEffect(() => {
+    if (!dropdownOpen) return;
+    searchInputRef.current?.focus();
+  }, [dropdownOpen]);
+
+  useEffect(() => {
+    if (!dropdownOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        closeDropdown();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [dropdownOpen]);
 
   return (
     <div className={className}>
@@ -124,7 +158,7 @@ export function ConversationBar({
           <button
             type="button"
             className="fixed inset-0 z-40"
-            onClick={() => setDropdownOpen(false)}
+            onClick={closeDropdown}
             aria-label="Close model menu"
           />
         )}
@@ -156,11 +190,17 @@ export function ConversationBar({
             <button
               type="button"
               onClick={handleConnectOrDisconnect}
+              disabled={isLoading || hasErrorState}
               className="h-[34px] w-[34px] rounded-[10px] border border-[#DCD7CD]/80 bg-[#FAF8F5]/90 text-[#A8A296] hover:text-[#D9934E]"
-              aria-label={isConnected || isLoading ? "Disconnect" : "Connect"}
+              aria-label={isConnected ? "Disconnect" : "Connect"}
             >
-              <span className="flex items-center justify-center">{isConnected || isLoading ? <X size={16} /> : <Phone size={16} />}</span>
+              <span className="flex items-center justify-center">
+                {isConnected ? <X size={16} /> : <Phone size={16} />}
+              </span>
             </button>
+
+            {/* Render the rightSlot (SettingsPanel) here */}
+            {rightSlot}
           </div>
         </div>
 
@@ -170,7 +210,7 @@ export function ConversationBar({
             style={{ backgroundColor: statusColor }}
           />
           <span className="text-[10px] font-medium uppercase tracking-[0.15em] text-[#A8A296]">
-            {statusText === "LISTENING" ? "CONNECTED" : statusText}
+            {statusText}
           </span>
           <div className="mx-1 h-3 w-px bg-[#DCD7CD]" />
 
@@ -178,13 +218,17 @@ export function ConversationBar({
             <button
               type="button"
               onClick={() => {
-                if (isConnected || isLoading) return;
-                setDropdownOpen((prev) => !prev);
+                if (isConnected || isLoading || hasErrorState) return;
+                setDropdownOpen((prev) => {
+                  const next = !prev;
+                  if (!next) setSearch("");
+                  return next;
+                });
               }}
               className="inline-flex items-center gap-1 rounded-md px-1 py-0.5 hover:bg-[#FAF8F5]"
               aria-expanded={dropdownOpen}
               aria-haspopup="listbox"
-              disabled={isConnected || isLoading}
+              disabled={isConnected || isLoading || hasErrorState}
             >
               <span
                 className="inline-flex h-[18px] w-[18px] items-center justify-center rounded text-[9px] font-semibold"
@@ -208,6 +252,7 @@ export function ConversationBar({
                 <div className="relative">
                   <Search size={12} className="absolute left-2 top-1/2 -translate-y-1/2 text-[#C8C3BA]" />
                   <input
+                    ref={searchInputRef}
                     value={search}
                     onChange={(event) => setSearch(event.target.value)}
                     placeholder="Search model..."
@@ -216,7 +261,7 @@ export function ConversationBar({
                 </div>
               </div>
 
-              <div className="max-h-[220px] overflow-y-auto p-1">
+              <div className="max-h-[220px] overflow-y-auto p-1" role="listbox" aria-label="Model options">
                 {(Object.keys(groupedModels) as ModelOption["provider"][]).map((provider) => {
                   const models = groupedModels[provider];
                   if (!models.length) return null;
@@ -230,13 +275,14 @@ export function ConversationBar({
                         <button
                           key={model.id}
                           type="button"
+                          role="option"
+                          aria-selected={selectedModelId === model.id}
                           className={`w-full flex items-center gap-2 rounded-md px-2 py-1 text-left hover:bg-[#FFF8F0] ${
                             selectedModelId === model.id ? "bg-[#FFF5E6]/70" : ""
                           }`}
                           onClick={() => {
                             onModelChange?.(model.id);
-                            setDropdownOpen(false);
-                            setSearch("");
+                            closeDropdown();
                           }}
                         >
                           <span

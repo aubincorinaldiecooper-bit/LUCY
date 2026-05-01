@@ -203,6 +203,9 @@ async def run_bot(room_url: str, token: str, model_id: str | None = None):
     selected_model = model_id or OPENROUTER_MODEL
     logger.info(f"Using model for session: {selected_model}")
 
+    selected_model = model_id or OPENROUTER_MODEL
+    logger.info(f"Using model for session: {selected_model}")
+
     llm = OpenRouterLLMService(
         api_key=OPENROUTER_API_KEY,
         settings=OpenRouterLLMService.Settings(model=selected_model),
