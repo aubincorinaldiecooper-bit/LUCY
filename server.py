@@ -1,9 +1,9 @@
+
 import os
 os.environ["ORT_INTRA_OP_NUM_THREADS"] = "2"
 os.environ["ORT_INTER_OP_NUM_THREADS"] = "1"
 os.environ["ONNXRUNTIME_LOG_LEVEL"] = "3"
 
-import asyncio
 import time
 import re
 from contextlib import asynccontextmanager
@@ -18,7 +18,16 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import EndFrame, ErrorFrame, LLMMessagesUpdateFrame, StartFrame, Frame, TextFrame, TranscriptionFrame, UserAudioRawFrame
+from pipecat.frames.frames import (
+    EndFrame,
+    ErrorFrame,
+    LLMMessagesUpdateFrame,
+    Frame,
+    StartFrame,
+    TextFrame,
+    TranscriptionFrame,
+    UserAudioRawFrame,
+)
 from pipecat.observers.loggers.metrics_log_observer import MetricsLogObserver
 from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
 from pipecat.pipeline.pipeline import Pipeline
@@ -41,7 +50,6 @@ load_dotenv()
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "You are Lucy, a chill and straightforward friend who keeps conversations light and insightful. Respond in one or two natural sentences with clear punctuation for smooth pacing. Keep your tone casual and conversational, avoiding corporate or overly formal phrasing. When politics, religion, or strong opinions come up, stay neutral and gently turn the focus back by asking one quick question about their perspective. Prioritize learning about them through intuitive questioning rather than agreeing just to be polite, and skip generic validation like I can see that or that is an interesting perspective. If asked about your origins or how you work, casually say you are not sure about the technical details but your creator built you to make daily conversations more meaningful. When you need current information, always briefly acknowledge it first with a natural phrase like let me look that up or give me a sec, then keep your summary tight. Stay in character, keep it real, and focus on natural back-and-forth dialogue.")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "minimax/minimax-m2.7")
 DAILY_API_KEY = os.getenv("DAILY_API_KEY", "")
 DAILY_API_URL = os.getenv("DAILY_API_URL", "https://api.daily.co/v1")
 DAILY_ROOM_URL = os.getenv("DAILY_ROOM_URL", "")
@@ -89,41 +97,92 @@ async def warmup_models() -> None:
     logger.info(f"Startup model warm-up finished in {time.perf_counter() - warmup_start:.2f}s")
 
 class TextNormalizer(FrameProcessor):
+    """Strips markdown characters from TextFrames and passes all other frames through."""
+
     def __init__(self):
         super().__init__()
-        self._markdown_pattern = re.compile(r'[*_`#~>]|```|^\s*[-*•]\s+')
+        self._markdown_pattern = re.compile(r'[*_`#~>]|```|^\s*[-*•]\s+', re.MULTILINE)
+
+    def _check_started(self, frame: Frame) -> None:
+        pass
+
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         if isinstance(frame, TextFrame):
             clean = self._markdown_pattern.sub('', frame.text)
             clean = re.sub(r'\s+', ' ', clean).strip()
-            if clean:
-                frame = TextFrame(text=clean, user_id=frame.user_id)
-        await self.push_frame(frame, direction)
+            await self.push_frame(
+                TextFrame(text=clean, user_id=frame.user_id) if clean else frame,
+                direction,
+            )
+        else:
+            await self.push_frame(frame, direction)
+
 
 class STTDebugProcessor(FrameProcessor):
+    """Logs frame flow around STT for debugging."""
+
     def __init__(self, label: str = "STTDebug"):
         super().__init__()
         self._label = label
-        self._logged_first_non_audio_non_transcript = False
+        self._audio_frames_in: int = 0
+        self._transcripts_out: int = 0
+        self._logged_first_other_frame = False
+
+    def _check_started(self, frame: Frame) -> None:
+        pass
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        frame_name = type(frame).__name__
+        is_after_stt = "after" in self._label.lower()
+
         if isinstance(frame, StartFrame):
-            logger.info(f"{self._label} received StartFrame")
+            if is_after_stt:
+                logger.info("STTDebug-after received StartFrame")
+            else:
+                logger.info(f"[{self._label}] received StartFrame")
+            await self.push_frame(frame, direction)
+            return
+
+        if isinstance(frame, UserAudioRawFrame):
+            self._audio_frames_in += 1
+            if self._audio_frames_in == 1 or self._audio_frames_in % 100 == 0:
+                logger.debug(
+                    f"[{self._label}] Audio frame #{self._audio_frames_in} → STT "
+                    f"(size={len(frame.audio)} bytes, "
+                    f"sample_rate={frame.sample_rate}, "
+                    f"channels={frame.num_channels})"
+                )
+        elif isinstance(frame, TranscriptionFrame):
+            self._transcripts_out += 1
+            logger.info(
+                f"[{self._label}] Transcript #{self._transcripts_out} ← STT: "
+                f"text={frame.text!r} user_id={frame.user_id!r}"
+            )
+        elif isinstance(frame, TextFrame):
+            logger.info(f"[{self._label}] TextFrame: {frame.text!r}")
         elif isinstance(frame, ErrorFrame):
-            logger.error(f"{self._label} received ErrorFrame: {frame}")
-        if isinstance(frame, TextFrame):
-            logger.info(f"{self._label} received TextFrame: {frame.text!r}")
-        elif not isinstance(frame, (UserAudioRawFrame, TranscriptionFrame)):
-            if not self._logged_first_non_audio_non_transcript:
-                self._logged_first_non_audio_non_transcript = True
-                logger.info(f"{self._label} first non-audio/non-transcript frame: {type(frame).__name__}")
+            logger.error(f"[{self._label}] ErrorFrame from STT: {frame.error!r}")
+        elif not self._logged_first_other_frame:
+            self._logged_first_other_frame = True
+            logger.info(
+                f"[{self._label}] First non-audio/non-transcript frame: "
+                f"{frame_name} direction={direction}"
+            )
+
         await self.push_frame(frame, direction)
 
+
 def normalize_openrouter_model_id(model_id: str | None) -> str:
+    """Maps shorthand model IDs to full OpenRouter provider/model format.
+
+    Falls back to a hardcoded default if no model_id is provided.
+    """
     if not model_id:
-        return OPENROUTER_MODEL
+        return "openai/gpt-4o"
+
     if "/" in model_id:
         return model_id
+
     shorthand_map = {
         "gpt-4o": "openai/gpt-4o",
         "gpt-4o-mini": "openai/gpt-4o-mini",
@@ -136,6 +195,7 @@ def normalize_openrouter_model_id(model_id: str | None) -> str:
     else:
         logger.warning(f"Normalized shorthand model id '{model_id}' -> '{normalized}'")
     return normalized
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -171,12 +231,19 @@ async def run_bot(room_url: str, token: str, model_id: str | None = None):
 
     stt = DeepgramSTTService(
         api_key=DEEPGRAM_API_KEY,
-        language="en",
-        model="nova-2",
-        smart_format=True,
-        punctuate=True,
+        settings=DeepgramSTTService.Settings(
+            language="en",
+            model="nova-2",
+            smart_format=True,
+            punctuate=True,
+        ),
     )
-    logger.info(f"Deepgram API key configured: {bool(DEEPGRAM_API_KEY)}")
+
+    if DEEPGRAM_API_KEY:
+        logger.info("Deepgram API key present")
+    else:
+        logger.error("DEEPGRAM_API_KEY is not set — DeepgramSTTService will not produce transcripts")
+
     if hasattr(stt, "event_handler"):
         @stt.event_handler("on_connected")
         async def on_stt_connected(*args, **kwargs):
@@ -184,11 +251,11 @@ async def run_bot(room_url: str, token: str, model_id: str | None = None):
 
         @stt.event_handler("on_disconnected")
         async def on_stt_disconnected(*args, **kwargs):
-            logger.warning(f"Deepgram STT WebSocket disconnected: args={args}, kwargs={kwargs}")
+            logger.warning("Deepgram STT WebSocket disconnected")
 
         @stt.event_handler("on_connection_error")
         async def on_stt_connection_error(*args, **kwargs):
-            logger.error(f"Deepgram STT WebSocket connection error: args={args}, kwargs={kwargs}")
+            logger.error(f"Deepgram STT connection error: args={args}, kwargs={kwargs}")
 
     selected_model = normalize_openrouter_model_id(model_id)
     logger.info(f"Using model for session: {selected_model}")
@@ -202,6 +269,9 @@ async def run_bot(room_url: str, token: str, model_id: str | None = None):
         @llm.event_handler("on_error")
         async def on_llm_error(*args, **kwargs):
             logger.exception(f"OpenRouter LLM error: args={args}, kwargs={kwargs}")
+
+    stt_debug_before = STTDebugProcessor(label="DeepgramSTT-before")
+    stt_debug_after = STTDebugProcessor(label="DeepgramSTT-after")
 
     async with AsyncExitStack() as exit_stack:
         tavily_mcp_url = os.getenv("TAVILY_MCP_URL", "")
@@ -225,12 +295,12 @@ async def run_bot(room_url: str, token: str, model_id: str | None = None):
 
         pipeline = Pipeline([
             transport.input(),
-            STTDebugProcessor("STTDebug-before"),
+            stt_debug_before,
             stt,
-            STTDebugProcessor("STTDebug-after"),
+            stt_debug_after,
+            TextNormalizer(),
             context_aggregator.user(),
             llm,
-            TextNormalizer(),
             tts,
             transport.output(),
             context_aggregator.assistant(),
@@ -295,8 +365,12 @@ async def run_bot(room_url: str, token: str, model_id: str | None = None):
 
         runner = PipelineRunner()
         logger.info("Pipeline runner started; waiting for Daily participants to join")
-        await runner.run(task)
-    
+        try:
+            await runner.run(task)
+        except Exception as e:
+            logger.exception(f"Pipeline runner failed: {e}")
+
+
 async def create_daily_session() -> tuple[str, str, str]:
     if not DAILY_API_KEY:
         raise HTTPException(status_code=500, detail="DAILY_API_KEY is not configured")
