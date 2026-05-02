@@ -1,4 +1,3 @@
-
 import os
 os.environ["ORT_INTRA_OP_NUM_THREADS"] = "2"
 os.environ["ORT_INTER_OP_NUM_THREADS"] = "1"
@@ -231,11 +230,15 @@ async def run_bot(room_url: str, token: str, model_id: str | None = None):
 
     stt = DeepgramSTTService(
         api_key=DEEPGRAM_API_KEY,
+        encoding="linear16",
+        channels=1,
+        sample_rate=16000,
         settings=DeepgramSTTService.Settings(
-            language="en",
             model="nova-2",
+            language="en",
             smart_format=True,
             punctuate=True,
+            interim_results=True,
         ),
     )
 
