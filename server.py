@@ -15,18 +15,21 @@ from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import EndFrame, LLMMessagesUpdateFrame, Frame, TextFrame
+from pipecat.audio.vad.vad_analyzer import VADParams
+from pipecat.frames.frames import EndFrame, ErrorFrame, LLMMessagesUpdateFrame, StartFrame, Frame, TextFrame, TranscriptionFrame, UserAudioRawFrame
 from pipecat.observers.loggers.metrics_log_observer import MetricsLogObserver
 from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair, LLMUserAggregatorParams
 from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
 from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.mistral.stt import MistralSTTService
 from pipecat.services.kokoro.tts import KokoroTTSService
 from pipecat.services import mcp_service
 from pipecat.services.mcp_service import MCPClient
@@ -40,6 +43,10 @@ load_dotenv()
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "You are Lucy, a chill and straightforward friend who keeps conversations light and insightful. Respond in one or two natural sentences with clear punctuation for smooth pacing. Keep your tone casual and conversational, avoiding corporate or overly formal phrasing. When politics, religion, or strong opinions come up, stay neutral and gently turn the focus back by asking one quick question about their perspective. Prioritize learning about them through intuitive questioning rather than agreeing just to be polite, and skip generic validation like I can see that or that is an interesting perspective. If asked about your origins or how you work, casually say you are not sure about the technical details but your creator built you to make daily conversations more meaningful. When you need current information, always briefly acknowledge it first with a natural phrase like let me look that up or give me a sec, then keep your summary tight. Stay in character, keep it real, and focus on natural back-and-forth dialogue.")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "")
+STT_PROVIDER = os.getenv("STT_PROVIDER", "deepgram").lower()
+VAD_STOP_SECS = float(os.getenv("VAD_STOP_SECS", "0.4"))
+MISTRAL_STREAMING_DELAY_MS = int(os.getenv("MISTRAL_STREAMING_DELAY_MS", "160"))
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "minimax/minimax-m2.7")
 DAILY_API_KEY = os.getenv("DAILY_API_KEY", "")
 DAILY_API_URL = os.getenv("DAILY_API_URL", "https://api.daily.co/v1")
@@ -50,49 +57,41 @@ CORS_ORIGINS = os.getenv(
     "CORS_ORIGINS",
     "http://localhost:3000,https://vigilant-youth-production-452c.up.railway.app",
 )
+REQUIRED_FRONTEND_ORIGIN = "https://vigilant-youth-production-452c.up.railway.app"
 
 def parse_cors_origins(origins: str) -> list[str]:
     return [origin.strip() for origin in origins.split(",") if origin.strip()]
 
 ALLOWED_CORS_ORIGINS = parse_cors_origins(CORS_ORIGINS)
+if REQUIRED_FRONTEND_ORIGIN not in ALLOWED_CORS_ORIGINS:
+    ALLOWED_CORS_ORIGINS.append(REQUIRED_FRONTEND_ORIGIN)
 
-_KOKORO_TTS_POOL: asyncio.LifoQueue[KokoroTTSService] = asyncio.LifoQueue(maxsize=2)
 _WARMED_VAD_ANALYZER: SileroVADAnalyzer | None = None
 
 def create_tts_service() -> KokoroTTSService:
     return KokoroTTSService(
         settings=KokoroTTSService.Settings(
             voice="af_sarah",
-            speed=0.92,
             language=Language.EN_GB,
         )
     )
+
+def create_vad_analyzer() -> SileroVADAnalyzer:
+    return SileroVADAnalyzer(params=VADParams(stop_secs=VAD_STOP_SECS))
 
 async def warmup_tts_service(tts: KokoroTTSService) -> None:
     async for _ in tts.run_tts("Warmup.", context_id="startup-warmup"):
         break
 
-async def get_tts_service() -> tuple[KokoroTTSService, bool]:
-    try:
-        return _KOKORO_TTS_POOL.get_nowait(), True
-    except asyncio.QueueEmpty:
-        return create_tts_service(), False
-
-def return_tts_service(tts: KokoroTTSService) -> None:
-    if _KOKORO_TTS_POOL.full():
-        return
-    _KOKORO_TTS_POOL.put_nowait(tts)
-
 async def warmup_models() -> None:
     global _WARMED_VAD_ANALYZER
     warmup_start = time.perf_counter()
     logger.info("Starting startup model warm-up")
-    _WARMED_VAD_ANALYZER = SileroVADAnalyzer()
+    _WARMED_VAD_ANALYZER = create_vad_analyzer()
     logger.info("Silero/Smart Turn model warm-up complete")
     try:
         tts = create_tts_service()
         await warmup_tts_service(tts)
-        return_tts_service(tts)
         logger.info("Kokoro TTS model warm-up complete")
     except Exception as e:
         logger.warning(f"Kokoro warm-up failed (continuing without cache): {e}")
@@ -103,12 +102,90 @@ class TextNormalizer(FrameProcessor):
         super().__init__()
         self._markdown_pattern = re.compile(r'[*_`#~>]|```|^\s*[-*•]\s+')
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
         if isinstance(frame, TextFrame):
             clean = self._markdown_pattern.sub('', frame.text)
             clean = re.sub(r'\s+', ' ', clean).strip()
             if clean:
                 frame = TextFrame(text=clean, user_id=frame.user_id)
         await self.push_frame(frame, direction)
+
+class STTDebugProcessor(FrameProcessor):
+    def __init__(self, label: str = "STTDebug"):
+        super().__init__()
+        self._label = label
+        self._logged_first_non_audio_non_transcript = False
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+        if isinstance(frame, StartFrame):
+            logger.info(f"{self._label} received StartFrame")
+        elif isinstance(frame, ErrorFrame):
+            logger.error(f"{self._label} received ErrorFrame: {frame}")
+        elif isinstance(frame, UserAudioRawFrame):
+            logger.info(f"{self._label} received UserAudioRawFrame: sample_rate={frame.sample_rate}, channels={frame.num_channels}, bytes={len(frame.audio)}")
+        elif isinstance(frame, TranscriptionFrame):
+            logger.info(f"{self._label} received TranscriptionFrame: {frame.text!r}")
+        elif isinstance(frame, TextFrame):
+            logger.info(f"{self._label} received TextFrame: {frame.text!r}")
+        elif not isinstance(frame, (UserAudioRawFrame, TranscriptionFrame)):
+            if not self._logged_first_non_audio_non_transcript:
+                self._logged_first_non_audio_non_transcript = True
+                logger.info(f"{self._label} first non-audio/non-transcript frame: {type(frame).__name__}")
+        await self.push_frame(frame, direction)
+
+def normalize_openrouter_model_id(model_id: str | None) -> str:
+    if not model_id:
+        return OPENROUTER_MODEL
+    if "/" in model_id:
+        return model_id
+    shorthand_map = {
+        "gpt-4o": "openai/gpt-4o",
+        "gpt-4o-mini": "openai/gpt-4o-mini",
+        "minimax-m1": "minimax/minimax-01",
+        "deepseek-v3": "deepseek/deepseek-chat",
+    }
+    normalized = shorthand_map.get(model_id, model_id)
+    if normalized == model_id:
+        logger.warning(f"Model id '{model_id}' has no provider prefix and no known mapping; using as-is")
+    else:
+        logger.warning(f"Normalized shorthand model id '{model_id}' -> '{normalized}'")
+    return normalized
+
+def create_stt_service(provider: str):
+    if provider == "mistral":
+        if not MISTRAL_API_KEY:
+            raise RuntimeError("MISTRAL_API_KEY is required when STT_PROVIDER=mistral")
+        try:
+            return MistralSTTService(
+                api_key=MISTRAL_API_KEY,
+                sample_rate=16000,
+                target_streaming_delay_ms=MISTRAL_STREAMING_DELAY_MS,
+                settings=MistralSTTService.Settings(
+                    model="voxtral-mini-transcribe-realtime-2602",
+                    interim_results=True,
+                ),
+            )
+        except TypeError as e:
+            logger.warning(f"Extended Mistral constructor failed; falling back to api_key only: {e}")
+            return MistralSTTService(api_key=MISTRAL_API_KEY)
+
+    if provider != "deepgram":
+        logger.warning(f"Unknown STT_PROVIDER '{provider}', defaulting to deepgram")
+
+    return DeepgramSTTService(
+        api_key=DEEPGRAM_API_KEY,
+        encoding="linear16",
+        channels=1,
+        sample_rate=16000,
+        settings=DeepgramSTTService.Settings(
+            model="nova-2",
+            language="en",
+            smart_format=True,
+            punctuate=True,
+            interim_results=True,
+        ),
+    )
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -125,11 +202,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-async def run_bot(room_url: str, token: str):
+async def run_bot(room_url: str, token: str, model_id: str | None = None):
     run_started_at = time.monotonic()
     logger.info(f"Starting Daily session for room: {room_url}")
 
-    tts, _ = await get_tts_service()
+    tts = create_tts_service()
 
     transport = DailyTransport(
         room_url=room_url,
@@ -138,17 +215,40 @@ async def run_bot(room_url: str, token: str):
         params=DailyParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
-            vad_analyzer=_WARMED_VAD_ANALYZER or SileroVADAnalyzer(),
+            vad_analyzer=_WARMED_VAD_ANALYZER or create_vad_analyzer(),
         ),
     )
 
-    stt = DeepgramSTTService(api_key=DEEPGRAM_API_KEY)
+    stt = create_stt_service(STT_PROVIDER)
+    if STT_PROVIDER == "mistral":
+        logger.info(f"Mistral API key configured: {bool(MISTRAL_API_KEY)}")
+    else:
+        logger.info(f"Deepgram API key configured: {bool(DEEPGRAM_API_KEY)}")
+    if hasattr(stt, "event_handler"):
+        @stt.event_handler("on_connected")
+        async def on_stt_connected(*args, **kwargs):
+            logger.info(f"{STT_PROVIDER} STT connected")
+
+        @stt.event_handler("on_disconnected")
+        async def on_stt_disconnected(*args, **kwargs):
+            logger.warning(f"{STT_PROVIDER} STT disconnected: args={args}, kwargs={kwargs}")
+
+        @stt.event_handler("on_connection_error")
+        async def on_stt_connection_error(*args, **kwargs):
+            logger.error(f"{STT_PROVIDER} STT connection error: args={args}, kwargs={kwargs}")
+
+    selected_model = normalize_openrouter_model_id(model_id)
+    logger.info(f"Using model for session: {selected_model}")
 
     llm = OpenRouterLLMService(
         api_key=OPENROUTER_API_KEY,
-        settings=OpenRouterLLMService.Settings(model=OPENROUTER_MODEL),
+        settings=OpenRouterLLMService.Settings(model=selected_model),
         system_prompt=SYSTEM_PROMPT,
     )
+    if hasattr(llm, "event_handler"):
+        @llm.event_handler("on_error")
+        async def on_llm_error(*args, **kwargs):
+            logger.exception(f"OpenRouter LLM error: args={args}, kwargs={kwargs}")
 
     async with AsyncExitStack() as exit_stack:
         tavily_mcp_url = os.getenv("TAVILY_MCP_URL", "")
@@ -168,11 +268,21 @@ async def run_bot(room_url: str, token: str):
             logger.warning("TAVILY_MCP_URL is not configured; Tavily MCP tools were not registered")
 
         context = LLMContext(messages=[])
-        context_aggregator = LLMContextAggregatorPair(context)
+        try:
+            context_aggregator = LLMContextAggregatorPair(
+                context,
+                user_params=LLMUserAggregatorParams(
+                    vad_analyzer=create_vad_analyzer(),
+                ),
+            )
+        except TypeError:
+            context_aggregator = LLMContextAggregatorPair(context)
 
         pipeline = Pipeline([
             transport.input(),
+            STTDebugProcessor("STTDebug-before"),
             stt,
+            STTDebugProcessor("STTDebug-after"),
             context_aggregator.user(),
             llm,
             TextNormalizer(),
@@ -201,13 +311,37 @@ async def run_bot(room_url: str, token: str):
             observers=[MetricsLogObserver(), user_bot_latency_observer],
         )
 
+        pipeline_started = False
+        participant_joined = False
+        greeting_queued = False
+
+        async def maybe_queue_greeting() -> None:
+            nonlocal greeting_queued
+            if not pipeline_started or not participant_joined or greeting_queued:
+                return
+            greeting_queued = True
+            logger.info("Queueing greeting frame to force initial LLM turn")
+            await task.queue_frame(
+                LLMMessagesUpdateFrame(
+                    [{"role": "user", "content": "Hello"}],
+                    run_llm=True,
+                )
+            )
+
+        @task.event_handler("on_pipeline_started")
+        async def on_pipeline_started(*args, **kwargs):
+            nonlocal pipeline_started
+            pipeline_started = True
+            logger.info("Pipeline started; StartFrame reached pipeline sink")
+            await maybe_queue_greeting()
+
         @transport.event_handler("on_first_participant_joined")
         async def on_first_participant_joined(_transport, _participant):
+            nonlocal participant_joined
+            participant_joined = True
             join_delay_seconds = time.monotonic() - run_started_at
             logger.info(f"First participant joined ({join_delay_seconds:.2f}s after run_bot start)")
-            await task.queue_frame(
-                LLMMessagesUpdateFrame([{"role": "user", "content": "Hello"}], run_llm=True)
-            )
+            await maybe_queue_greeting()
 
         @transport.event_handler("on_participant_left")
         async def on_participant_left(_transport, _participant, _reason):
@@ -216,11 +350,8 @@ async def run_bot(room_url: str, token: str):
 
         runner = PipelineRunner()
         logger.info("Pipeline runner started; waiting for Daily participants to join")
-        try:
-            await runner.run(task)
-        finally:
-            return_tts_service(tts)
-
+        await runner.run(task)
+    
 async def create_daily_session() -> tuple[str, str, str]:
     if not DAILY_API_KEY:
         raise HTTPException(status_code=500, detail="DAILY_API_KEY is not configured")
@@ -242,10 +373,13 @@ async def create_daily_session() -> tuple[str, str, str]:
 async def health() -> JSONResponse:
     return JSONResponse({"status": "ok"})
 
+class DailySessionRequest(BaseModel):
+    model_id: str | None = None
+
 @app.post("/api/daily/session")
-async def daily_session(background_tasks: BackgroundTasks):
+async def daily_session(background_tasks: BackgroundTasks, payload: DailySessionRequest):
     room_url, user_token, bot_token = await create_daily_session()
-    background_tasks.add_task(run_bot, room_url, bot_token)
+    background_tasks.add_task(run_bot, room_url, bot_token, payload.model_id)
     return JSONResponse({"room_url": room_url, "token": user_token})
 
 @app.options("/api/daily/session")
