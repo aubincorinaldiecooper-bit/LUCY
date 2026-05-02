@@ -76,6 +76,7 @@ export function useVoiceClient() {
       }
 
       callRef.current = null;
+      joinStartedAtRef.current = null;
       cleanupRemoteAudioEls();
       setState("idle");
       setIsMuted(false);
@@ -108,6 +109,7 @@ export function useVoiceClient() {
         setState("idle");
         setIsMuted(false);
         callRef.current = null;
+        joinStartedAtRef.current = null;
         cleanupRemoteAudioEls();
       });
 
@@ -116,6 +118,7 @@ export function useVoiceClient() {
         setState("idle");
         setIsMuted(false);
         callRef.current = null;
+        joinStartedAtRef.current = null;
         cleanupRemoteAudioEls();
       });
 
@@ -139,6 +142,7 @@ export function useVoiceClient() {
           });
         remoteAudioElsRef.current.set(event.track.id, audio);
 
+        // ✅ Latency tracking preserved from codex branch
         const joinStartedAt = joinStartedAtRef.current;
         if (joinStartedAt) {
           const firstResponseLatencyMs = performance.now() - joinStartedAt;
