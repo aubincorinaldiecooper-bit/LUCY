@@ -3,7 +3,6 @@ os.environ["ORT_INTRA_OP_NUM_THREADS"] = "2"
 os.environ["ORT_INTER_OP_NUM_THREADS"] = "1"
 os.environ["ONNXRUNTIME_LOG_LEVEL"] = "3"
 
-import asyncio
 import time
 import re
 from contextlib import asynccontextmanager
@@ -18,7 +17,15 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import EndFrame, LLMMessagesUpdateFrame, Frame, TextFrame
+from pipecat.frames.frames import (
+    EndFrame,
+    ErrorFrame,
+    LLMMessagesUpdateFrame,
+    Frame,
+    TextFrame,
+    TranscriptionFrame,
+    UserAudioRawFrame,
+)
 from pipecat.observers.loggers.metrics_log_observer import MetricsLogObserver
 from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
 from pipecat.pipeline.pipeline import Pipeline
@@ -89,28 +96,63 @@ async def warmup_models() -> None:
     logger.info(f"Startup model warm-up finished in {time.perf_counter() - warmup_start:.2f}s")
 
 class TextNormalizer(FrameProcessor):
+    """Strips markdown characters from TextFrames and passes all other frames through."""
+
     def __init__(self):
         super().__init__()
-        self._markdown_pattern = re.compile(r'[*_`#~>]|```|^\s*[-*•]\s+')
+        self._markdown_pattern = re.compile(r'[*_`#~>]|```|^\s*[-*•]\s+', re.MULTILINE)
+
+    def _check_started(self, frame: Frame) -> None:
+        pass
+
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         if isinstance(frame, TextFrame):
             clean = self._markdown_pattern.sub('', frame.text)
             clean = re.sub(r'\s+', ' ', clean).strip()
-            if clean:
-                frame = TextFrame(text=clean, user_id=frame.user_id)
-        await self.push_frame(frame, direction)
+            await self.push_frame(
+                TextFrame(text=clean, user_id=frame.user_id) if clean else frame,
+                direction,
+            )
+        else:
+            await self.push_frame(frame, direction)
+
 
 class STTDebugProcessor(FrameProcessor):
-    def __init__(self, stage: str):
+    """Logs audio frames going into STT and transcripts coming out."""
+
+    def __init__(self, label: str = "STTDebug"):
         super().__init__()
-        self._stage = stage
+        self._label = label
+        self._audio_frames_in: int = 0
+        self._transcripts_out: int = 0
+
+    def _check_started(self, frame: Frame) -> None:
+        pass
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
-        if isinstance(frame, TextFrame):
-            logger.info(f"[STT:{self._stage}] TextFrame: {frame.text!r}")
+        if isinstance(frame, UserAudioRawFrame):
+            self._audio_frames_in += 1
+            if self._audio_frames_in == 1 or self._audio_frames_in % 100 == 0:
+                logger.debug(
+                    f"[{self._label}] Audio frame #{self._audio_frames_in} → STT "
+                    f"(size={len(frame.audio)} bytes, "
+                    f"sample_rate={frame.sample_rate}, "
+                    f"channels={frame.num_channels})"
+                )
+        elif isinstance(frame, TranscriptionFrame):
+            self._transcripts_out += 1
+            logger.info(
+                f"[{self._label}] Transcript #{self._transcripts_out} ← STT: "
+                f"text={frame.text!r} user_id={frame.user_id!r}"
+            )
+        elif isinstance(frame, ErrorFrame):
+            logger.error(f"[{self._label}] ErrorFrame from STT: {frame.error!r}")
+
         await self.push_frame(frame, direction)
 
+
 def normalize_openrouter_model_id(model_id: str | None) -> str:
+    """Maps shorthand model IDs to full OpenRouter provider/model format."""
     if not model_id:
         return OPENROUTER_MODEL
     if "/" in model_id:
@@ -127,6 +169,7 @@ def normalize_openrouter_model_id(model_id: str | None) -> str:
     else:
         logger.warning(f"Normalized shorthand model id '{model_id}' -> '{normalized}'")
     return normalized
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -160,8 +203,20 @@ async def run_bot(room_url: str, token: str, model_id: str | None = None):
         ),
     )
 
-    stt = DeepgramSTTService(api_key=DEEPGRAM_API_KEY)
+    if not DEEPGRAM_API_KEY:
+        logger.error("DEEPGRAM_API_KEY is not set — DeepgramSTTService will not produce transcripts")
 
+    stt = DeepgramSTTService(
+        api_key=DEEPGRAM_API_KEY,
+        settings=DeepgramSTTService.Settings(
+            language="en",
+            model="nova-2",
+            smart_format=True,
+            punctuate=True,
+        ),
+    )
+
+    # Normalize model ID (frontend may send shorthand or full)
     selected_model = normalize_openrouter_model_id(model_id)
     logger.info(f"Using model for session: {selected_model}")
 
@@ -174,6 +229,10 @@ async def run_bot(room_url: str, token: str, model_id: str | None = None):
         @llm.event_handler("on_error")
         async def on_llm_error(*args, **kwargs):
             logger.exception(f"OpenRouter LLM error: args={args}, kwargs={kwargs}")
+
+    # Instantiate STT debug processors for pipeline visibility
+    stt_debug_before = STTDebugProcessor(label="DeepgramSTT-before")
+    stt_debug_after = STTDebugProcessor(label="DeepgramSTT-after")
 
     async with AsyncExitStack() as exit_stack:
         tavily_mcp_url = os.getenv("TAVILY_MCP_URL", "")
@@ -197,12 +256,12 @@ async def run_bot(room_url: str, token: str, model_id: str | None = None):
 
         pipeline = Pipeline([
             transport.input(),
-            STTDebugProcessor("before-stt"),
+            stt_debug_before,   # log audio frames before STT
             stt,
-            STTDebugProcessor("after-stt"),
+            stt_debug_after,    # log transcripts after STT
+            TextNormalizer(),
             context_aggregator.user(),
             llm,
-            TextNormalizer(),
             tts,
             transport.output(),
             context_aggregator.assistant(),
@@ -228,6 +287,10 @@ async def run_bot(room_url: str, token: str, model_id: str | None = None):
             observers=[MetricsLogObserver(), user_bot_latency_observer],
         )
 
+        @stt.event_handler("on_connection_error")
+        async def on_stt_connection_error(_stt, error):
+            logger.error(f"Deepgram STT connection error: {error!r}")
+
         @transport.event_handler("on_first_participant_joined")
         async def on_first_participant_joined(_transport, _participant):
             join_delay_seconds = time.monotonic() - run_started_at
@@ -246,8 +309,12 @@ async def run_bot(room_url: str, token: str, model_id: str | None = None):
 
         runner = PipelineRunner()
         logger.info("Pipeline runner started; waiting for Daily participants to join")
-        await runner.run(task)
-    
+        try:
+            await runner.run(task)
+        except Exception as e:
+            logger.exception(f"Pipeline runner failed: {e}")
+
+
 async def create_daily_session() -> tuple[str, str, str]:
     if not DAILY_API_KEY:
         raise HTTPException(status_code=500, detail="DAILY_API_KEY is not configured")
