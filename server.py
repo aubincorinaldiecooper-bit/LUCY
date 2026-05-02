@@ -17,6 +17,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import (
     EndFrame,
     ErrorFrame,
@@ -52,6 +53,8 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "")
 STT_PROVIDER = os.getenv("STT_PROVIDER", "deepgram").lower()
+VAD_STOP_SECS = float(os.getenv("VAD_STOP_SECS", "0.3"))
+MISTRAL_STREAMING_DELAY_MS = int(os.getenv("MISTRAL_STREAMING_DELAY_MS", "160"))
 DAILY_API_KEY = os.getenv("DAILY_API_KEY", "")
 DAILY_API_URL = os.getenv("DAILY_API_URL", "https://api.daily.co/v1")
 DAILY_ROOM_URL = os.getenv("DAILY_ROOM_URL", "")
@@ -69,6 +72,9 @@ def parse_cors_origins(origins: str) -> list[str]:
 ALLOWED_CORS_ORIGINS = parse_cors_origins(CORS_ORIGINS)
 if REQUIRED_FRONTEND_ORIGIN not in ALLOWED_CORS_ORIGINS:
     ALLOWED_CORS_ORIGINS.append(REQUIRED_FRONTEND_ORIGIN)
+
+def create_vad_analyzer() -> SileroVADAnalyzer:
+    return SileroVADAnalyzer(params=VADParams(stop_secs=VAD_STOP_SECS))
 
 _WARMED_VAD_ANALYZER: SileroVADAnalyzer | None = None
 
@@ -88,7 +94,7 @@ async def warmup_models() -> None:
     global _WARMED_VAD_ANALYZER
     warmup_start = time.perf_counter()
     logger.info("Starting startup model warm-up")
-    _WARMED_VAD_ANALYZER = SileroVADAnalyzer()
+    _WARMED_VAD_ANALYZER = create_vad_analyzer()
     logger.info("Silero/Smart Turn model warm-up complete")
     try:
         tts = create_tts_service()
@@ -204,12 +210,14 @@ def create_stt_service(provider: str):
         try:
             return MistralSTTService(
                 api_key=MISTRAL_API_KEY,
-                model="voxtral-mini-transcribe-realtime-2602",
-                language="en",
                 sample_rate=16000,
+                target_streaming_delay_ms=MISTRAL_STREAMING_DELAY_MS,
+                settings=MistralSTTService.Settings(
+                    model="voxtral-mini-transcribe-realtime-2602",
+                ),
             )
-        except TypeError:
-            logger.warning("Extended Mistral constructor failed; falling back to api_key only")
+        except TypeError as e:
+            logger.warning(f"Extended Mistral constructor failed; falling back to api_key only: {e}")
             return MistralSTTService(api_key=MISTRAL_API_KEY)
     else:
         logger.info("Using Deepgram STT")
@@ -258,7 +266,7 @@ async def run_bot(room_url: str, token: str, model_id: str | None = None):
         params=DailyParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
-            vad_analyzer=_WARMED_VAD_ANALYZER or SileroVADAnalyzer(),
+            vad_analyzer=_WARMED_VAD_ANALYZER or create_vad_analyzer(),
         ),
     )
 
