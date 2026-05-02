@@ -15,9 +15,10 @@ from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import EndFrame, LLMMessagesUpdateFrame, Frame, TextFrame
+from pipecat.frames.frames import EndFrame, ErrorFrame, LLMMessagesUpdateFrame, StartFrame, Frame, TextFrame, TranscriptionFrame, UserAudioRawFrame
 from pipecat.observers.loggers.metrics_log_observer import MetricsLogObserver
 from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
 from pipecat.pipeline.pipeline import Pipeline
@@ -50,20 +51,21 @@ CORS_ORIGINS = os.getenv(
     "CORS_ORIGINS",
     "http://localhost:3000,https://vigilant-youth-production-452c.up.railway.app",
 )
+REQUIRED_FRONTEND_ORIGIN = "https://vigilant-youth-production-452c.up.railway.app"
 
 def parse_cors_origins(origins: str) -> list[str]:
     return [origin.strip() for origin in origins.split(",") if origin.strip()]
 
 ALLOWED_CORS_ORIGINS = parse_cors_origins(CORS_ORIGINS)
+if REQUIRED_FRONTEND_ORIGIN not in ALLOWED_CORS_ORIGINS:
+    ALLOWED_CORS_ORIGINS.append(REQUIRED_FRONTEND_ORIGIN)
 
-_KOKORO_TTS_POOL: asyncio.LifoQueue[KokoroTTSService] = asyncio.LifoQueue(maxsize=2)
 _WARMED_VAD_ANALYZER: SileroVADAnalyzer | None = None
 
 def create_tts_service() -> KokoroTTSService:
     return KokoroTTSService(
         settings=KokoroTTSService.Settings(
             voice="af_sarah",
-            speed=0.92,
             language=Language.EN_GB,
         )
     )
@@ -71,17 +73,6 @@ def create_tts_service() -> KokoroTTSService:
 async def warmup_tts_service(tts: KokoroTTSService) -> None:
     async for _ in tts.run_tts("Warmup.", context_id="startup-warmup"):
         break
-
-async def get_tts_service() -> tuple[KokoroTTSService, bool]:
-    try:
-        return _KOKORO_TTS_POOL.get_nowait(), True
-    except asyncio.QueueEmpty:
-        return create_tts_service(), False
-
-def return_tts_service(tts: KokoroTTSService) -> None:
-    if _KOKORO_TTS_POOL.full():
-        return
-    _KOKORO_TTS_POOL.put_nowait(tts)
 
 async def warmup_models() -> None:
     global _WARMED_VAD_ANALYZER
@@ -92,7 +83,6 @@ async def warmup_models() -> None:
     try:
         tts = create_tts_service()
         await warmup_tts_service(tts)
-        return_tts_service(tts)
         logger.info("Kokoro TTS model warm-up complete")
     except Exception as e:
         logger.warning(f"Kokoro warm-up failed (continuing without cache): {e}")
@@ -110,6 +100,43 @@ class TextNormalizer(FrameProcessor):
                 frame = TextFrame(text=clean, user_id=frame.user_id)
         await self.push_frame(frame, direction)
 
+class STTDebugProcessor(FrameProcessor):
+    def __init__(self, label: str = "STTDebug"):
+        super().__init__()
+        self._label = label
+        self._logged_first_non_audio_non_transcript = False
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        if isinstance(frame, StartFrame):
+            logger.info(f"{self._label} received StartFrame")
+        elif isinstance(frame, ErrorFrame):
+            logger.error(f"{self._label} received ErrorFrame: {frame}")
+        if isinstance(frame, TextFrame):
+            logger.info(f"{self._label} received TextFrame: {frame.text!r}")
+        elif not isinstance(frame, (UserAudioRawFrame, TranscriptionFrame)):
+            if not self._logged_first_non_audio_non_transcript:
+                self._logged_first_non_audio_non_transcript = True
+                logger.info(f"{self._label} first non-audio/non-transcript frame: {type(frame).__name__}")
+        await self.push_frame(frame, direction)
+
+def normalize_openrouter_model_id(model_id: str | None) -> str:
+    if not model_id:
+        return OPENROUTER_MODEL
+    if "/" in model_id:
+        return model_id
+    shorthand_map = {
+        "gpt-4o": "openai/gpt-4o",
+        "gpt-4o-mini": "openai/gpt-4o-mini",
+        "minimax-m1": "minimax/minimax-01",
+        "deepseek-v3": "deepseek/deepseek-chat",
+    }
+    normalized = shorthand_map.get(model_id, model_id)
+    if normalized == model_id:
+        logger.warning(f"Model id '{model_id}' has no provider prefix and no known mapping; using as-is")
+    else:
+        logger.warning(f"Normalized shorthand model id '{model_id}' -> '{normalized}'")
+    return normalized
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     await warmup_models()
@@ -125,11 +152,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-async def run_bot(room_url: str, token: str):
+async def run_bot(room_url: str, token: str, model_id: str | None = None):
     run_started_at = time.monotonic()
     logger.info(f"Starting Daily session for room: {room_url}")
 
-    tts, _ = await get_tts_service()
+    tts = create_tts_service()
 
     transport = DailyTransport(
         room_url=room_url,
@@ -142,13 +169,39 @@ async def run_bot(room_url: str, token: str):
         ),
     )
 
-    stt = DeepgramSTTService(api_key=DEEPGRAM_API_KEY)
+    stt = DeepgramSTTService(
+        api_key=DEEPGRAM_API_KEY,
+        language="en",
+        model="nova-2",
+        smart_format=True,
+        punctuate=True,
+    )
+    logger.info(f"Deepgram API key configured: {bool(DEEPGRAM_API_KEY)}")
+    if hasattr(stt, "event_handler"):
+        @stt.event_handler("on_connected")
+        async def on_stt_connected(*args, **kwargs):
+            logger.info("Deepgram STT WebSocket connected")
+
+        @stt.event_handler("on_disconnected")
+        async def on_stt_disconnected(*args, **kwargs):
+            logger.warning(f"Deepgram STT WebSocket disconnected: args={args}, kwargs={kwargs}")
+
+        @stt.event_handler("on_connection_error")
+        async def on_stt_connection_error(*args, **kwargs):
+            logger.error(f"Deepgram STT WebSocket connection error: args={args}, kwargs={kwargs}")
+
+    selected_model = normalize_openrouter_model_id(model_id)
+    logger.info(f"Using model for session: {selected_model}")
 
     llm = OpenRouterLLMService(
         api_key=OPENROUTER_API_KEY,
-        settings=OpenRouterLLMService.Settings(model=OPENROUTER_MODEL),
+        settings=OpenRouterLLMService.Settings(model=selected_model),
         system_prompt=SYSTEM_PROMPT,
     )
+    if hasattr(llm, "event_handler"):
+        @llm.event_handler("on_error")
+        async def on_llm_error(*args, **kwargs):
+            logger.exception(f"OpenRouter LLM error: args={args}, kwargs={kwargs}")
 
     async with AsyncExitStack() as exit_stack:
         tavily_mcp_url = os.getenv("TAVILY_MCP_URL", "")
@@ -172,7 +225,9 @@ async def run_bot(room_url: str, token: str):
 
         pipeline = Pipeline([
             transport.input(),
+            STTDebugProcessor("STTDebug-before"),
             stt,
+            STTDebugProcessor("STTDebug-after"),
             context_aggregator.user(),
             llm,
             TextNormalizer(),
@@ -201,13 +256,37 @@ async def run_bot(room_url: str, token: str):
             observers=[MetricsLogObserver(), user_bot_latency_observer],
         )
 
+        pipeline_started = False
+        participant_joined = False
+        greeting_queued = False
+
+        async def maybe_queue_greeting() -> None:
+            nonlocal greeting_queued
+            if not pipeline_started or not participant_joined or greeting_queued:
+                return
+            greeting_queued = True
+            logger.info("Queueing greeting frame to force initial LLM turn")
+            await task.queue_frame(
+                LLMMessagesUpdateFrame(
+                    [{"role": "user", "content": "Hello"}],
+                    run_llm=True,
+                )
+            )
+
+        @task.event_handler("on_pipeline_started")
+        async def on_pipeline_started(*args, **kwargs):
+            nonlocal pipeline_started
+            pipeline_started = True
+            logger.info("Pipeline started; StartFrame reached pipeline sink")
+            await maybe_queue_greeting()
+
         @transport.event_handler("on_first_participant_joined")
         async def on_first_participant_joined(_transport, _participant):
+            nonlocal participant_joined
+            participant_joined = True
             join_delay_seconds = time.monotonic() - run_started_at
             logger.info(f"First participant joined ({join_delay_seconds:.2f}s after run_bot start)")
-            await task.queue_frame(
-                LLMMessagesUpdateFrame([{"role": "user", "content": "Hello"}], run_llm=True)
-            )
+            await maybe_queue_greeting()
 
         @transport.event_handler("on_participant_left")
         async def on_participant_left(_transport, _participant, _reason):
@@ -216,11 +295,8 @@ async def run_bot(room_url: str, token: str):
 
         runner = PipelineRunner()
         logger.info("Pipeline runner started; waiting for Daily participants to join")
-        try:
-            await runner.run(task)
-        finally:
-            return_tts_service(tts)
-
+        await runner.run(task)
+    
 async def create_daily_session() -> tuple[str, str, str]:
     if not DAILY_API_KEY:
         raise HTTPException(status_code=500, detail="DAILY_API_KEY is not configured")
@@ -242,10 +318,13 @@ async def create_daily_session() -> tuple[str, str, str]:
 async def health() -> JSONResponse:
     return JSONResponse({"status": "ok"})
 
+class DailySessionRequest(BaseModel):
+    model_id: str | None = None
+
 @app.post("/api/daily/session")
-async def daily_session(background_tasks: BackgroundTasks):
+async def daily_session(background_tasks: BackgroundTasks, payload: DailySessionRequest):
     room_url, user_token, bot_token = await create_daily_session()
-    background_tasks.add_task(run_bot, room_url, bot_token)
+    background_tasks.add_task(run_bot, room_url, bot_token, payload.model_id)
     return JSONResponse({"room_url": room_url, "token": user_token})
 
 @app.options("/api/daily/session")
