@@ -86,7 +86,7 @@ export function useVoiceClient() {
         audioSource: true,
         videoSource: false,
         startAudioOff: false,
-        subscribeToTracksAutomatically: true, // ✅ Daily.js handles remote audio natively & safely
+        subscribeToTracksAutomatically: true,
       });
 
       (call as any).on("joined-meeting", () => {

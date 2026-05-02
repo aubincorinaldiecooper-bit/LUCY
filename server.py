@@ -118,8 +118,7 @@ class TextNormalizer(FrameProcessor):
 
 
 class STTDebugProcessor(FrameProcessor):
-    """Development-only processor for frame-level STT debugging.
-    Kept in file for easy reactivation, but removed from production pipeline."""
+    """Logs audio frames going into STT and transcripts coming out."""
 
     def __init__(self, label: str = "STTDebug"):
         super().__init__()
@@ -150,6 +149,26 @@ class STTDebugProcessor(FrameProcessor):
             logger.error(f"[{self._label}] ErrorFrame from STT: {frame.error!r}")
 
         await self.push_frame(frame, direction)
+
+
+def normalize_openrouter_model_id(model_id: str | None) -> str:
+    """Maps shorthand model IDs to full OpenRouter provider/model format."""
+    if not model_id:
+        return OPENROUTER_MODEL
+    if "/" in model_id:
+        return model_id
+    shorthand_map = {
+        "gpt-4o": "openai/gpt-4o",
+        "gpt-4o-mini": "openai/gpt-4o-mini",
+        "minimax-m1": "minimax/minimax-01",
+        "deepseek-v3": "deepseek/deepseek-chat",
+    }
+    normalized = shorthand_map.get(model_id, model_id)
+    if normalized == model_id:
+        logger.warning(f"Model id '{model_id}' has no provider prefix and no known mapping; using as-is")
+    else:
+        logger.warning(f"Normalized shorthand model id '{model_id}' -> '{normalized}'")
+    return normalized
 
 
 @asynccontextmanager
@@ -197,13 +216,8 @@ async def run_bot(room_url: str, token: str, model_id: str | None = None):
         ),
     )
 
-    selected_model = model_id or OPENROUTER_MODEL
-    logger.info(f"Using model for session: {selected_model}")
-
-    selected_model = model_id or OPENROUTER_MODEL
-    logger.info(f"Using model for session: {selected_model}")
-
-    selected_model = model_id or OPENROUTER_MODEL
+    # Normalize model ID (frontend may send shorthand or full)
+    selected_model = normalize_openrouter_model_id(model_id)
     logger.info(f"Using model for session: {selected_model}")
 
     llm = OpenRouterLLMService(
@@ -211,6 +225,14 @@ async def run_bot(room_url: str, token: str, model_id: str | None = None):
         settings=OpenRouterLLMService.Settings(model=selected_model),
         system_prompt=SYSTEM_PROMPT,
     )
+    if hasattr(llm, "event_handler"):
+        @llm.event_handler("on_error")
+        async def on_llm_error(*args, **kwargs):
+            logger.exception(f"OpenRouter LLM error: args={args}, kwargs={kwargs}")
+
+    # Instantiate STT debug processors for pipeline visibility
+    stt_debug_before = STTDebugProcessor(label="DeepgramSTT-before")
+    stt_debug_after = STTDebugProcessor(label="DeepgramSTT-after")
 
     async with AsyncExitStack() as exit_stack:
         tavily_mcp_url = os.getenv("TAVILY_MCP_URL", "")
@@ -234,7 +256,9 @@ async def run_bot(room_url: str, token: str, model_id: str | None = None):
 
         pipeline = Pipeline([
             transport.input(),
+            stt_debug_before,   # log audio frames before STT
             stt,
+            stt_debug_after,    # log transcripts after STT
             TextNormalizer(),
             context_aggregator.user(),
             llm,
@@ -275,6 +299,7 @@ async def run_bot(room_url: str, token: str, model_id: str | None = None):
                 [{"role": "user", "content": "Hello"}],
                 run_llm=True,
             )
+            logger.info("Queueing greeting frame to force initial LLM turn")
             await task.queue_frame(greeting_frame)
 
         @transport.event_handler("on_participant_left")
@@ -284,8 +309,12 @@ async def run_bot(room_url: str, token: str, model_id: str | None = None):
 
         runner = PipelineRunner()
         logger.info("Pipeline runner started; waiting for Daily participants to join")
-        await runner.run(task)
-    
+        try:
+            await runner.run(task)
+        except Exception as e:
+            logger.exception(f"Pipeline runner failed: {e}")
+
+
 async def create_daily_session() -> tuple[str, str, str]:
     if not DAILY_API_KEY:
         raise HTTPException(status_code=500, detail="DAILY_API_KEY is not configured")

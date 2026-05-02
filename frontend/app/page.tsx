@@ -14,7 +14,7 @@ const SettingsPanel = dynamic(() => import("@/components/SettingsPanel"), { ssr:
 export default function HomePage() {
   const { state, connect, disconnect, toggleMute } = useVoiceClient();
   const { mics, speakers } = useAudioDevices();
-  const [selectedModelId, setSelectedModelId] = useState("gpt-4o");
+  const [selectedModelId, setSelectedModelId] = useState("openai/gpt-4o");
   const [selectedMic, setSelectedMic] = useState("");
   const [selectedSpeaker, setSelectedSpeaker] = useState("");
 

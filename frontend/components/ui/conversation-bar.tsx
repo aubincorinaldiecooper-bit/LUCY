@@ -1,8 +1,7 @@
 "use client";
 
-import { motion } from "framer-motion";
 import { Check, ChevronDown, Mic, MicOff, Phone, Search, X } from "lucide-react";
-import { useEffect, useRef, type ReactNode, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { VoiceState } from "@/hooks/useVoiceClient";
 import Waveform from "@/components/Waveform";
 
@@ -29,14 +28,12 @@ type ConversationBarProps = {
 };
 
 const MODEL_OPTIONS: ModelOption[] = [
-  { id: "gpt-4.1", name: "GPT-4.1", provider: "openai", badge: "G", tone: "#4A6CF7", bg: "#F0F4FF" },
-  { id: "gpt-4o", name: "GPT-4o", provider: "openai", badge: "G", tone: "#4A6CF7", bg: "#F0F4FF" },
-  { id: "claude-sonnet-4", name: "Claude Sonnet 4", provider: "anthropic", badge: "C", tone: "#D9783E", bg: "#FFF3E0" },
-  { id: "claude-opus-4", name: "Claude Opus 4", provider: "anthropic", badge: "C", tone: "#D9783E", bg: "#FFF3E0" },
-  { id: "minimax-m1", name: "MiniMax M1", provider: "minimax", badge: "M", tone: "#8B5CF6", bg: "#F3E8FF" },
-  { id: "minimax-text-01", name: "MiniMax Text-01", provider: "minimax", badge: "M", tone: "#8B5CF6", bg: "#F3E8FF" },
-  { id: "deepseek-r1", name: "DeepSeek R1", provider: "deepseek", badge: "D", tone: "#0891B2", bg: "#E0F2FE" },
-  { id: "deepseek-v3", name: "DeepSeek V3", provider: "deepseek", badge: "D", tone: "#0891B2", bg: "#E0F2FE" },
+  { id: "anthropic/claude-3.5-sonnet:beta", name: "Claude 3.5 Sonnet", provider: "anthropic", badge: "C", tone: "#D9783E", bg: "#FFF3E0" },
+  { id: "openai/gpt-4o", name: "GPT-4o", provider: "openai", badge: "G", tone: "#4A6CF7", bg: "#F0F4FF" },
+  { id: "openai/gpt-4o-mini", name: "GPT-4o Mini", provider: "openai", badge: "G", tone: "#4A6CF7", bg: "#F0F4FF" },
+  { id: "minimax/minimax-01", name: "MiniMax M1", provider: "minimax", badge: "M", tone: "#8B5CF6", bg: "#F3E8FF" },
+  { id: "deepseek/deepseek-chat", name: "DeepSeek Chat (V3)", provider: "deepseek", badge: "D", tone: "#0891B2", bg: "#E0F2FE" },
+  { id: "anthropic/claude-3-opus-20240229", name: "Claude 3 Opus", provider: "anthropic", badge: "C", tone: "#D9783E", bg: "#FFF3E0" },
 ];
 
 const PROVIDER_LABEL: Record<ModelOption["provider"], string> = {
@@ -46,7 +43,7 @@ const PROVIDER_LABEL: Record<ModelOption["provider"], string> = {
   deepseek: "DeepSeek",
 };
 
-const DEFAULT_MODEL_ID = "gpt-4o"; // aligned with main's model list
+const DEFAULT_MODEL_ID = "openai/gpt-4o";
 const DOT_PLACEHOLDER_HEIGHTS = [4,5,6,7,8,9,10,12,14,16,18,20,22,24,22,20,18,16,14,12,10,9,8,7,6,5,4];
 
 function DotPlaceholder() {
@@ -89,7 +86,7 @@ export function ConversationBar({
     if (process.env.NODE_ENV !== "production" && selectedModelId) {
       console.warn(`[ConversationBar] Unknown model id "${selectedModelId}". Falling back to "${defaultModel?.id ?? MODEL_OPTIONS[0]?.id}".`);
     }
-    return defaultModel ?? MODEL_OPTIONS[0];
+    return defaultModel ?? MODEL_OPTIONS[0]!;
   }, [selectedModelId]);
 
   const filteredModels = useMemo(() => {
@@ -199,7 +196,7 @@ export function ConversationBar({
               </span>
             </button>
 
-            {/* Render the rightSlot (SettingsPanel) here */}
+            {/* External slot (e.g., SettingsPanel) */}
             {rightSlot}
           </div>
         </div>
