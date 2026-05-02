@@ -36,6 +36,7 @@ from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
 from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
 from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.mistral.stt import MistralSTTService
 from pipecat.services.kokoro.tts import KokoroTTSService
 from pipecat.services import mcp_service
 from pipecat.services.mcp_service import MCPClient
@@ -49,11 +50,13 @@ load_dotenv()
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "You are Lucy, a chill and straightforward friend who keeps conversations light and insightful. Respond in one or two natural sentences with clear punctuation for smooth pacing. Keep your tone casual and conversational, avoiding corporate or overly formal phrasing. When politics, religion, or strong opinions come up, stay neutral and gently turn the focus back by asking one quick question about their perspective. Prioritize learning about them through intuitive questioning rather than agreeing just to be polite, and skip generic validation like I can see that or that is an interesting perspective. If asked about your origins or how you work, casually say you are not sure about the technical details but your creator built you to make daily conversations more meaningful. When you need current information, always briefly acknowledge it first with a natural phrase like let me look that up or give me a sec, then keep your summary tight. Stay in character, keep it real, and focus on natural back-and-forth dialogue.")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "")
 DAILY_API_KEY = os.getenv("DAILY_API_KEY", "")
 DAILY_API_URL = os.getenv("DAILY_API_URL", "https://api.daily.co/v1")
 DAILY_ROOM_URL = os.getenv("DAILY_ROOM_URL", "")
 TAVILY_MCP_URL = os.getenv("TAVILY_MCP_URL", "")
 BOT_NAME = os.getenv("BOT_NAME", "Lucy")
+STT_PROVIDER = os.getenv("STT_PROVIDER", "deepgram").lower()
 CORS_ORIGINS = os.getenv(
     "CORS_ORIGINS",
     "http://localhost:3000,https://vigilant-youth-production-452c.up.railway.app",
@@ -102,9 +105,6 @@ class TextNormalizer(FrameProcessor):
         super().__init__()
         self._markdown_pattern = re.compile(r'[*_`#~>]|```|^\s*[-*•]\s+', re.MULTILINE)
 
-    def _check_started(self, frame: Frame) -> None:
-        pass
-
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
         if isinstance(frame, TextFrame):
@@ -127,9 +127,6 @@ class STTDebugProcessor(FrameProcessor):
         self._audio_frames_in: int = 0
         self._transcripts_out: int = 0
         self._logged_first_other_frame = False
-
-    def _check_started(self, frame: Frame) -> None:
-        pass
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
@@ -199,6 +196,42 @@ def normalize_openrouter_model_id(model_id: str | None) -> str:
     return normalized
 
 
+def create_stt_service(provider: str):
+    """Create STT service based on provider."""
+    if provider == "mistral":
+        logger.info("Using Mistral STT")
+        if not MISTRAL_API_KEY:
+            logger.error("MISTRAL_API_KEY is not set — MistralSTTService will not work")
+        # Try extended constructor if available; fallback to api_key only
+        try:
+            return MistralSTTService(
+                api_key=MISTRAL_API_KEY,
+                model="voxtral-mini-transcribe-realtime-2602",
+                language="en",
+                sample_rate=16000,
+            )
+        except TypeError:
+            logger.warning("Extended Mistral constructor failed; falling back to api_key only")
+            return MistralSTTService(api_key=MISTRAL_API_KEY)
+    else:
+        logger.info("Using Deepgram STT")
+        if not DEEPGRAM_API_KEY:
+            logger.error("DEEPGRAM_API_KEY is not set — DeepgramSTTService will not produce transcripts")
+        return DeepgramSTTService(
+            api_key=DEEPGRAM_API_KEY,
+            encoding="linear16",
+            channels=1,
+            sample_rate=16000,
+            settings=DeepgramSTTService.Settings(
+                model="nova-2",
+                language="en",
+                smart_format=True,
+                punctuate=True,
+                interim_results=True,
+            ),
+        )
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     await warmup_models()
@@ -231,37 +264,20 @@ async def run_bot(room_url: str, token: str, model_id: str | None = None):
         ),
     )
 
-    stt = DeepgramSTTService(
-        api_key=DEEPGRAM_API_KEY,
-        encoding="linear16",
-        channels=1,
-        sample_rate=16000,
-        settings=DeepgramSTTService.Settings(
-            model="nova-2",
-            language="en",
-            smart_format=True,
-            punctuate=True,
-            interim_results=True,
-        ),
-    )
-
-    if DEEPGRAM_API_KEY:
-        logger.info("Deepgram API key present")
-    else:
-        logger.error("DEEPGRAM_API_KEY is not set — DeepgramSTTService will not produce transcripts")
+    stt = create_stt_service(STT_PROVIDER)
 
     if hasattr(stt, "event_handler"):
         @stt.event_handler("on_connected")
         async def on_stt_connected(*args, **kwargs):
-            logger.info("Deepgram STT WebSocket connected")
+            logger.info(f"{STT_PROVIDER.capitalize()} STT connected")
 
         @stt.event_handler("on_disconnected")
         async def on_stt_disconnected(*args, **kwargs):
-            logger.warning("Deepgram STT WebSocket disconnected")
+            logger.warning(f"{STT_PROVIDER.capitalize()} STT disconnected")
 
         @stt.event_handler("on_connection_error")
         async def on_stt_connection_error(*args, **kwargs):
-            logger.error(f"Deepgram STT connection error: args={args}, kwargs={kwargs}")
+            logger.error(f"{STT_PROVIDER.capitalize()} STT connection error: args={args}, kwargs={kwargs}")
 
     selected_model = normalize_openrouter_model_id(model_id)
     logger.info(f"Using model for session: {selected_model}")
@@ -276,8 +292,8 @@ async def run_bot(room_url: str, token: str, model_id: str | None = None):
         async def on_llm_error(*args, **kwargs):
             logger.exception(f"OpenRouter LLM error: args={args}, kwargs={kwargs}")
 
-    stt_debug_before = STTDebugProcessor(label="DeepgramSTT-before")
-    stt_debug_after = STTDebugProcessor(label="DeepgramSTT-after")
+    stt_debug_before = STTDebugProcessor(label=f"{STT_PROVIDER}STT-before")
+    stt_debug_after = STTDebugProcessor(label=f"{STT_PROVIDER}STT-after")
 
     async with AsyncExitStack() as exit_stack:
         tavily_mcp_url = os.getenv("TAVILY_MCP_URL", "")
