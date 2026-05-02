@@ -51,12 +51,12 @@ SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "You are Lucy, a chill and straightfo
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "")
+STT_PROVIDER = os.getenv("STT_PROVIDER", "deepgram").lower()
 DAILY_API_KEY = os.getenv("DAILY_API_KEY", "")
 DAILY_API_URL = os.getenv("DAILY_API_URL", "https://api.daily.co/v1")
 DAILY_ROOM_URL = os.getenv("DAILY_ROOM_URL", "")
 TAVILY_MCP_URL = os.getenv("TAVILY_MCP_URL", "")
 BOT_NAME = os.getenv("BOT_NAME", "Lucy")
-STT_PROVIDER = os.getenv("STT_PROVIDER", "deepgram").lower()
 CORS_ORIGINS = os.getenv(
     "CORS_ORIGINS",
     "http://localhost:3000,https://vigilant-youth-production-452c.up.railway.app",
@@ -173,7 +173,6 @@ class STTDebugProcessor(FrameProcessor):
 
 def normalize_openrouter_model_id(model_id: str | None) -> str:
     """Maps shorthand model IDs to full OpenRouter provider/model format.
-
     Falls back to a hardcoded default if no model_id is provided.
     """
     if not model_id:
@@ -202,7 +201,6 @@ def create_stt_service(provider: str):
         logger.info("Using Mistral STT")
         if not MISTRAL_API_KEY:
             logger.error("MISTRAL_API_KEY is not set — MistralSTTService will not work")
-        # Try extended constructor if available; fallback to api_key only
         try:
             return MistralSTTService(
                 api_key=MISTRAL_API_KEY,

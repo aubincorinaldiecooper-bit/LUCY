@@ -42,6 +42,15 @@ export function useVoiceClient() {
   const [isMuted, setIsMuted] = useState(false);
   const callRef = useRef<DailyCall | null>(null);
   const joinStartedAtRef = useRef<number | null>(null);
+  const remoteAudioElsRef = useRef<Map<string, HTMLAudioElement>>(new Map());
+
+  const cleanupRemoteAudioEls = useCallback(() => {
+    remoteAudioElsRef.current.forEach((audioEl) => {
+      audioEl.pause();
+      audioEl.srcObject = null;
+    });
+    remoteAudioElsRef.current.clear();
+  }, []);
 
   const disconnect = useCallback(async () => {
     const call = callRef.current;
@@ -68,10 +77,11 @@ export function useVoiceClient() {
 
       callRef.current = null;
       joinStartedAtRef.current = null;
+      cleanupRemoteAudioEls();
       setState("idle");
       setIsMuted(false);
     }
-  }, []);
+  }, [cleanupRemoteAudioEls]);
 
   const connect = useCallback(async (modelId?: string) => {
     if (callRef.current) {
@@ -100,6 +110,7 @@ export function useVoiceClient() {
         setIsMuted(false);
         callRef.current = null;
         joinStartedAtRef.current = null;
+        cleanupRemoteAudioEls();
       });
 
       (call as any).on("error", () => {
@@ -108,12 +119,28 @@ export function useVoiceClient() {
         setIsMuted(false);
         callRef.current = null;
         joinStartedAtRef.current = null;
+        cleanupRemoteAudioEls();
       });
 
       (call as any).on("track-started", (event: { participant: { local: boolean } | null; track: MediaStreamTrack; type: string }) => {
         if (event.participant?.local || event.type !== "audio") {
           return;
         }
+
+        const stream = new MediaStream([event.track]);
+        const audio = new Audio();
+        audio.autoplay = true;
+        audio.srcObject = stream;
+        void audio.play()
+          .then(() => console.debug(`[daily] remote audio playing track=${event.track.id}`))
+          .catch((error: unknown) => {
+            if (error instanceof Error) {
+              console.debug(`[daily] remote audio play() failed track=${event.track.id} name=${error.name} message=${error.message}`);
+            } else {
+              console.debug(`[daily] remote audio play() failed track=${event.track.id}`, error);
+            }
+          });
+        remoteAudioElsRef.current.set(event.track.id, audio);
 
         // ✅ Latency tracking preserved from codex branch
         const joinStartedAt = joinStartedAtRef.current;
@@ -128,6 +155,15 @@ export function useVoiceClient() {
         }
 
         setState(isMuted ? "muted" : "connected");
+      });
+
+      (call as any).on("track-stopped", (event: { track: MediaStreamTrack; type: string }) => {
+        if (event.type !== "audio") return;
+        const existingAudioEl = remoteAudioElsRef.current.get(event.track.id);
+        if (!existingAudioEl) return;
+        existingAudioEl.pause();
+        existingAudioEl.srcObject = null;
+        remoteAudioElsRef.current.delete(event.track.id);
       });
 
       callRef.current = call;
@@ -155,16 +191,18 @@ export function useVoiceClient() {
 
       callRef.current = null;
       joinStartedAtRef.current = null;
+      cleanupRemoteAudioEls();
       setIsMuted(false);
       setState("idle");
     }
-  }, [isMuted]);
+  }, [cleanupRemoteAudioEls, isMuted]);
 
   useEffect(() => {
     return () => {
       void disconnect();
+      cleanupRemoteAudioEls();
     };
-  }, [disconnect]);
+  }, [cleanupRemoteAudioEls, disconnect]);
 
   const toggleMute = useCallback(() => {
     const nextMuted = !isMuted;
