@@ -106,6 +106,7 @@ class TextNormalizer(FrameProcessor):
         pass
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
         if isinstance(frame, TextFrame):
             clean = self._markdown_pattern.sub('', frame.text)
             clean = re.sub(r'\s+', ' ', clean).strip()
@@ -131,6 +132,8 @@ class STTDebugProcessor(FrameProcessor):
         pass
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+
         frame_name = type(frame).__name__
         is_after_stt = "after" in self._label.lower()
 
