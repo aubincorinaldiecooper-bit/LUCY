@@ -67,6 +67,7 @@ export function useVoiceClient() {
       }
 
       callRef.current = null;
+      joinStartedAtRef.current = null;
       setState("idle");
       setIsMuted(false);
     }
@@ -98,6 +99,7 @@ export function useVoiceClient() {
         setState("idle");
         setIsMuted(false);
         callRef.current = null;
+        joinStartedAtRef.current = null;
       });
 
       (call as any).on("error", () => {
@@ -105,6 +107,7 @@ export function useVoiceClient() {
         setState("idle");
         setIsMuted(false);
         callRef.current = null;
+        joinStartedAtRef.current = null;
       });
 
       (call as any).on("track-started", (event: { participant: { local: boolean } | null; track: MediaStreamTrack; type: string }) => {
@@ -112,6 +115,7 @@ export function useVoiceClient() {
           return;
         }
 
+        // ✅ Latency tracking preserved from codex branch
         const joinStartedAt = joinStartedAtRef.current;
         if (joinStartedAt) {
           const firstResponseLatencyMs = performance.now() - joinStartedAt;
