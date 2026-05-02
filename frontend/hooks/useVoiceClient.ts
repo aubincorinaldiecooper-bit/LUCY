@@ -10,8 +10,6 @@ type DailySessionResponse = {
   token: string;
 };
 
-const REMOTE_AUDIO_ELEMENT_ID = "lucy-remote-audio";
-
 function resolveSessionUrl() {
   const rawApiUrl = process.env.NEXT_PUBLIC_API_URL?.trim().replace(/^['"]|['"]$/g, "");
 
@@ -23,12 +21,13 @@ function resolveSessionUrl() {
   return new URL("/api/daily/session", baseUrl).toString();
 }
 
-async function createDailySession(): Promise<DailySessionResponse> {
+async function createDailySession(modelId?: string): Promise<DailySessionResponse> {
   const response = await fetch(resolveSessionUrl(), {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
     },
+    body: JSON.stringify(modelId ? { model_id: modelId } : {}),
   });
 
   if (!response.ok) {
@@ -42,39 +41,21 @@ export function useVoiceClient() {
   const [state, setState] = useState<VoiceState>("idle");
   const [isMuted, setIsMuted] = useState(false);
   const callRef = useRef<DailyCall | null>(null);
-  const activeMicDeviceIdRef = useRef<string | undefined>(undefined);
+  const joinStartedAtRef = useRef<number | null>(null);
+  const remoteAudioElsRef = useRef<Map<string, HTMLAudioElement>>(new Map());
 
-  const ensureRemoteAudioElement = useCallback(() => {
-    let audioEl = document.getElementById(REMOTE_AUDIO_ELEMENT_ID) as HTMLAudioElement | null;
-
-    if (!audioEl) {
-      audioEl = document.createElement("audio");
-      audioEl.id = REMOTE_AUDIO_ELEMENT_ID;
-      audioEl.autoplay = true;
-      audioEl.setAttribute("playsinline", "true");
-      audioEl.style.display = "none";
-      document.body.appendChild(audioEl);
-    }
-
-    return audioEl;
-  }, []);
-
-  const clearRemoteAudioElement = useCallback(() => {
-    const audioEl = document.getElementById(REMOTE_AUDIO_ELEMENT_ID) as HTMLAudioElement | null;
-    if (!audioEl) {
-      return;
-    }
-
-    audioEl.pause();
-    audioEl.srcObject = null;
-    audioEl.remove();
+  const cleanupRemoteAudioEls = useCallback(() => {
+    remoteAudioElsRef.current.forEach((audioEl) => {
+      audioEl.pause();
+      audioEl.srcObject = null;
+    });
+    remoteAudioElsRef.current.clear();
   }, []);
 
   const disconnect = useCallback(async () => {
     const call = callRef.current;
 
     if (!call) {
-      activeMicDeviceIdRef.current = undefined;
       return;
     }
 
@@ -95,26 +76,21 @@ export function useVoiceClient() {
       }
 
       callRef.current = null;
-      activeMicDeviceIdRef.current = undefined;
-      clearRemoteAudioElement();
+      cleanupRemoteAudioEls();
       setState("idle");
       setIsMuted(false);
     }
-  }, [clearRemoteAudioElement]);
+  }, [cleanupRemoteAudioEls]);
 
-  const connect = useCallback(async (micDeviceId?: string) => {
+  const connect = useCallback(async (modelId?: string) => {
     if (callRef.current) {
-      if (activeMicDeviceIdRef.current === micDeviceId) {
-        return;
-      }
-
-      await disconnect();
+      return;
     }
 
     setState("initializing");
 
     try {
-      const session = await createDailySession();
+      const session = await createDailySession(modelId);
       const call = DailyIframe.createCallObject({
         audioSource: true,
         videoSource: false,
@@ -124,7 +100,7 @@ export function useVoiceClient() {
 
       (call as any).on("joined-meeting", () => {
         console.debug("[daily] joined meeting");
-        setState(isMuted ? "muted" : "connected");
+        setState("connecting");
       });
 
       (call as any).on("left-meeting", () => {
@@ -132,47 +108,63 @@ export function useVoiceClient() {
         setState("idle");
         setIsMuted(false);
         callRef.current = null;
-        activeMicDeviceIdRef.current = undefined;
-        clearRemoteAudioElement();
+        cleanupRemoteAudioEls();
       });
 
       (call as any).on("error", () => {
         console.debug("[daily] meeting error");
-        clearRemoteAudioElement();
         setState("idle");
         setIsMuted(false);
         callRef.current = null;
-        activeMicDeviceIdRef.current = undefined;
+        cleanupRemoteAudioEls();
       });
 
       (call as any).on("track-started", (event: { participant: { local: boolean } | null; track: MediaStreamTrack; type: string }) => {
-        console.debug("[daily] track started", event.type);
-
         if (event.participant?.local || event.type !== "audio") {
           return;
         }
 
-        const audioEl = ensureRemoteAudioElement();
-        audioEl.srcObject = new MediaStream([event.track]);
-        void audioEl.play().catch((error) => {
-          console.debug("[daily] remote audio playback blocked", error);
-        });
+        const stream = new MediaStream([event.track]);
+        const audio = new Audio();
+        audio.autoplay = true;
+        audio.srcObject = stream;
+        void audio.play()
+          .then(() => console.debug(`[daily] remote audio playing track=${event.track.id}`))
+          .catch((error: unknown) => {
+            if (error instanceof Error) {
+              console.debug(`[daily] remote audio play() failed track=${event.track.id} name=${error.name} message=${error.message}`);
+            } else {
+              console.debug(`[daily] remote audio play() failed track=${event.track.id}`, error);
+            }
+          });
+        remoteAudioElsRef.current.set(event.track.id, audio);
+
+        const joinStartedAt = joinStartedAtRef.current;
+        if (joinStartedAt) {
+          const firstResponseLatencyMs = performance.now() - joinStartedAt;
+          if (firstResponseLatencyMs > 2000) {
+            console.warn(`[daily] first response latency ${Math.round(firstResponseLatencyMs)}ms (>2000ms target)`);
+          } else {
+            console.debug(`[daily] first response latency ${Math.round(firstResponseLatencyMs)}ms`);
+          }
+          joinStartedAtRef.current = null;
+        }
+
+        setState(isMuted ? "muted" : "connected");
       });
 
-      (call as any).on("track-stopped", (event: { type: string }) => {
-        console.debug("[daily] track stopped", event.type);
-
-        if (event.type === "audio") {
-          clearRemoteAudioElement();
-        }
+      (call as any).on("track-stopped", (event: { track: MediaStreamTrack; type: string }) => {
+        if (event.type !== "audio") return;
+        const existingAudioEl = remoteAudioElsRef.current.get(event.track.id);
+        if (!existingAudioEl) return;
+        existingAudioEl.pause();
+        existingAudioEl.srcObject = null;
+        remoteAudioElsRef.current.delete(event.track.id);
       });
 
       callRef.current = call;
       setState("connecting");
-
-      if (micDeviceId) {
-        await call.setInputDevicesAsync({ audioDeviceId: micDeviceId });
-      }
+      joinStartedAtRef.current = performance.now();
 
       await call.join({
         url: session.room_url,
@@ -180,41 +172,33 @@ export function useVoiceClient() {
         startAudioOff: false,
       });
 
-      activeMicDeviceIdRef.current = micDeviceId;
       call.setLocalAudio(!isMuted);
-      const audioEl = ensureRemoteAudioElement();
-      void audioEl.play().catch((error) => {
-        console.debug("[daily] remote audio element not ready to play yet", error);
-      });
 
-      setState(isMuted ? "muted" : "connected");
     } catch {
-      if (callRef.current) {
-        if (!callRef.current.isDestroyed()) {
-          try {
-            await callRef.current.destroy();
-          } catch (error) {
-            if (!(error instanceof DOMException && error.name === "InvalidStateError")) {
-              throw error;
-            }
+      if (callRef.current && !callRef.current.isDestroyed()) {
+        try {
+          await callRef.current.destroy();
+        } catch (error) {
+          if (!(error instanceof DOMException && error.name === "InvalidStateError")) {
+            throw error;
           }
         }
       }
 
       callRef.current = null;
-      activeMicDeviceIdRef.current = undefined;
-      clearRemoteAudioElement();
+      joinStartedAtRef.current = null;
+      cleanupRemoteAudioEls();
       setIsMuted(false);
       setState("idle");
     }
-  }, [clearRemoteAudioElement, disconnect, ensureRemoteAudioElement, isMuted]);
+  }, [cleanupRemoteAudioEls, isMuted]);
 
   useEffect(() => {
     return () => {
       void disconnect();
-      clearRemoteAudioElement();
+      cleanupRemoteAudioEls();
     };
-  }, [clearRemoteAudioElement, disconnect]);
+  }, [cleanupRemoteAudioEls, disconnect]);
 
   const toggleMute = useCallback(() => {
     const nextMuted = !isMuted;
