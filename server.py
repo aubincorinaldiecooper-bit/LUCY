@@ -3,7 +3,6 @@ os.environ["ORT_INTRA_OP_NUM_THREADS"] = "2"
 os.environ["ORT_INTER_OP_NUM_THREADS"] = "1"
 os.environ["ONNXRUNTIME_LOG_LEVEL"] = "3"
 
-import asyncio
 import time
 import re
 from contextlib import asynccontextmanager
@@ -18,7 +17,16 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import EndFrame, ErrorFrame, LLMMessagesUpdateFrame, StartFrame, Frame, TextFrame, TranscriptionFrame, UserAudioRawFrame
+from pipecat.frames.frames import (
+    EndFrame,
+    ErrorFrame,
+    LLMMessagesUpdateFrame,
+    Frame,
+    StartFrame,
+    TextFrame,
+    TranscriptionFrame,
+    UserAudioRawFrame,
+)
 from pipecat.observers.loggers.metrics_log_observer import MetricsLogObserver
 from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
 from pipecat.pipeline.pipeline import Pipeline
@@ -44,7 +52,6 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "")
 STT_PROVIDER = os.getenv("STT_PROVIDER", "deepgram").lower()
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "minimax/minimax-m2.7")
 DAILY_API_KEY = os.getenv("DAILY_API_KEY", "")
 DAILY_API_URL = os.getenv("DAILY_API_URL", "https://api.daily.co/v1")
 DAILY_ROOM_URL = os.getenv("DAILY_ROOM_URL", "")
@@ -91,63 +98,89 @@ async def warmup_models() -> None:
         logger.warning(f"Kokoro warm-up failed (continuing without cache): {e}")
     logger.info(f"Startup model warm-up finished in {time.perf_counter() - warmup_start:.2f}s")
 
-async def deepgram_connectivity_check() -> None:
-    if not DEEPGRAM_API_KEY:
-        logger.warning("Skipping Deepgram connectivity check: API key missing")
-        return
-    url = "wss://api.deepgram.com/v1/listen?model=nova-2&encoding=linear16&sample_rate=16000&channels=1"
-    headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}"}
-    timeout = aiohttp.ClientTimeout(total=8)
-    try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.ws_connect(url, headers=headers, heartbeat=5) as ws:
-                logger.info("Deepgram direct WebSocket check connected successfully")
-                await ws.close()
-    except Exception as e:
-        logger.error(f"Deepgram direct WebSocket check failed: {e}")
-
 class TextNormalizer(FrameProcessor):
+    """Strips markdown characters from TextFrames and passes all other frames through."""
+
     def __init__(self):
         super().__init__()
-        self._markdown_pattern = re.compile(r'[*_`#~>]|```|^\s*[-*•]\s+')
+        self._markdown_pattern = re.compile(r'[*_`#~>]|```|^\s*[-*•]\s+', re.MULTILINE)
+
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
         if isinstance(frame, TextFrame):
             clean = self._markdown_pattern.sub('', frame.text)
             clean = re.sub(r'\s+', ' ', clean).strip()
-            if clean:
-                frame = TextFrame(text=clean, user_id=frame.user_id)
-        await self.push_frame(frame, direction)
+            await self.push_frame(
+                TextFrame(text=clean, user_id=frame.user_id) if clean else frame,
+                direction,
+            )
+        else:
+            await self.push_frame(frame, direction)
+
 
 class STTDebugProcessor(FrameProcessor):
+    """Logs frame flow around STT for debugging."""
+
     def __init__(self, label: str = "STTDebug"):
         super().__init__()
         self._label = label
-        self._logged_first_non_audio_non_transcript = False
+        self._audio_frames_in: int = 0
+        self._transcripts_out: int = 0
+        self._logged_first_other_frame = False
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
+
+        frame_name = type(frame).__name__
+        is_after_stt = "after" in self._label.lower()
+
         if isinstance(frame, StartFrame):
-            logger.info(f"{self._label} received StartFrame")
-        elif isinstance(frame, ErrorFrame):
-            logger.error(f"{self._label} received ErrorFrame: {frame}")
-        elif isinstance(frame, UserAudioRawFrame):
-            logger.info(f"{self._label} received UserAudioRawFrame: sample_rate={frame.sample_rate}, channels={frame.num_channels}, bytes={len(frame.audio)}")
+            if is_after_stt:
+                logger.info("STTDebug-after received StartFrame")
+            else:
+                logger.info(f"[{self._label}] received StartFrame")
+            await self.push_frame(frame, direction)
+            return
+
+        if isinstance(frame, UserAudioRawFrame):
+            self._audio_frames_in += 1
+            if self._audio_frames_in == 1 or self._audio_frames_in % 100 == 0:
+                logger.debug(
+                    f"[{self._label}] Audio frame #{self._audio_frames_in} → STT "
+                    f"(size={len(frame.audio)} bytes, "
+                    f"sample_rate={frame.sample_rate}, "
+                    f"channels={frame.num_channels})"
+                )
         elif isinstance(frame, TranscriptionFrame):
-            logger.info(f"{self._label} received TranscriptionFrame: {frame.text!r}")
+            self._transcripts_out += 1
+            logger.info(
+                f"[{self._label}] Transcript #{self._transcripts_out} ← STT: "
+                f"text={frame.text!r} user_id={frame.user_id!r}"
+            )
         elif isinstance(frame, TextFrame):
-            logger.info(f"{self._label} received TextFrame: {frame.text!r}")
-        elif not isinstance(frame, (UserAudioRawFrame, TranscriptionFrame)):
-            if not self._logged_first_non_audio_non_transcript:
-                self._logged_first_non_audio_non_transcript = True
-                logger.info(f"{self._label} first non-audio/non-transcript frame: {type(frame).__name__}")
+            logger.info(f"[{self._label}] TextFrame: {frame.text!r}")
+        elif isinstance(frame, ErrorFrame):
+            logger.error(f"[{self._label}] ErrorFrame from STT: {frame.error!r}")
+        elif not self._logged_first_other_frame:
+            self._logged_first_other_frame = True
+            logger.info(
+                f"[{self._label}] First non-audio/non-transcript frame: "
+                f"{frame_name} direction={direction}"
+            )
+
         await self.push_frame(frame, direction)
 
+
 def normalize_openrouter_model_id(model_id: str | None) -> str:
+    """Maps shorthand model IDs to full OpenRouter provider/model format.
+    Falls back to a hardcoded default if no model_id is provided.
+    """
     if not model_id:
-        return OPENROUTER_MODEL
+        return "openai/gpt-4o"
+
     if "/" in model_id:
         return model_id
+
     shorthand_map = {
         "gpt-4o": "openai/gpt-4o",
         "gpt-4o-mini": "openai/gpt-4o-mini",
@@ -161,37 +194,41 @@ def normalize_openrouter_model_id(model_id: str | None) -> str:
         logger.warning(f"Normalized shorthand model id '{model_id}' -> '{normalized}'")
     return normalized
 
+
 def create_stt_service(provider: str):
+    """Create STT service based on provider."""
     if provider == "mistral":
+        logger.info("Using Mistral STT")
         if not MISTRAL_API_KEY:
-            raise RuntimeError("MISTRAL_API_KEY is required when STT_PROVIDER=mistral")
-        mistral_kwargs = {
-            "api_key": MISTRAL_API_KEY,
-            "model": "voxtral-mini-transcribe-realtime-2602",
-            "language": "en",
-            "sample_rate": 16000,
-        }
+            logger.error("MISTRAL_API_KEY is not set — MistralSTTService will not work")
         try:
-            return MistralSTTService(**mistral_kwargs)
+            return MistralSTTService(
+                api_key=MISTRAL_API_KEY,
+                model="voxtral-mini-transcribe-realtime-2602",
+                language="en",
+                sample_rate=16000,
+            )
         except TypeError:
+            logger.warning("Extended Mistral constructor failed; falling back to api_key only")
             return MistralSTTService(api_key=MISTRAL_API_KEY)
+    else:
+        logger.info("Using Deepgram STT")
+        if not DEEPGRAM_API_KEY:
+            logger.error("DEEPGRAM_API_KEY is not set — DeepgramSTTService will not produce transcripts")
+        return DeepgramSTTService(
+            api_key=DEEPGRAM_API_KEY,
+            encoding="linear16",
+            channels=1,
+            sample_rate=16000,
+            settings=DeepgramSTTService.Settings(
+                model="nova-2",
+                language="en",
+                smart_format=True,
+                punctuate=True,
+                interim_results=True,
+            ),
+        )
 
-    if provider != "deepgram":
-        logger.warning(f"Unknown STT_PROVIDER '{provider}', defaulting to deepgram")
-
-    return DeepgramSTTService(
-        api_key=DEEPGRAM_API_KEY,
-        encoding="linear16",
-        channels=1,
-        sample_rate=16000,
-        settings=DeepgramSTTService.Settings(
-            model="nova-2",
-            language="en",
-            smart_format=True,
-            punctuate=True,
-            interim_results=True,
-        ),
-    )
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -211,7 +248,6 @@ app.add_middleware(
 async def run_bot(room_url: str, token: str, model_id: str | None = None):
     run_started_at = time.monotonic()
     logger.info(f"Starting Daily session for room: {room_url}")
-    await deepgram_connectivity_check()
 
     tts = create_tts_service()
 
@@ -227,22 +263,19 @@ async def run_bot(room_url: str, token: str, model_id: str | None = None):
     )
 
     stt = create_stt_service(STT_PROVIDER)
-    if STT_PROVIDER == "mistral":
-        logger.info(f"Mistral API key configured: {bool(MISTRAL_API_KEY)}")
-    else:
-        logger.info(f"Deepgram API key configured: {bool(DEEPGRAM_API_KEY)}")
+
     if hasattr(stt, "event_handler"):
         @stt.event_handler("on_connected")
         async def on_stt_connected(*args, **kwargs):
-            logger.info(f"{STT_PROVIDER} STT connected")
+            logger.info(f"{STT_PROVIDER.capitalize()} STT connected")
 
         @stt.event_handler("on_disconnected")
         async def on_stt_disconnected(*args, **kwargs):
-            logger.warning(f"{STT_PROVIDER} STT disconnected: args={args}, kwargs={kwargs}")
+            logger.warning(f"{STT_PROVIDER.capitalize()} STT disconnected")
 
         @stt.event_handler("on_connection_error")
         async def on_stt_connection_error(*args, **kwargs):
-            logger.error(f"{STT_PROVIDER} STT connection error: args={args}, kwargs={kwargs}")
+            logger.error(f"{STT_PROVIDER.capitalize()} STT connection error: args={args}, kwargs={kwargs}")
 
     selected_model = normalize_openrouter_model_id(model_id)
     logger.info(f"Using model for session: {selected_model}")
@@ -256,6 +289,9 @@ async def run_bot(room_url: str, token: str, model_id: str | None = None):
         @llm.event_handler("on_error")
         async def on_llm_error(*args, **kwargs):
             logger.exception(f"OpenRouter LLM error: args={args}, kwargs={kwargs}")
+
+    stt_debug_before = STTDebugProcessor(label=f"{STT_PROVIDER}STT-before")
+    stt_debug_after = STTDebugProcessor(label=f"{STT_PROVIDER}STT-after")
 
     async with AsyncExitStack() as exit_stack:
         tavily_mcp_url = os.getenv("TAVILY_MCP_URL", "")
@@ -279,12 +315,12 @@ async def run_bot(room_url: str, token: str, model_id: str | None = None):
 
         pipeline = Pipeline([
             transport.input(),
-            STTDebugProcessor("STTDebug-before"),
+            stt_debug_before,
             stt,
-            STTDebugProcessor("STTDebug-after"),
+            stt_debug_after,
+            TextNormalizer(),
             context_aggregator.user(),
             llm,
-            TextNormalizer(),
             tts,
             transport.output(),
             context_aggregator.assistant(),
@@ -349,8 +385,12 @@ async def run_bot(room_url: str, token: str, model_id: str | None = None):
 
         runner = PipelineRunner()
         logger.info("Pipeline runner started; waiting for Daily participants to join")
-        await runner.run(task)
-    
+        try:
+            await runner.run(task)
+        except Exception as e:
+            logger.exception(f"Pipeline runner failed: {e}")
+
+
 async def create_daily_session() -> tuple[str, str, str]:
     if not DAILY_API_KEY:
         raise HTTPException(status_code=500, detail="DAILY_API_KEY is not configured")
