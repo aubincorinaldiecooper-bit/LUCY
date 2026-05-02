@@ -44,7 +44,10 @@ const PROVIDER_LABEL: Record<ModelOption["provider"], string> = {
 };
 
 const DEFAULT_MODEL_ID = "openai/gpt-4o";
-const DOT_PLACEHOLDER_HEIGHTS = [4,5,6,7,8,9,10,12,14,16,18,20,22,24,22,20,18,16,14,12,10,9,8,7,6,5,4];
+const DOT_PLACEHOLDER_HEIGHTS = [
+  4, 5, 6, 7, 8, 9, 10, 12, 14, 16, 18, 20, 22, 24, 22, 20, 18, 16, 14,
+  12, 10, 9, 8, 7, 6, 5, 4,
+];
 
 function DotPlaceholder() {
   return (

@@ -22,6 +22,7 @@ from pipecat.frames.frames import (
     ErrorFrame,
     LLMMessagesUpdateFrame,
     Frame,
+    StartFrame,
     TextFrame,
     TranscriptionFrame,
     UserAudioRawFrame,
@@ -48,7 +49,6 @@ load_dotenv()
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "You are Lucy, a chill and straightforward friend who keeps conversations light and insightful. Respond in one or two natural sentences with clear punctuation for smooth pacing. Keep your tone casual and conversational, avoiding corporate or overly formal phrasing. When politics, religion, or strong opinions come up, stay neutral and gently turn the focus back by asking one quick question about their perspective. Prioritize learning about them through intuitive questioning rather than agreeing just to be polite, and skip generic validation like I can see that or that is an interesting perspective. If asked about your origins or how you work, casually say you are not sure about the technical details but your creator built you to make daily conversations more meaningful. When you need current information, always briefly acknowledge it first with a natural phrase like let me look that up or give me a sec, then keep your summary tight. Stay in character, keep it real, and focus on natural back-and-forth dialogue.")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "minimax/minimax-m2.7")
 DAILY_API_KEY = os.getenv("DAILY_API_KEY", "")
 DAILY_API_URL = os.getenv("DAILY_API_URL", "https://api.daily.co/v1")
 DAILY_ROOM_URL = os.getenv("DAILY_ROOM_URL", "")
@@ -118,18 +118,30 @@ class TextNormalizer(FrameProcessor):
 
 
 class STTDebugProcessor(FrameProcessor):
-    """Logs audio frames going into STT and transcripts coming out."""
+    """Logs frame flow around STT for debugging."""
 
     def __init__(self, label: str = "STTDebug"):
         super().__init__()
         self._label = label
         self._audio_frames_in: int = 0
         self._transcripts_out: int = 0
+        self._logged_first_other_frame = False
 
     def _check_started(self, frame: Frame) -> None:
         pass
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        frame_name = type(frame).__name__
+        is_after_stt = "after" in self._label.lower()
+
+        if isinstance(frame, StartFrame):
+            if is_after_stt:
+                logger.info("STTDebug-after received StartFrame")
+            else:
+                logger.info(f"[{self._label}] received StartFrame")
+            await self.push_frame(frame, direction)
+            return
+
         if isinstance(frame, UserAudioRawFrame):
             self._audio_frames_in += 1
             if self._audio_frames_in == 1 or self._audio_frames_in % 100 == 0:
@@ -145,18 +157,31 @@ class STTDebugProcessor(FrameProcessor):
                 f"[{self._label}] Transcript #{self._transcripts_out} ← STT: "
                 f"text={frame.text!r} user_id={frame.user_id!r}"
             )
+        elif isinstance(frame, TextFrame):
+            logger.info(f"[{self._label}] TextFrame: {frame.text!r}")
         elif isinstance(frame, ErrorFrame):
             logger.error(f"[{self._label}] ErrorFrame from STT: {frame.error!r}")
+        elif not self._logged_first_other_frame:
+            self._logged_first_other_frame = True
+            logger.info(
+                f"[{self._label}] First non-audio/non-transcript frame: "
+                f"{frame_name} direction={direction}"
+            )
 
         await self.push_frame(frame, direction)
 
 
 def normalize_openrouter_model_id(model_id: str | None) -> str:
-    """Maps shorthand model IDs to full OpenRouter provider/model format."""
+    """Maps shorthand model IDs to full OpenRouter provider/model format.
+
+    Falls back to a hardcoded default if no model_id is provided.
+    """
     if not model_id:
-        return OPENROUTER_MODEL
+        return "openai/gpt-4o"
+
     if "/" in model_id:
         return model_id
+
     shorthand_map = {
         "gpt-4o": "openai/gpt-4o",
         "gpt-4o-mini": "openai/gpt-4o-mini",
@@ -203,9 +228,6 @@ async def run_bot(room_url: str, token: str, model_id: str | None = None):
         ),
     )
 
-    if not DEEPGRAM_API_KEY:
-        logger.error("DEEPGRAM_API_KEY is not set — DeepgramSTTService will not produce transcripts")
-
     stt = DeepgramSTTService(
         api_key=DEEPGRAM_API_KEY,
         settings=DeepgramSTTService.Settings(
@@ -216,7 +238,24 @@ async def run_bot(room_url: str, token: str, model_id: str | None = None):
         ),
     )
 
-    # Normalize model ID (frontend may send shorthand or full)
+    if DEEPGRAM_API_KEY:
+        logger.info("Deepgram API key present")
+    else:
+        logger.error("DEEPGRAM_API_KEY is not set — DeepgramSTTService will not produce transcripts")
+
+    if hasattr(stt, "event_handler"):
+        @stt.event_handler("on_connected")
+        async def on_stt_connected(*args, **kwargs):
+            logger.info("Deepgram STT WebSocket connected")
+
+        @stt.event_handler("on_disconnected")
+        async def on_stt_disconnected(*args, **kwargs):
+            logger.warning("Deepgram STT WebSocket disconnected")
+
+        @stt.event_handler("on_connection_error")
+        async def on_stt_connection_error(*args, **kwargs):
+            logger.error(f"Deepgram STT connection error: args={args}, kwargs={kwargs}")
+
     selected_model = normalize_openrouter_model_id(model_id)
     logger.info(f"Using model for session: {selected_model}")
 
@@ -230,7 +269,6 @@ async def run_bot(room_url: str, token: str, model_id: str | None = None):
         async def on_llm_error(*args, **kwargs):
             logger.exception(f"OpenRouter LLM error: args={args}, kwargs={kwargs}")
 
-    # Instantiate STT debug processors for pipeline visibility
     stt_debug_before = STTDebugProcessor(label="DeepgramSTT-before")
     stt_debug_after = STTDebugProcessor(label="DeepgramSTT-after")
 
@@ -256,9 +294,9 @@ async def run_bot(room_url: str, token: str, model_id: str | None = None):
 
         pipeline = Pipeline([
             transport.input(),
-            stt_debug_before,   # log audio frames before STT
+            stt_debug_before,
             stt,
-            stt_debug_after,    # log transcripts after STT
+            stt_debug_after,
             TextNormalizer(),
             context_aggregator.user(),
             llm,
@@ -287,20 +325,37 @@ async def run_bot(room_url: str, token: str, model_id: str | None = None):
             observers=[MetricsLogObserver(), user_bot_latency_observer],
         )
 
-        @stt.event_handler("on_connection_error")
-        async def on_stt_connection_error(_stt, error):
-            logger.error(f"Deepgram STT connection error: {error!r}")
+        pipeline_started = False
+        participant_joined = False
+        greeting_queued = False
+
+        async def maybe_queue_greeting() -> None:
+            nonlocal greeting_queued
+            if not pipeline_started or not participant_joined or greeting_queued:
+                return
+            greeting_queued = True
+            logger.info("Queueing greeting frame to force initial LLM turn")
+            await task.queue_frame(
+                LLMMessagesUpdateFrame(
+                    [{"role": "user", "content": "Hello"}],
+                    run_llm=True,
+                )
+            )
+
+        @task.event_handler("on_pipeline_started")
+        async def on_pipeline_started(*args, **kwargs):
+            nonlocal pipeline_started
+            pipeline_started = True
+            logger.info("Pipeline started; StartFrame reached pipeline sink")
+            await maybe_queue_greeting()
 
         @transport.event_handler("on_first_participant_joined")
         async def on_first_participant_joined(_transport, _participant):
+            nonlocal participant_joined
+            participant_joined = True
             join_delay_seconds = time.monotonic() - run_started_at
             logger.info(f"First participant joined ({join_delay_seconds:.2f}s after run_bot start)")
-            greeting_frame = LLMMessagesUpdateFrame(
-                [{"role": "user", "content": "Hello"}],
-                run_llm=True,
-            )
-            logger.info("Queueing greeting frame to force initial LLM turn")
-            await task.queue_frame(greeting_frame)
+            await maybe_queue_greeting()
 
         @transport.event_handler("on_participant_left")
         async def on_participant_left(_transport, _participant, _reason):
