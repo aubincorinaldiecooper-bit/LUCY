@@ -4,6 +4,7 @@ from uuid import uuid4
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from livekit import api
 from pydantic import BaseModel
 
@@ -21,6 +22,11 @@ app.add_middleware(
 
 class SessionRequest(BaseModel):
     model: str | None = None
+
+
+@app.get("/health")
+async def health() -> JSONResponse:
+    return JSONResponse({"status": "ok"})
 
 
 @app.post("/api/livekit/session")
