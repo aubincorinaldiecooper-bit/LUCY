@@ -34,7 +34,7 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair, LLMUserAggregatorParams
 from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.mistral.stt import MistralSTTService
@@ -214,6 +214,7 @@ def create_stt_service(provider: str):
                 target_streaming_delay_ms=MISTRAL_STREAMING_DELAY_MS,
                 settings=MistralSTTService.Settings(
                     model="voxtral-mini-transcribe-realtime-2602",
+                    interim_results=True,
                 ),
             )
         except TypeError as e:
@@ -319,7 +320,15 @@ async def run_bot(room_url: str, token: str, model_id: str | None = None):
             logger.warning("TAVILY_MCP_URL is not configured; Tavily MCP tools were not registered")
 
         context = LLMContext(messages=[])
-        context_aggregator = LLMContextAggregatorPair(context)
+        try:
+            context_aggregator = LLMContextAggregatorPair(
+                context,
+                user_params=LLMUserAggregatorParams(
+                    vad_analyzer=create_vad_analyzer(),
+                ),
+            )
+        except TypeError:
+            context_aggregator = LLMContextAggregatorPair(context)
 
         pipeline = Pipeline([
             transport.input(),
