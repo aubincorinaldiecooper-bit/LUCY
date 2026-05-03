@@ -14,10 +14,9 @@ RUN pip install --no-cache-dir uv
 RUN mkdir -p /app/cache/uv
 
 COPY pyproject.toml uv.lock ./
-ENV UV_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu
 RUN uv sync --frozen --no-dev
 RUN uv cache clean 2>/dev/null; rm -rf /root/.cache /tmp/* /var/cache/apt/archives/*.deb
-RUN python -c "from pipecat.services.kokoro.tts import KokoroTTSService; import torch; print('✅ Build imports OK')" || exit 1
+RUN python -c "from livekit.agents import AgentSession; from kokoro_plugin import KokoroTTS; print('✅ Build imports OK')" || exit 1
 
 COPY . .
 
