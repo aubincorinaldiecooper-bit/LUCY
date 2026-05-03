@@ -16,6 +16,8 @@ RUN mkdir -p /app/cache/uv
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev
 RUN uv cache clean 2>/dev/null; rm -rf /root/.cache /tmp/* /var/cache/apt/archives/*.deb
+
+COPY kokoro_plugin.py /app/kokoro_plugin.py
 RUN python -c "from livekit.agents import AgentSession; from kokoro_plugin import KokoroTTS; print('✅ Build imports OK')" || exit 1
 
 COPY . .
