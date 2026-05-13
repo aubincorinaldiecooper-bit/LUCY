@@ -12,10 +12,19 @@ load_dotenv()
 
 app = FastAPI(title="Lucy LiveKit Session API")
 
+default_origins = "http://localhost:3000,https://vigilant-youth-production-452c.up.railway.app"
+
+allowed_origins = (
+    os.getenv("CORS_ORIGINS")
+    or os.getenv("ALLOWED_ORIGINS")
+    or default_origins
+)
+
 origins = [
-    "http://localhost:3000",
-    "https://my-frontend.vercel.app",
-    "https://my-frontend.up.railway.app",
+    origin.strip().rstrip("/")
+    for origin in allowed_origins.split(",")
+
+    if origin.strip()
 ]
 
 app.add_middleware(
@@ -25,7 +34,6 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
-
 
 class SessionRequest(BaseModel):
     model: str | None = None
