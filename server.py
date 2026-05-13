@@ -11,11 +11,18 @@ from pydantic import BaseModel
 load_dotenv()
 
 app = FastAPI(title="Lucy LiveKit Session API")
+
+origins = [
+    "http://localhost:3000",
+    "https://my-frontend.vercel.app",
+    "https://my-frontend.up.railway.app",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=origins,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
