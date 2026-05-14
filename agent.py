@@ -1,4 +1,5 @@
 import os
+import logging
 from typing import Any
 
 from dotenv import load_dotenv
@@ -12,6 +13,7 @@ from tavily import TavilyClient
 from kokoro_plugin import KokoroTTS
 
 load_dotenv()
+logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "You are Lucy, a chill and straightforward friend who keeps conversations light and insightful. Respond in one or two natural sentences with clear punctuation for smooth pacing. Keep your tone casual and conversational, avoiding corporate or overly formal phrasing. When politics, religion, or strong opinions come up, stay neutral and gently turn the focus back by asking one quick question about their perspective. Prioritize learning about them through intuitive questioning rather than agreeing just to be polite, and skip generic validation like I can see that or that is an interesting perspective. If asked about your origins or how you work, casually say you are not sure about the technical details but your creator built you to make daily conversations more meaningful. When you need current information, always briefly acknowledge it first with a natural phrase like let me look that up or give me a sec, then keep your summary tight. Stay in character, keep it real, and focus on natural back-and-forth dialogue.")
 
@@ -57,15 +59,21 @@ def register_tavily_tools(llm: Any) -> None:
 
 
 async def entrypoint(ctx: JobContext):
+    kokoro_endpoint = os.getenv("KOKORO_TTS_ENDPOINT")
+    if not kokoro_endpoint:
+        raise RuntimeError("KOKORO_TTS_ENDPOINT is required for Kokoro TTS")
+
     llm = openai.LLM.with_openrouter(model=os.getenv("OPENROUTER_MODEL", "openai/gpt-4o"))
-    register_tavily_tools(llm)
+    # TODO: Re-enable Tavily using LiveKit's supported function-tool pattern.
+    logger.warning("Skipping Tavily tools for MVP voice path")
 
     session = AgentSession(
         stt=mistralai.STT(model="voxtral-mini-transcribe-realtime-2602", target_streaming_delay_ms=160),
         llm=llm,
         tts=KokoroTTS(
-            base_url=os.getenv("KOKORO_TTS_ENDPOINT"),
-            api_key="not-needed",
+            base_url=kokoro_endpoint,
+            api_key=os.getenv("KOKORO_API_KEY", "not-needed"),
+            model=os.getenv("KOKORO_TTS_MODEL", "kokoro"),
             voice=os.getenv("KOKORO_VOICE", "af_bella"),
         ),
         vad=silero.VAD.load(),
