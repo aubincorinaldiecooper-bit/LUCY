@@ -21,6 +21,7 @@ COPY kokoro_plugin.py /app/kokoro_plugin.py
 RUN python -c "from livekit.agents import AgentSession; from kokoro_plugin import KokoroTTS; print('✅ Build imports OK')" || exit 1
 
 COPY . .
+RUN python agent.py download-files
 
 EXPOSE 8080
 CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8080"]
