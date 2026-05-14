@@ -57,6 +57,10 @@ def register_tavily_tools(llm: Any) -> None:
 
 
 async def entrypoint(ctx: JobContext):
+    kokoro_endpoint = os.getenv("KOKORO_TTS_ENDPOINT")
+    if not kokoro_endpoint:
+        raise RuntimeError("KOKORO_TTS_ENDPOINT is required for Kokoro TTS")
+
     llm = openai.LLM.with_openrouter(model=os.getenv("OPENROUTER_MODEL", "openai/gpt-4o"))
     register_tavily_tools(llm)
 
@@ -64,8 +68,9 @@ async def entrypoint(ctx: JobContext):
         stt=mistralai.STT(model="voxtral-mini-transcribe-realtime-2602", target_streaming_delay_ms=160),
         llm=llm,
         tts=KokoroTTS(
-            base_url=os.getenv("KOKORO_TTS_ENDPOINT"),
-            api_key="not-needed",
+            base_url=kokoro_endpoint,
+            api_key=os.getenv("KOKORO_API_KEY", "not-needed"),
+            model=os.getenv("KOKORO_TTS_MODEL", "kokoro"),
             voice=os.getenv("KOKORO_VOICE", "af_bella"),
         ),
         vad=silero.VAD.load(),
