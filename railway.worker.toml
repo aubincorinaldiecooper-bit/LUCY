@@ -1,0 +1,5 @@
+[build]
+aptPackages = ["libxcb1"]
+
+[deploy]
+startCommand = "uv run agent.py start"
