@@ -64,11 +64,8 @@ async def entrypoint(ctx: JobContext):
         raise RuntimeError("KOKORO_TTS_ENDPOINT is required for Kokoro TTS")
 
     llm = openai.LLM.with_openrouter(model=os.getenv("OPENROUTER_MODEL", "openai/gpt-4o"))
-    tavily_api_key = os.getenv("TAVILY_API_KEY", "").strip()
-    if tavily_api_key:
-        register_tavily_tools(llm)
-    else:
-        logger.warning("TAVILY_API_KEY not set; skipping Tavily tools")
+    # TODO: Re-enable Tavily using LiveKit's supported function-tool pattern.
+    logger.warning("Skipping Tavily tools for MVP voice path")
 
     session = AgentSession(
         stt=mistralai.STT(model="voxtral-mini-transcribe-realtime-2602", target_streaming_delay_ms=160),
