@@ -1,19 +1,11 @@
 import logging
-import time
 from dataclasses import dataclass
 from typing import Any, Dict, Literal, Optional
 
 import httpx
 import openai
 
-from livekit.agents import (
-    APIConnectionError,
-    APIConnectOptions,
-    APIStatusError,
-    APITimeoutError,
-    tts,
-    utils,
-)
+from livekit.agents import APIConnectionError, APIConnectOptions, APIStatusError, APITimeoutError, tts
 from livekit.agents.types import (
     DEFAULT_API_CONNECT_OPTIONS,
     NOT_GIVEN,
@@ -168,8 +160,8 @@ class KokoroTTSStream(tts.ChunkedStream):
         self._client = client
         self._opts = opts
 
-    async def _run(self):
-        """Run the TTS synthesis."""
+    async def _run(self, output_emitter: tts.AudioEmitter) -> None:
+        """Run TTS synthesis using the current LiveKit ChunkedStream output_emitter API."""
         oai_stream = self._client.audio.speech.with_streaming_response.create(
             input=self.input_text,
             model=self._opts.model,
@@ -179,37 +171,21 @@ class KokoroTTSStream(tts.ChunkedStream):
             timeout=httpx.Timeout(30, connect=self._conn_options.timeout),
         )
 
-        request_id = utils.shortuuid()
-
-        audio_bstream = utils.audio.AudioByteStream(
-            sample_rate=TTS_SAMPLE_RATE,
-            num_channels=TTS_CHANNELS,
-        )
-
         logger.info(f"Kokoro -> converting text to audio")
 
         try:
-            start_time = time.time()
             async with oai_stream as stream:
+                output_emitter.initialize(
+                    request_id=stream.request_id or "",
+                    sample_rate=TTS_SAMPLE_RATE,
+                    num_channels=TTS_CHANNELS,
+                    mime_type="audio/pcm",
+                )
                 async for data in stream.iter_bytes():
-                    for frame in audio_bstream.write(data):
-                        self._event_ch.send_nowait(
-                            tts.SynthesizedAudio(
-                                frame=frame,
-                                request_id=request_id,
-                            )
-                        )
-                # Flush any remaining data in the buffer
-                for frame in audio_bstream.flush():
-                    self._event_ch.send_nowait(
-                        tts.SynthesizedAudio(
-                            frame=frame,
-                            request_id=request_id,
-                        )
-                    )
-            
-            inference_time = time.time() - start_time
-            logger.info(f"Kokoro TTS synthesis completed in {inference_time*1000:.1f}ms")
+                    output_emitter.push(data)
+
+            output_emitter.flush()
+            logger.info("Kokoro TTS synthesis completed")
 
         except openai.APITimeoutError:
             raise APITimeoutError()
