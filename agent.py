@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from livekit.agents import Agent, AgentSession, JobContext, WorkerOptions, cli
-from livekit.plugins import mistralai, openai, silero
+from livekit.plugins import deepgram, mistralai, openai, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 from tavily import TavilyClient
 
@@ -48,6 +48,32 @@ Safety:
 If the user may hurt themselves or someone else, switch to direct safety language. Tell them to pause, step away from anything dangerous, contact emergency services or a local crisis line, and reach out to someone they trust right now. Do not encourage self-harm, violence, revenge, or escalation.""".strip()
 
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT)
+
+TTS_PROVIDER = os.getenv("TTS_PROVIDER", "deepgram").strip().lower()
+
+
+def build_tts():
+    if TTS_PROVIDER == "deepgram":
+        logger.info("Using Deepgram TTS provider")
+        return deepgram.TTS(
+            model=os.getenv("DEEPGRAM_TTS_MODEL", "aura-2-asteria-en")
+        )
+
+    if TTS_PROVIDER == "kokoro":
+        kokoro_endpoint = os.getenv("KOKORO_TTS_ENDPOINT")
+        if not kokoro_endpoint:
+            raise RuntimeError("KOKORO_TTS_ENDPOINT is required for Kokoro TTS")
+
+        logger.info("Using Kokoro TTS provider")
+        return KokoroTTS(
+            base_url=kokoro_endpoint,
+            api_key=os.getenv("KOKORO_API_KEY", "not-needed"),
+            model=os.getenv("KOKORO_TTS_MODEL", "kokoro"),
+            voice=os.getenv("KOKORO_VOICE", "af_bella"),
+            speed=float(os.getenv("KOKORO_SPEED", "1.03")),
+        )
+
+    raise RuntimeError("Unsupported TTS_PROVIDER. Use 'deepgram' or 'kokoro'.")
 
 app = FastAPI()
 
@@ -91,10 +117,6 @@ def register_tavily_tools(llm: Any) -> None:
 
 
 async def entrypoint(ctx: JobContext):
-    kokoro_endpoint = os.getenv("KOKORO_TTS_ENDPOINT")
-    if not kokoro_endpoint:
-        raise RuntimeError("KOKORO_TTS_ENDPOINT is required for Kokoro TTS")
-
     llm = openai.LLM.with_openrouter(model=os.getenv("OPENROUTER_MODEL", "openai/gpt-4o"))
     # TODO: Re-enable Tavily using LiveKit's supported function-tool pattern.
     logger.warning("Skipping Tavily tools for MVP voice path")
@@ -102,13 +124,7 @@ async def entrypoint(ctx: JobContext):
     session = AgentSession(
         stt=mistralai.STT(model="voxtral-mini-transcribe-realtime-2602", target_streaming_delay_ms=160),
         llm=llm,
-        tts=KokoroTTS(
-            base_url=kokoro_endpoint,
-            api_key=os.getenv("KOKORO_API_KEY", "not-needed"),
-            model=os.getenv("KOKORO_TTS_MODEL", "kokoro"),
-            voice=os.getenv("KOKORO_VOICE", "af_bella"),
-            speed=float(os.getenv("KOKORO_SPEED", "1.03")),
-        ),
+        tts=build_tts(),
         vad=silero.VAD.load(),
         turn_detection=MultilingualModel(),
     )
