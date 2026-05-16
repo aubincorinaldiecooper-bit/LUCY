@@ -1,4 +1,5 @@
 import os
+import asyncio
 import logging
 from typing import Any
 
@@ -83,7 +84,7 @@ def _safe_attr(obj: object, name: str, default: str = "n/a") -> str:
 
 
 def attach_session_diagnostics(session: AgentSession) -> None:
-    active_speeches: set[str] = set()
+    active_speech_handles: dict[str, object] = {}
 
     def _speech_id(handle: object) -> str:
         sid = _safe_attr(handle, "id", "")
@@ -91,19 +92,64 @@ def attach_session_diagnostics(session: AgentSession) -> None:
             return sid
         return _next_local_speech_id()
 
+    def _clear_active_handles(reason: str) -> None:
+        if active_speech_handles:
+            logger.warning(
+                "Clearing stale active speech handles: reason=%s cleared_count=%s",
+                reason,
+                len(active_speech_handles),
+            )
+            active_speech_handles.clear()
+
     @session.on("speech_created")
     def _on_speech_created(handle: object) -> None:
         speech_id = _speech_id(handle)
-        if active_speeches:
-            logger.warning("Possible overlap: new speech started while previous speech active")
-        active_speeches.add(speech_id)
-        logger.info("Assistant speech started: speech_id=%s active_count=%s", speech_id, len(active_speeches))
+
+        if active_speech_handles:
+            for active_id, active_handle in list(active_speech_handles.items()):
+                if active_id == speech_id:
+                    continue
+
+                interrupt = getattr(active_handle, "interrupt", None)
+                if callable(interrupt):
+                    try:
+                        interrupt()
+                        logger.warning(
+                            "Interrupted previous active speech before new speech: previous_speech_id=%s new_speech_id=%s",
+                            active_id,
+                            speech_id,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "Failed interrupting previous speech: previous_speech_id=%s new_speech_id=%s err=%s",
+                            active_id,
+                            speech_id,
+                            e,
+                        )
+                else:
+                    logger.warning(
+                        "New speech created while another speech is active and cannot be interrupted: previous_speech_id=%s new_speech_id=%s",
+                        active_id,
+                        speech_id,
+                    )
+
+        active_speech_handles[speech_id] = handle
+        logger.info(
+            "Assistant speech started: speech_id=%s active_count=%s",
+            speech_id,
+            len(active_speech_handles),
+        )
 
         def _on_done(done_handle: object) -> None:
             done_id = _speech_id(done_handle)
-            active_speeches.discard(done_id)
+            active_speech_handles.pop(done_id, None)
             interrupted = _safe_attr(done_handle, "interrupted", "unknown")
-            logger.info("Assistant speech finished: speech_id=%s interrupted=%s active_count=%s", done_id, interrupted, len(active_speeches))
+            logger.info(
+                "Assistant speech finished: speech_id=%s interrupted=%s active_count=%s",
+                done_id,
+                interrupted,
+                len(active_speech_handles),
+            )
 
         add_done_callback = getattr(handle, "add_done_callback", None)
         if callable(add_done_callback):
@@ -111,15 +157,18 @@ def attach_session_diagnostics(session: AgentSession) -> None:
 
     @session.on("overlapping_speech")
     def _on_overlapping_speech(*_: object) -> None:
-        logger.warning("Session reported overlapping_speech event while assistant_active_count=%s", len(active_speeches))
+        logger.warning(
+            "Session reported overlapping_speech event while assistant_active_count=%s",
+            len(active_speech_handles),
+        )
 
     @session.on("agent_state_changed")
     def _on_agent_state_changed(state: object) -> None:
-        logger.info("Agent state changed: state=%s assistant_active_count=%s", state, len(active_speeches))
+        logger.info("Agent state changed: state=%s assistant_active_count=%s", state, len(active_speech_handles))
 
     @session.on("user_state_changed")
     def _on_user_state_changed(state: object) -> None:
-        logger.info("User state changed: state=%s assistant_active_count=%s", state, len(active_speeches))
+        logger.info("User state changed: state=%s assistant_active_count=%s", state, len(active_speech_handles))
 
     @session.on("agent_false_interruption")
     def _on_agent_false_interruption(*_: object) -> None:
@@ -134,11 +183,13 @@ def attach_session_diagnostics(session: AgentSession) -> None:
     @session.on("error")
     def _on_error(error: object) -> None:
         logger.error("Session error event: %s", error)
+        if "tts" in str(error).lower():
+            _clear_active_handles("tts_error")
 
     @session.on("close")
     def _on_close() -> None:
-        logger.info("Session close event: active_speeches_remaining=%s", len(active_speeches))
-
+        _clear_active_handles("session_close")
+        logger.info("Session close event: active_speeches_remaining=%s", len(active_speech_handles))
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -311,7 +362,10 @@ async def entrypoint(ctx: JobContext):
 
     await session.start(room=ctx.room, agent=LucyAgent())
     logger.info("About to generate greeting reply")
-    greeting_handle = await session.generate_reply(instructions="Greet the user in one short casual sentence as Crash. Say: Hey, Whats up? what did you want to chat about?")
+    greeting_handle = await session.generate_reply(
+        instructions="Greet the user in one short casual sentence as Crash. Say: Yo. What’s going on?",
+        allow_interruptions=False,
+    )
     logger.info(
         "Greeting generate_reply completed: handle_type=%s handle_id=%s allow_interruptions=%s interrupted=%s",
         type(greeting_handle).__name__,
@@ -319,6 +373,18 @@ async def entrypoint(ctx: JobContext):
         _safe_attr(greeting_handle, "allow_interruptions"),
         _safe_attr(greeting_handle, "interrupted"),
     )
+
+    wait_for_playout = getattr(greeting_handle, "wait_for_playout", None)
+    if callable(wait_for_playout):
+        try:
+            await asyncio.wait_for(wait_for_playout(), timeout=8.0)
+            logger.info("Greeting playout completed")
+        except TimeoutError:
+            logger.warning("Greeting playout wait timed out")
+        except Exception as e:
+            logger.warning("Greeting playout wait failed: %s", e)
+    else:
+        logger.warning("Greeting handle does not support wait_for_playout")
 
 
 if __name__ == "__main__":
