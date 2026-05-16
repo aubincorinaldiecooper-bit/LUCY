@@ -145,7 +145,7 @@ def register_tavily_tools(llm: Any) -> None:
 
 
 async def entrypoint(ctx: JobContext):
-    llm = openai.LLM.with_openrouter(model=os.getenv("OPENROUTER_MODEL", "openai/gpt-4o"))
+    llm = openai.LLM.with_openrouter(model=os.getenv("OPENROUTER_MODEL", "gpt-chat-latest"))
     # TODO: Re-enable Tavily using LiveKit's supported function-tool pattern.
     logger.warning("Skipping Tavily tools for MVP voice path")
 
