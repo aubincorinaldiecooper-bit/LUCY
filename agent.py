@@ -85,12 +85,29 @@ def _safe_attr(obj: object, name: str, default: str = "n/a") -> str:
 
 def attach_session_diagnostics(session: AgentSession) -> None:
     active_speech_handles: dict[str, object] = {}
+    _local_speech_ids: dict[int, str] = {}
+    payload_debug_logged = False
+
+    def _resolve_speech_handle(event_or_handle: object) -> object:
+        for attr in ("speech_handle", "handle", "speech"):
+            candidate = getattr(event_or_handle, attr, None)
+            if candidate is not None:
+                return candidate
+        return event_or_handle
 
     def _speech_id(handle: object) -> str:
         sid = _safe_attr(handle, "id", "")
         if sid:
             return sid
-        return _next_local_speech_id()
+
+        sid = _safe_attr(handle, "speech_id", "")
+        if sid:
+            return sid
+
+        obj_id = id(handle)
+        if obj_id not in _local_speech_ids:
+            _local_speech_ids[obj_id] = _next_local_speech_id()
+        return _local_speech_ids[obj_id]
 
     def _clear_active_handles(reason: str) -> None:
         if active_speech_handles:
@@ -101,70 +118,101 @@ def attach_session_diagnostics(session: AgentSession) -> None:
             )
             active_speech_handles.clear()
 
+    def _interrupt_with_fallback(previous_handle: object, previous_id: str, new_id: str) -> bool:
+        interrupt = getattr(previous_handle, "interrupt", None)
+        if callable(interrupt):
+            try:
+                interrupt()
+                logger.warning(
+                    "Interrupted previous active speech before new speech: previous_speech_id=%s new_speech_id=%s path=previous_handle.interrupt",
+                    previous_id,
+                    new_id,
+                )
+                return True
+            except Exception as e:
+                logger.warning("Failed previous_handle.interrupt: previous_speech_id=%s new_speech_id=%s err=%s", previous_id, new_id, e)
+
+        current_speech = getattr(session, "current_speech", None)
+        current_interrupt = getattr(current_speech, "interrupt", None)
+        if callable(current_interrupt):
+            try:
+                current_interrupt()
+                logger.warning(
+                    "Interrupted previous active speech before new speech: previous_speech_id=%s new_speech_id=%s path=session.current_speech.interrupt",
+                    previous_id,
+                    new_id,
+                )
+                return True
+            except Exception as e:
+                logger.warning("Failed session.current_speech.interrupt: previous_speech_id=%s new_speech_id=%s err=%s", previous_id, new_id, e)
+
+        session_interrupt = getattr(session, "interrupt", None)
+        if callable(session_interrupt):
+            try:
+                session_interrupt()
+                logger.warning(
+                    "Interrupted previous active speech before new speech: previous_speech_id=%s new_speech_id=%s path=session.interrupt",
+                    previous_id,
+                    new_id,
+                )
+                return True
+            except Exception as e:
+                logger.warning("Failed session.interrupt: previous_speech_id=%s new_speech_id=%s err=%s", previous_id, new_id, e)
+
+        logger.warning(
+            "All interruption fallback paths failed: previous_speech_id=%s new_speech_id=%s",
+            previous_id,
+            new_id,
+        )
+        return False
+
     @session.on("speech_created")
-    def _on_speech_created(handle: object) -> None:
-        speech_id = _speech_id(handle)
+    def _on_speech_created(event_or_handle: object) -> None:
+        nonlocal payload_debug_logged
+
+        if not payload_debug_logged:
+            payload_debug_logged = True
+            attrs = ("id", "speech_id", "handle", "speech", "speech_handle", "interrupted", "add_done_callback", "interrupt", "wait_for_playout")
+            attr_presence = {name: hasattr(event_or_handle, name) for name in attrs}
+            logger.info("speech_created payload debug: type=%s attrs=%s", type(event_or_handle).__name__, attr_presence)
+
+        resolved_handle = _resolve_speech_handle(event_or_handle)
+        speech_id = _speech_id(resolved_handle)
 
         if active_speech_handles:
             for active_id, active_handle in list(active_speech_handles.items()):
                 if active_id == speech_id:
                     continue
+                if _interrupt_with_fallback(active_handle, active_id, speech_id):
+                    active_speech_handles.pop(active_id, None)
 
-                interrupt = getattr(active_handle, "interrupt", None)
-                if callable(interrupt):
-                    try:
-                        interrupt()
-                        logger.warning(
-                            "Interrupted previous active speech before new speech: previous_speech_id=%s new_speech_id=%s",
-                            active_id,
-                            speech_id,
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            "Failed interrupting previous speech: previous_speech_id=%s new_speech_id=%s err=%s",
-                            active_id,
-                            speech_id,
-                            e,
-                        )
-                else:
-                    logger.warning(
-                        "New speech created while another speech is active and cannot be interrupted: previous_speech_id=%s new_speech_id=%s",
-                        active_id,
-                        speech_id,
-                    )
+        active_speech_handles[speech_id] = resolved_handle
+        logger.info("Assistant speech started: speech_id=%s active_count=%s", speech_id, len(active_speech_handles))
 
-        active_speech_handles[speech_id] = handle
-        logger.info(
-            "Assistant speech started: speech_id=%s active_count=%s",
-            speech_id,
-            len(active_speech_handles),
-        )
-
-        def _on_done(done_handle: object) -> None:
-            done_id = _speech_id(done_handle)
-            active_speech_handles.pop(done_id, None)
-            interrupted = _safe_attr(done_handle, "interrupted", "unknown")
-            logger.info(
-                "Assistant speech finished: speech_id=%s interrupted=%s active_count=%s",
-                done_id,
-                interrupted,
-                len(active_speech_handles),
-            )
-
-        add_done_callback = getattr(handle, "add_done_callback", None)
+        add_done_callback = getattr(resolved_handle, "add_done_callback", None)
         if callable(add_done_callback):
+            def _on_done(done_event_or_handle: object) -> None:
+                done_resolved_handle = _resolve_speech_handle(done_event_or_handle)
+                done_id = _speech_id(done_resolved_handle)
+                active_speech_handles.pop(done_id, None)
+                interrupted = _safe_attr(done_resolved_handle, "interrupted", "unknown")
+                logger.info("Assistant speech finished: speech_id=%s interrupted=%s active_count=%s", done_id, interrupted, len(active_speech_handles))
+
             add_done_callback(_on_done)
+        else:
+            logger.warning("Resolved speech handle does not support add_done_callback")
 
     @session.on("overlapping_speech")
     def _on_overlapping_speech(*_: object) -> None:
-        logger.warning(
-            "Session reported overlapping_speech event while assistant_active_count=%s",
-            len(active_speech_handles),
-        )
+        logger.warning("Session reported overlapping_speech event while assistant_active_count=%s", len(active_speech_handles))
 
     @session.on("agent_state_changed")
     def _on_agent_state_changed(state: object) -> None:
         logger.info("Agent state changed: state=%s assistant_active_count=%s", state, len(active_speech_handles))
+        if str(state).lower() == "listening":
+            current_speech = getattr(session, "current_speech", None)
+            if current_speech is None:
+                _clear_active_handles("agent_returned_to_listening")
 
     @session.on("user_state_changed")
     def _on_user_state_changed(state: object) -> None:
