@@ -5,7 +5,7 @@ from typing import Any
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from livekit.agents import Agent, AgentSession, JobContext, WorkerOptions, cli
+from livekit.agents import Agent, AgentSession, JobContext, TurnHandlingOptions, WorkerOptions, cli
 from livekit.plugins import deepgram, mistralai, openai, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 from tavily import TavilyClient
@@ -50,6 +50,7 @@ If the user may hurt themselves or someone else, switch to direct safety languag
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT)
 
 TTS_PROVIDER = os.getenv("TTS_PROVIDER", "deepgram").strip().lower()
+STT_PROVIDER = os.getenv("STT_PROVIDER", "deepgram_flux").strip().lower()
 
 
 def build_tts():
@@ -88,6 +89,33 @@ class LucyAgent(Agent):
         super().__init__(instructions=SYSTEM_PROMPT)
 
 
+
+def build_stt():
+    if STT_PROVIDER == "deepgram_flux":
+        logger.info("Using Deepgram Flux STT provider")
+        return deepgram.STTv2(
+            model=os.getenv("DEEPGRAM_STT_MODEL", "flux-general-en"),
+            eager_eot_threshold=float(os.getenv("DEEPGRAM_EAGER_EOT_THRESHOLD", "0.4")),
+            eot_threshold=float(os.getenv("DEEPGRAM_EOT_THRESHOLD", "0.7")),
+            eot_timeout_ms=int(os.getenv("DEEPGRAM_EOT_TIMEOUT_MS", "700")),
+        )
+
+    if STT_PROVIDER == "deepgram_nova3":
+        logger.info("Using Deepgram Nova-3 STT provider")
+        return deepgram.STT(
+            model=os.getenv("DEEPGRAM_STT_MODEL", "nova-3"),
+            language=os.getenv("DEEPGRAM_STT_LANGUAGE", "en"),
+        )
+
+    if STT_PROVIDER == "mistral":
+        logger.info("Using Mistral Voxtral STT provider")
+        return mistralai.STT(
+            model=os.getenv("MISTRAL_STT_MODEL", "voxtral-mini-transcribe-realtime-2602"),
+            target_streaming_delay_ms=int(os.getenv("MISTRAL_TARGET_STREAMING_DELAY_MS", "160")),
+        )
+
+    raise RuntimeError("Unsupported STT_PROVIDER. Use 'deepgram_flux', 'deepgram_nova3', or 'mistral'.")
+
 def _tavily() -> TavilyClient:
     return TavilyClient(api_key=os.getenv("TAVILY_API_KEY", ""))
 
@@ -121,12 +149,19 @@ async def entrypoint(ctx: JobContext):
     # TODO: Re-enable Tavily using LiveKit's supported function-tool pattern.
     logger.warning("Skipping Tavily tools for MVP voice path")
 
+    turn_detection = MultilingualModel()
+    turn_handling = None
+    if STT_PROVIDER == "deepgram_flux":
+        # Use Deepgram STT-native turn detection for lower latency when available.
+        turn_handling = TurnHandlingOptions(turn_detection="stt")
+
     session = AgentSession(
-        stt=mistralai.STT(model="voxtral-mini-transcribe-realtime-2602", target_streaming_delay_ms=160),
+        stt=build_stt(),
         llm=llm,
         tts=build_tts(),
         vad=silero.VAD.load(),
-        turn_detection=MultilingualModel(),
+        turn_detection=turn_detection,
+        turn_handling=turn_handling,
     )
 
     await session.start(room=ctx.room, agent=LucyAgent())
