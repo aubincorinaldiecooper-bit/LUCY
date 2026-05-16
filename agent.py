@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from livekit.agents import Agent, AgentSession, JobContext, TurnHandlingOptions, WorkerOptions, cli
-from livekit.plugins import deepgram, mistralai, openai, silero
+from livekit.plugins import deepgram, hume, mistralai, openai, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 from tavily import TavilyClient
 
@@ -53,11 +53,64 @@ TTS_PROVIDER = os.getenv("TTS_PROVIDER", "deepgram").strip().lower()
 STT_PROVIDER = os.getenv("STT_PROVIDER", "deepgram_flux").strip().lower()
 
 
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _resolve_hume_model_version() -> str | None:
+    hume_model = os.getenv("HUME_MODEL", "octave-2").strip().lower()
+    if not hume_model:
+        return None
+    if hume_model in {"octave-2", "2", "v2"}:
+        return "2"
+    if hume_model in {"octave-1", "1", "v1"}:
+        return "1"
+    return hume_model
+
+
 def build_tts():
     if TTS_PROVIDER == "deepgram":
         logger.info("Using Deepgram TTS provider")
         return deepgram.TTS(
             model=os.getenv("DEEPGRAM_TTS_MODEL", "aura-2-asteria-en")
+        )
+
+    if TTS_PROVIDER == "hume":
+        logger.info("Using Hume TTS provider")
+
+        hume_voice_id = os.getenv("HUME_VOICE_ID")
+        hume_voice_name = os.getenv("HUME_VOICE_NAME")
+        hume_voice_provider = os.getenv("HUME_VOICE_PROVIDER", "hume").strip().lower()
+        instant_mode = env_bool("HUME_INSTANT_MODE", True)
+
+        voice = None
+        if hume_voice_id:
+            voice = hume.VoiceById(id=hume_voice_id)
+        elif hume_voice_name:
+            voice_provider = hume.VoiceProvider.hume
+            if hume_voice_provider != "hume":
+                try:
+                    voice_provider = hume.VoiceProvider[hume_voice_provider]
+                except KeyError:
+                    voice_provider = hume.VoiceProvider(hume_voice_provider.upper())
+
+            voice = hume.VoiceByName(
+                name=hume_voice_name,
+                provider=voice_provider,
+            )
+
+        if instant_mode and voice is None:
+            raise RuntimeError("HUME_VOICE_ID or HUME_VOICE_NAME is required when HUME_INSTANT_MODE=true")
+
+        return hume.TTS(
+            voice=voice,
+            model_version=_resolve_hume_model_version(),
+            description=os.getenv("HUME_DESCRIPTION") or None,
+            speed=float(os.getenv("HUME_SPEED", "1.0")),
+            instant_mode=instant_mode,
         )
 
     if TTS_PROVIDER == "kokoro":
@@ -74,7 +127,7 @@ def build_tts():
             speed=float(os.getenv("KOKORO_SPEED", "1.03")),
         )
 
-    raise RuntimeError("Unsupported TTS_PROVIDER. Use 'deepgram' or 'kokoro'.")
+    raise RuntimeError("Unsupported TTS_PROVIDER. Use 'deepgram', 'hume', or 'kokoro'.")
 
 app = FastAPI()
 
@@ -145,7 +198,7 @@ def register_tavily_tools(llm: Any) -> None:
 
 
 async def entrypoint(ctx: JobContext):
-    llm = openai.LLM.with_openrouter(model=os.getenv("OPENROUTER_MODEL", "gpt-chat-latest"))
+    llm = openai.LLM.with_openrouter(model=os.getenv("OPENROUTER_MODEL", "openai/gpt-4o"))
     # TODO: Re-enable Tavily using LiveKit's supported function-tool pattern.
     logger.warning("Skipping Tavily tools for MVP voice path")
 

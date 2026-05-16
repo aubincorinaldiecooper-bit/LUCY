@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "LUCY voice server"
 requires-python = ">=3.11"
 dependencies = [
-  "livekit-agents[mistralai,openai,silero,turn-detector,deepgram]~=1.5",
+  "livekit-agents[mistralai,openai,silero,turn-detector,deepgram,hume]~=1.5",
   "python-dotenv",
   "tavily-python",
   "fastapi",
