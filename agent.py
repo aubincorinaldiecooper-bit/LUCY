@@ -52,6 +52,81 @@ SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT)
 TTS_PROVIDER = os.getenv("TTS_PROVIDER", "deepgram").strip().lower()
 STT_PROVIDER = os.getenv("STT_PROVIDER", "deepgram_flux").strip().lower()
 
+_speech_counter = 0
+
+
+def _next_local_speech_id() -> str:
+    global _speech_counter
+    _speech_counter += 1
+    return f"local_speech_{_speech_counter}"
+
+
+def _safe_attr(obj: object, name: str, default: str = "n/a") -> str:
+    try:
+        value = getattr(obj, name)
+    except Exception:
+        return default
+    return str(value)
+
+
+def attach_session_diagnostics(session: AgentSession) -> None:
+    active_speeches: set[str] = set()
+
+    def _speech_id(handle: object) -> str:
+        sid = _safe_attr(handle, "id", "")
+        if sid:
+            return sid
+        return _next_local_speech_id()
+
+    @session.on("speech_created")
+    def _on_speech_created(handle: object) -> None:
+        speech_id = _speech_id(handle)
+        if active_speeches:
+            logger.warning("Possible overlap: new speech started while previous speech active")
+        active_speeches.add(speech_id)
+        logger.info("Assistant speech started: speech_id=%s active_count=%s", speech_id, len(active_speeches))
+
+        def _on_done(done_handle: object) -> None:
+            done_id = _speech_id(done_handle)
+            active_speeches.discard(done_id)
+            interrupted = _safe_attr(done_handle, "interrupted", "unknown")
+            logger.info("Assistant speech finished: speech_id=%s interrupted=%s active_count=%s", done_id, interrupted, len(active_speeches))
+
+        add_done_callback = getattr(handle, "add_done_callback", None)
+        if callable(add_done_callback):
+            add_done_callback(_on_done)
+
+    @session.on("overlapping_speech")
+    def _on_overlapping_speech(*_: object) -> None:
+        logger.warning("Session reported overlapping_speech event while assistant_active_count=%s", len(active_speeches))
+
+    @session.on("agent_state_changed")
+    def _on_agent_state_changed(state: object) -> None:
+        logger.info("Agent state changed: state=%s assistant_active_count=%s", state, len(active_speeches))
+
+    @session.on("user_state_changed")
+    def _on_user_state_changed(state: object) -> None:
+        logger.info("User state changed: state=%s assistant_active_count=%s", state, len(active_speeches))
+
+    @session.on("agent_false_interruption")
+    def _on_agent_false_interruption(*_: object) -> None:
+        logger.warning("Agent false interruption detected")
+
+    @session.on("conversation_item_added")
+    def _on_conversation_item_added(item: object) -> None:
+        role = _safe_attr(item, "role")
+        interrupted = _safe_attr(item, "interrupted")
+        logger.info("Conversation item added: role=%s interrupted=%s", role, interrupted)
+
+    @session.on("error")
+    def _on_error(error: object) -> None:
+        logger.error("Session error event: %s", error)
+
+    @session.on("close")
+    def _on_close() -> None:
+        logger.info("Session close event: active_speeches_remaining=%s", len(active_speeches))
+
+
 
 def env_bool(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
@@ -219,8 +294,18 @@ async def entrypoint(ctx: JobContext):
         turn_handling=turn_handling,
     )
 
+    attach_session_diagnostics(session)
+
     await session.start(room=ctx.room, agent=LucyAgent())
-    await session.generate_reply(instructions="Greet the user in one short spoken sentence as Crash. Make it feel calm, direct, and slightly intriguing. Ask what kind of headspace they're currently in at the moment.")
+    logger.info("About to generate greeting reply")
+    greeting_handle = await session.generate_reply(instructions="Greet the user in one short spoken sentence as Crash. Make it feel calm, direct, and slightly intriguing. Ask what kind of headspace they're currently in at the moment.")
+    logger.info(
+        "Greeting generate_reply completed: handle_type=%s handle_id=%s allow_interruptions=%s interrupted=%s",
+        type(greeting_handle).__name__,
+        _safe_attr(greeting_handle, "id"),
+        _safe_attr(greeting_handle, "allow_interruptions"),
+        _safe_attr(greeting_handle, "interrupted"),
+    )
 
 
 if __name__ == "__main__":
