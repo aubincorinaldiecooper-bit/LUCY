@@ -311,7 +311,7 @@ async def entrypoint(ctx: JobContext):
 
     await session.start(room=ctx.room, agent=LucyAgent())
     logger.info("About to generate greeting reply")
-    greeting_handle = await session.generate_reply(instructions="Greet the user in one short spoken sentence as Crash. Make it feel calm, direct, and slightly intriguing. Ask what kind of headspace they're currently in at the moment.")
+    greeting_handle = await session.generate_reply(instructions="Greet the user in one short casual sentence as Crash. Say: Hey, Whats up? what did you want to chat about?")
     logger.info(
         "Greeting generate_reply completed: handle_type=%s handle_id=%s allow_interruptions=%s interrupted=%s",
         type(greeting_handle).__name__,
