@@ -1,5 +1,6 @@
 "use client";
 
+import type { ReactNode, RefObject } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowRight, MessageCircle, Mic, MicOff, PhoneOff } from "lucide-react";
 import { useVoiceClient } from "@/hooks/useVoiceClient";
@@ -152,7 +153,7 @@ function HomePage() {
   const orangeRef = useRef<HTMLDivElement | null>(null);
 
   const calculatePosition = useCallback(
-    (ref: React.RefObject<HTMLDivElement | null>): CharacterPos => {
+    (ref: RefObject<HTMLDivElement | null>): CharacterPos => {
       if (!trackingEnabled || !ref.current) return { faceX: 0, faceY: 0, bodySkew: 0 };
       const rect = ref.current.getBoundingClientRect();
       const centerX = rect.left + rect.width / 2;
@@ -234,7 +235,7 @@ function HomePage() {
   );
 }
 
-function AppFrame({ children }: { children: React.ReactNode }) {
+function AppFrame({ children }: { children: ReactNode }) {
   return (
     <main className="min-h-screen w-full relative overflow-hidden" style={{ backgroundColor: COLORS.bg, color: COLORS.text }}>
       {children}
@@ -324,7 +325,7 @@ function LandingView({
   isBlackBlinking,
 }: {
   onStart: () => void;
-  refs: { purpleRef: React.RefObject<HTMLDivElement | null>; blackRef: React.RefObject<HTMLDivElement | null>; yellowRef: React.RefObject<HTMLDivElement | null>; orangeRef: React.RefObject<HTMLDivElement | null> };
+  refs: { purpleRef: RefObject<HTMLDivElement | null>; blackRef: RefObject<HTMLDivElement | null>; yellowRef: RefObject<HTMLDivElement | null>; orangeRef: RefObject<HTMLDivElement | null> };
   positions: { purplePos: CharacterPos; blackPos: CharacterPos; yellowPos: CharacterPos; orangePos: CharacterPos };
   isPurpleBlinking: boolean;
   isBlackBlinking: boolean;
