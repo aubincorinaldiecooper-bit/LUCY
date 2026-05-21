@@ -118,53 +118,6 @@ def attach_session_diagnostics(session: AgentSession) -> None:
             )
             active_speech_handles.clear()
 
-    def _interrupt_with_fallback(previous_handle: object, previous_id: str, new_id: str) -> bool:
-        interrupt = getattr(previous_handle, "interrupt", None)
-        if callable(interrupt):
-            try:
-                interrupt()
-                logger.warning(
-                    "Interrupted previous active speech before new speech: previous_speech_id=%s new_speech_id=%s path=previous_handle.interrupt",
-                    previous_id,
-                    new_id,
-                )
-                return True
-            except Exception as e:
-                logger.warning("Failed previous_handle.interrupt: previous_speech_id=%s new_speech_id=%s err=%s", previous_id, new_id, e)
-
-        current_speech = getattr(session, "current_speech", None)
-        current_interrupt = getattr(current_speech, "interrupt", None)
-        if callable(current_interrupt):
-            try:
-                current_interrupt()
-                logger.warning(
-                    "Interrupted previous active speech before new speech: previous_speech_id=%s new_speech_id=%s path=session.current_speech.interrupt",
-                    previous_id,
-                    new_id,
-                )
-                return True
-            except Exception as e:
-                logger.warning("Failed session.current_speech.interrupt: previous_speech_id=%s new_speech_id=%s err=%s", previous_id, new_id, e)
-
-        session_interrupt = getattr(session, "interrupt", None)
-        if callable(session_interrupt):
-            try:
-                session_interrupt()
-                logger.warning(
-                    "Interrupted previous active speech before new speech: previous_speech_id=%s new_speech_id=%s path=session.interrupt",
-                    previous_id,
-                    new_id,
-                )
-                return True
-            except Exception as e:
-                logger.warning("Failed session.interrupt: previous_speech_id=%s new_speech_id=%s err=%s", previous_id, new_id, e)
-
-        logger.warning(
-            "All interruption fallback paths failed: previous_speech_id=%s new_speech_id=%s",
-            previous_id,
-            new_id,
-        )
-        return False
 
     @session.on("speech_created")
     def _on_speech_created(event_or_handle: object) -> None:
@@ -180,11 +133,15 @@ def attach_session_diagnostics(session: AgentSession) -> None:
         speech_id = _speech_id(resolved_handle)
 
         if active_speech_handles:
-            for active_id, active_handle in list(active_speech_handles.items()):
+            for active_id in list(active_speech_handles.keys()):
                 if active_id == speech_id:
                     continue
-                if _interrupt_with_fallback(active_handle, active_id, speech_id):
-                    active_speech_handles.pop(active_id, None)
+                logger.warning(
+                    "Possible overlap: new speech started while previous speech active: previous_speech_id=%s new_speech_id=%s active_count=%s",
+                    active_id,
+                    speech_id,
+                    len(active_speech_handles),
+                )
 
         active_speech_handles[speech_id] = resolved_handle
         logger.info("Assistant speech started: speech_id=%s active_count=%s", speech_id, len(active_speech_handles))
@@ -411,7 +368,7 @@ async def entrypoint(ctx: JobContext):
     await session.start(room=ctx.room, agent=LucyAgent())
     logger.info("About to generate greeting reply")
     greeting_handle = await session.generate_reply(
-        instructions="Greet the user in one short casual sentence as Purple. Say: Hey. What’s up?",
+        instructions="Greet the user in one short casual sentence as Crash. Say: Yo. What’s going on?",
         allow_interruptions=False,
     )
     logger.info(
