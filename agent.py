@@ -346,22 +346,22 @@ async def entrypoint(ctx: JobContext):
     # TODO: Re-enable Tavily using LiveKit's supported function-tool pattern.
     logger.warning("Skipping Tavily tools for MVP voice path")
 
-    if STT_PROVIDER == "deepgram_flux":
-        # Flux has STT-native end-of-turn detection, so avoid running the separate multilingual turn detector.
-        turn_detection = None
-        turn_handling = TurnHandlingOptions(turn_detection="stt")
-    else:
-        turn_detection = MultilingualModel()
-        turn_handling = None
+    session_kwargs: dict[str, Any] = {
+        "stt": build_stt(),
+        "llm": llm,
+        "tts": build_tts(),
+        "vad": silero.VAD.load(),
+    }
 
-    session = AgentSession(
-        stt=build_stt(),
-        llm=llm,
-        tts=build_tts(),
-        vad=silero.VAD.load(),
-        turn_detection=turn_detection,
-        turn_handling=turn_handling,
-    )
+    if STT_PROVIDER == "deepgram_flux":
+        # Flux has STT-native end-of-turn detection; do not pass deprecated turn_detection for this provider.
+        session_kwargs["turn_handling"] = TurnHandlingOptions(turn_detection="stt")
+    else:
+        session_kwargs["turn_detection"] = MultilingualModel()
+
+    session = AgentSession(**session_kwargs)
+
+    attach_session_diagnostics(session)
 
     attach_session_diagnostics(session)
 
