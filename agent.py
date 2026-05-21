@@ -363,6 +363,8 @@ async def entrypoint(ctx: JobContext):
 
     attach_session_diagnostics(session)
 
+    attach_session_diagnostics(session)
+
     await session.start(room=ctx.room, agent=LucyAgent())
     logger.info("About to generate greeting reply")
     greeting_handle = await session.generate_reply(
