@@ -6,7 +6,7 @@ from typing import Any
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from livekit.agents import Agent, AgentSession, JobContext, TurnHandlingOptions, WorkerOptions, cli
+from livekit.agents import Agent, AgentSession, InterruptionOptions, JobContext, TurnHandlingOptions, WorkerOptions, cli
 from livekit.plugins import deepgram, hume, mistralai, openai, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 from tavily import TavilyClient
@@ -341,10 +341,39 @@ def register_tavily_tools(llm: Any) -> None:
         return tavily.search(query=topic, search_depth="advanced")
 
 
+def _attach_optional_interruption_diagnostics(session: AgentSession) -> None:
+    def _register(event_name: str, handler):
+        try:
+            session.on(event_name)(handler)
+            logger.info("Registered optional interruption diagnostic handler: event=%s", event_name)
+            return True
+        except Exception as e:
+            logger.info("Optional interruption diagnostic event unavailable: event=%s reason=%s", event_name, e)
+            return False
+
+    def _on_user_interruption_detected(event: object) -> None:
+        logger.info(
+            "User interruption diagnostic event: event_type=%s interrupted=%s",
+            type(event).__name__,
+            _safe_attr(event, "interrupted", "unknown"),
+        )
+
+    _register("user_interruption_detected", _on_user_interruption_detected)
+
+
+
 async def entrypoint(ctx: JobContext):
     llm = openai.LLM.with_openrouter(model=os.getenv("OPENROUTER_MODEL", "openai/gpt-4o"))
     # TODO: Re-enable Tavily using LiveKit's supported function-tool pattern.
     logger.warning("Skipping Tavily tools for MVP voice path")
+
+    interruption_options: InterruptionOptions = {
+        "enabled": True,
+        "min_words": 1,
+        "min_duration": 0.6,
+        "resume_false_interruption": True,
+        "false_interruption_timeout": 1.8,
+    }
 
     session_kwargs: dict[str, Any] = {
         "stt": build_stt(),
@@ -355,13 +384,23 @@ async def entrypoint(ctx: JobContext):
 
     if STT_PROVIDER == "deepgram_flux":
         # Flux has STT-native end-of-turn detection; do not pass deprecated turn_detection for this provider.
-        session_kwargs["turn_handling"] = TurnHandlingOptions(turn_detection="stt")
+        session_kwargs["turn_handling"] = TurnHandlingOptions(
+            turn_detection="stt",
+            interruption=interruption_options,
+        )
+        logger.info(
+            "Using Flux turn handling config: turn_detection=%s interruption=%s",
+            "stt",
+            interruption_options,
+        )
     else:
         session_kwargs["turn_detection"] = MultilingualModel()
+        logger.info("Using non-Flux turn handling config: turn_detection=%s", "multilingual")
 
     session = AgentSession(**session_kwargs)
 
     attach_session_diagnostics(session)
+    _attach_optional_interruption_diagnostics(session)
 
     await session.start(room=ctx.room, agent=LucyAgent())
     logger.info("About to generate greeting reply")
