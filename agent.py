@@ -109,6 +109,22 @@ def attach_session_diagnostics(session: AgentSession) -> None:
             _local_speech_ids[obj_id] = _next_local_speech_id()
         return _local_speech_ids[obj_id]
 
+    def _extract_agent_new_state(state_event: object) -> str:
+        new_state = getattr(state_event, "new_state", None)
+        if new_state is not None:
+            return str(new_state).strip().lower()
+
+        current_state = getattr(state_event, "state", None)
+        if current_state is not None:
+            return str(current_state).strip().lower()
+
+        state_text = str(state_event)
+        lowered = state_text.lower()
+        if "new_state='listening'" in lowered or 'new_state="listening"' in lowered:
+            return "listening"
+
+        return lowered.strip()
+
     def _clear_active_handles(reason: str) -> None:
         if active_speech_handles:
             logger.warning(
@@ -165,11 +181,18 @@ def attach_session_diagnostics(session: AgentSession) -> None:
 
     @session.on("agent_state_changed")
     def _on_agent_state_changed(state: object) -> None:
-        logger.info("Agent state changed: state=%s assistant_active_count=%s", state, len(active_speech_handles))
-        if str(state).lower() == "listening":
-            current_speech = getattr(session, "current_speech", None)
-            if current_speech is None:
-                _clear_active_handles("agent_returned_to_listening")
+        extracted_new_state = _extract_agent_new_state(state)
+        current_speech = getattr(session, "current_speech", None)
+        has_current_speech = current_speech is not None
+        logger.info(
+            "Agent state changed: state=%s extracted_new_state=%s has_current_speech=%s assistant_active_count=%s",
+            state,
+            extracted_new_state,
+            has_current_speech,
+            len(active_speech_handles),
+        )
+        if extracted_new_state == "listening" and not has_current_speech:
+            _clear_active_handles("agent_returned_to_listening")
 
     @session.on("user_state_changed")
     def _on_user_state_changed(state: object) -> None:
