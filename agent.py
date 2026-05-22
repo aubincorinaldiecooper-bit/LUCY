@@ -66,6 +66,7 @@ SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT)
 
 TTS_PROVIDER = os.getenv("TTS_PROVIDER", "deepgram").strip().lower()
 STT_PROVIDER = os.getenv("STT_PROVIDER", "deepgram_flux").strip().lower()
+VAD_PROVIDER = os.getenv("VAD_PROVIDER", "ai_coustics").strip().lower()
 
 _speech_counter = 0
 
@@ -128,6 +129,24 @@ def attach_session_diagnostics(session: AgentSession) -> None:
 
         state_text = str(state_event)
         lowered = state_text.lower()
+        if "new_state='listening'" in lowered or 'new_state="listening"' in lowered:
+            return "listening"
+
+        return lowered.strip()
+
+    def _extract_user_new_state(state_event: object) -> str:
+        new_state = getattr(state_event, "new_state", None)
+        if new_state is not None:
+            return str(new_state).strip().lower()
+
+        current_state = getattr(state_event, "state", None)
+        if current_state is not None:
+            return str(current_state).strip().lower()
+
+        state_text = str(state_event)
+        lowered = state_text.lower()
+        if "new_state='speaking'" in lowered or 'new_state="speaking"' in lowered:
+            return "speaking"
         if "new_state='listening'" in lowered or 'new_state="listening"' in lowered:
             return "listening"
 
@@ -313,7 +332,7 @@ def attach_session_diagnostics(session: AgentSession) -> None:
     @session.on("user_state_changed")
     def _on_user_state_changed(state: object) -> None:
         nonlocal latest_user_state, latest_user_state_timestamp
-        latest_user_state = str(state).strip().lower()
+        latest_user_state = _extract_user_new_state(state)
         latest_user_state_timestamp = time.monotonic()
         logger.info("User state changed: state=%s assistant_active_count=%s", state, len(active_speech_handles))
 
@@ -485,6 +504,46 @@ class LucyAgent(Agent):
 
 
 
+def build_vad():
+    if VAD_PROVIDER == "ai_coustics":
+        logger.info("Using ai-coustics VAD provider")
+        return ai_coustics.VAD()
+
+    if VAD_PROVIDER == "silero":
+        logger.info("Using Silero VAD provider")
+        return silero.VAD.load()
+
+    logger.warning("Unknown VAD_PROVIDER=%s. Falling back to ai-coustics VAD provider", VAD_PROVIDER)
+    return ai_coustics.VAD()
+
+
+def build_stt():
+    if STT_PROVIDER == "deepgram_flux":
+        logger.info("Using Deepgram Flux STT provider")
+        return deepgram.STTv2(
+            model=os.getenv("DEEPGRAM_STT_MODEL", "flux-general-en"),
+            eager_eot_threshold=float(os.getenv("DEEPGRAM_EAGER_EOT_THRESHOLD", "0.4")),
+            eot_threshold=float(os.getenv("DEEPGRAM_EOT_THRESHOLD", "0.7")),
+            eot_timeout_ms=int(os.getenv("DEEPGRAM_EOT_TIMEOUT_MS", "700")),
+        )
+
+    if STT_PROVIDER == "deepgram_nova3":
+        logger.info("Using Deepgram Nova-3 STT provider")
+        return deepgram.STT(
+            model=os.getenv("DEEPGRAM_STT_MODEL", "nova-3"),
+            language=os.getenv("DEEPGRAM_STT_LANGUAGE", "en"),
+        )
+
+    if STT_PROVIDER == "mistral":
+        logger.info("Using Mistral Voxtral STT provider")
+        return mistralai.STT(
+            model=os.getenv("MISTRAL_STT_MODEL", "voxtral-mini-transcribe-realtime-2602"),
+            target_streaming_delay_ms=int(os.getenv("MISTRAL_TARGET_STREAMING_DELAY_MS", "160")),
+        )
+
+    raise RuntimeError("Unsupported STT_PROVIDER. Use 'deepgram_flux', 'deepgram_nova3', or 'mistral'.")
+
+
 def build_stt():
     if STT_PROVIDER == "deepgram_flux":
         logger.info("Using Deepgram Flux STT provider")
@@ -565,6 +624,8 @@ async def entrypoint(ctx: JobContext):
     # TODO: Re-enable Tavily using LiveKit's supported function-tool pattern.
     logger.warning("Skipping Tavily tools for MVP voice path")
 
+    logger.info("Startup provider config: STT_PROVIDER=%s VAD_PROVIDER(raw)=%s", STT_PROVIDER, os.getenv("VAD_PROVIDER", "ai_coustics"))
+
     interruption_options: InterruptionOptions = {
         "enabled": True,
         "min_words": 1,
@@ -577,7 +638,7 @@ async def entrypoint(ctx: JobContext):
         "stt": build_stt(),
         "llm": llm,
         "tts": build_tts(),
-        "vad": silero.VAD.load(),
+        "vad": build_vad(),
     }
 
     if STT_PROVIDER == "deepgram_flux":
@@ -597,6 +658,8 @@ async def entrypoint(ctx: JobContext):
         logger.info("Using non-Flux turn handling config: turn_detection=%s", "multilingual")
 
     session = AgentSession(**session_kwargs)
+    resolved_vad = session_kwargs.get("vad")
+    logger.info("Resolved VAD provider: provider=%s vad_type=%s", VAD_PROVIDER, type(resolved_vad).__name__)
 
     attach_session_diagnostics(session)
     _attach_optional_interruption_diagnostics(session)
