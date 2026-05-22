@@ -91,6 +91,10 @@ def attach_session_diagnostics(session: AgentSession) -> None:
     speech_start_times: dict[str, float] = {}
     suppressed_speech_ids: set[str] = set()
     overlap_suppress_window_seconds = float(os.getenv("ASSISTANT_OVERLAP_SUPPRESS_WINDOW_SECONDS", "4.0"))
+    latest_user_state = "unknown"
+    latest_user_state_timestamp = 0.0
+    latest_agent_state = "unknown"
+    latest_agent_state_timestamp = 0.0
 
     def _resolve_speech_handle(event_or_handle: object) -> object:
         for attr in ("speech_handle", "handle", "speech"):
@@ -159,7 +163,33 @@ def attach_session_diagnostics(session: AgentSession) -> None:
         speech_start_times[speech_id] = now
 
         suppressed = False
+        suppression_attempted = False
+        suppression_result = "not_needed"
         if active_speech_handles:
+            active_ids_before_new = list(active_speech_handles.keys())
+            current_speech = getattr(session, "current_speech", None)
+            current_speech_id = _speech_id(current_speech) if current_speech is not None else "none"
+            current_speech_type = type(current_speech).__name__ if current_speech is not None else "none"
+            now_for_diag = time.monotonic()
+            user_state_age = (now_for_diag - latest_user_state_timestamp) if latest_user_state_timestamp else -1.0
+            agent_state_age = (now_for_diag - latest_agent_state_timestamp) if latest_agent_state_timestamp else -1.0
+            latest_user_state_normalized = str(latest_user_state).strip().lower()
+            latest_agent_state_normalized = str(latest_agent_state).strip().lower()
+            logger.info(
+                "Assistant overlap diagnostic: new_speech_id=%s active_speech_ids_before_new=%s session_current_speech_id=%s session_current_speech_type=%s latest_user_state=%s latest_agent_state=%s seconds_since_user_state_change=%.3f seconds_since_agent_state_change=%.3f user_state_is_speaking=%s agent_state_is_thinking=%s agent_state_is_speaking=%s agent_state_is_listening=%s",
+                speech_id,
+                active_ids_before_new,
+                current_speech_id,
+                current_speech_type,
+                latest_user_state,
+                latest_agent_state,
+                user_state_age,
+                agent_state_age,
+                latest_user_state_normalized == "speaking",
+                latest_agent_state_normalized == "thinking",
+                latest_agent_state_normalized == "speaking",
+                latest_agent_state_normalized == "listening",
+            )
             previous_id = None
             previous_started_at = None
             for active_id in active_speech_handles.keys():
@@ -176,7 +206,8 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                 age_seconds = now - previous_started_at
                 if age_seconds <= overlap_suppress_window_seconds:
                     method_used = None
-                    for method_name in ("cancel", "stop", "close", "interrupt"):
+                    suppression_attempted = True
+                    for method_name in ("cancel", "stop", "close"):
                         method = getattr(resolved_handle, method_name, None)
                         if callable(method):
                             try:
@@ -193,6 +224,7 @@ def attach_session_diagnostics(session: AgentSession) -> None:
 
                     if method_used is not None:
                         suppressed = True
+                        suppression_result = f"suppressed:{method_used}"
                         suppressed_speech_ids.add(speech_id)
                         logger.warning(
                             "Suppressing duplicate assistant speech overlap: kept_speech_id=%s suppressed_speech_id=%s active_count=%s method=%s",
@@ -203,28 +235,38 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                         )
                     else:
                         logger.warning(
-                            "Possible assistant speech overlap not suppressed: previous_speech_id=%s new_speech_id=%s reason=%s active_count=%s",
+                            "Possible assistant speech overlap not safely suppressed: previous_speech_id=%s new_speech_id=%s reason=%s active_count=%s",
                             previous_id,
                             speech_id,
-                            "no_supported_suppression_method",
+                            "no_safe_suppression_method",
                             len(active_speech_handles),
                         )
+                        suppression_result = "not_safely_suppressed:no_safe_suppression_method"
                 else:
                     logger.warning(
-                        "Possible assistant speech overlap not suppressed: previous_speech_id=%s new_speech_id=%s reason=%s active_count=%s",
+                        "Possible assistant speech overlap not safely suppressed: previous_speech_id=%s new_speech_id=%s reason=%s active_count=%s",
                         previous_id,
                         speech_id,
                         "previous_speech_outside_suppress_window",
                         len(active_speech_handles),
                     )
+                    suppression_result = "not_suppressed:previous_speech_outside_suppress_window"
             else:
                 logger.warning(
-                    "Possible assistant speech overlap not suppressed: previous_speech_id=%s new_speech_id=%s reason=%s active_count=%s",
+                    "Possible assistant speech overlap not safely suppressed: previous_speech_id=%s new_speech_id=%s reason=%s active_count=%s",
                     "unknown",
                     speech_id,
                     "missing_previous_speech_start_time",
                     len(active_speech_handles),
-                )
+                    )
+
+        if active_speech_handles:
+            logger.info(
+                "Assistant overlap suppression outcome: new_speech_id=%s suppression_attempted=%s result=%s",
+                speech_id,
+                suppression_attempted,
+                suppression_result,
+            )
 
         if not suppressed:
             active_speech_handles[speech_id] = resolved_handle
@@ -252,7 +294,10 @@ def attach_session_diagnostics(session: AgentSession) -> None:
 
     @session.on("agent_state_changed")
     def _on_agent_state_changed(state: object) -> None:
+        nonlocal latest_agent_state, latest_agent_state_timestamp
         extracted_new_state = _extract_agent_new_state(state)
+        latest_agent_state = extracted_new_state
+        latest_agent_state_timestamp = time.monotonic()
         current_speech = getattr(session, "current_speech", None)
         has_current_speech = current_speech is not None
         logger.info(
@@ -267,6 +312,9 @@ def attach_session_diagnostics(session: AgentSession) -> None:
 
     @session.on("user_state_changed")
     def _on_user_state_changed(state: object) -> None:
+        nonlocal latest_user_state, latest_user_state_timestamp
+        latest_user_state = str(state).strip().lower()
+        latest_user_state_timestamp = time.monotonic()
         logger.info("User state changed: state=%s assistant_active_count=%s", state, len(active_speech_handles))
 
     @session.on("agent_false_interruption")
@@ -521,7 +569,7 @@ async def entrypoint(ctx: JobContext):
         "enabled": True,
         "min_words": 1,
         "min_duration": 0.6,
-        "resume_false_interruption": True,
+        "resume_false_interruption": env_bool("LIVEKIT_RESUME_FALSE_INTERRUPTION", False),
         "false_interruption_timeout": 1.8,
     }
 
@@ -539,9 +587,10 @@ async def entrypoint(ctx: JobContext):
             interruption=interruption_options,
         )
         logger.info(
-            "Using Flux turn handling config: turn_detection=%s interruption=%s",
+            "Using Flux turn handling config: turn_detection=%s interruption=%s resume_false_interruption=%s",
             "stt",
             interruption_options,
+            interruption_options.get("resume_false_interruption"),
         )
     else:
         session_kwargs["turn_detection"] = MultilingualModel()
