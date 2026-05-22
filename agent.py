@@ -86,6 +86,43 @@ def _safe_attr(obj: object, name: str, default: str = "n/a") -> str:
     return str(value)
 
 
+def _redact_sensitive_text(value: object) -> str:
+    text = str(value)
+    lowered = text.lower()
+    redaction_markers = ("auth", "api_key", "apikey", "token", "bearer", "password", "secret", "requestinfo", "request_info", "real_url")
+    if any(marker in lowered for marker in redaction_markers):
+        return "[redacted]"
+
+    text = text.replace("\n", " ").replace("\r", " ")
+    if "?" in text and "http" in lowered:
+        text = text.split("?", 1)[0] + "?[redacted]"
+
+    return text[:240]
+
+
+def _safe_error_summary(error: object) -> dict[str, str]:
+    summary: dict[str, str] = {
+        "event_type": type(error).__name__,
+    }
+
+    nested_error = getattr(error, "error", None)
+    if nested_error is not None:
+        summary["nested_error_type"] = type(nested_error).__name__
+
+    for field in ("status", "label", "type", "source_type", "recoverable"):
+        value = getattr(error, field, None)
+        if value is not None:
+            summary[field] = _redact_sensitive_text(value)
+
+    message = getattr(error, "message", None)
+    if message is None:
+        message = getattr(error, "detail", None)
+    if message is not None:
+        summary["message"] = _redact_sensitive_text(message)
+
+    return summary
+
+
 def attach_session_diagnostics(session: AgentSession) -> None:
     active_speech_handles: dict[str, object] = {}
     _local_speech_ids: dict[int, str] = {}
@@ -349,8 +386,11 @@ def attach_session_diagnostics(session: AgentSession) -> None:
 
     @session.on("error")
     def _on_error(error: object) -> None:
-        logger.error("Session error event: %s", error)
-        if "tts" in str(error).lower():
+        safe_summary = _safe_error_summary(error)
+        logger.error("Session error event summary: %s", safe_summary)
+
+        searchable_safe_text = " ".join(str(v).lower() for v in safe_summary.values())
+        if "tts" in searchable_safe_text:
             _clear_active_handles("tts_error")
 
     @session.on("close")
@@ -503,6 +543,46 @@ class LucyAgent(Agent):
     def __init__(self) -> None:
         super().__init__(instructions=SYSTEM_PROMPT)
 
+
+
+def build_vad():
+    if VAD_PROVIDER == "ai_coustics":
+        logger.info("Using ai-coustics VAD provider")
+        return ai_coustics.VAD()
+
+    if VAD_PROVIDER == "silero":
+        logger.info("Using Silero VAD provider")
+        return silero.VAD.load()
+
+    logger.warning("Unknown VAD_PROVIDER=%s. Falling back to ai-coustics VAD provider", VAD_PROVIDER)
+    return ai_coustics.VAD()
+
+
+def build_stt():
+    if STT_PROVIDER == "deepgram_flux":
+        logger.info("Using Deepgram Flux STT provider")
+        return deepgram.STTv2(
+            model=os.getenv("DEEPGRAM_STT_MODEL", "flux-general-en"),
+            eager_eot_threshold=float(os.getenv("DEEPGRAM_EAGER_EOT_THRESHOLD", "0.4")),
+            eot_threshold=float(os.getenv("DEEPGRAM_EOT_THRESHOLD", "0.7")),
+            eot_timeout_ms=int(os.getenv("DEEPGRAM_EOT_TIMEOUT_MS", "700")),
+        )
+
+    if STT_PROVIDER == "deepgram_nova3":
+        logger.info("Using Deepgram Nova-3 STT provider")
+        return deepgram.STT(
+            model=os.getenv("DEEPGRAM_STT_MODEL", "nova-3"),
+            language=os.getenv("DEEPGRAM_STT_LANGUAGE", "en"),
+        )
+
+    if STT_PROVIDER == "mistral":
+        logger.info("Using Mistral Voxtral STT provider")
+        return mistralai.STT(
+            model=os.getenv("MISTRAL_STT_MODEL", "voxtral-mini-transcribe-realtime-2602"),
+            target_streaming_delay_ms=int(os.getenv("MISTRAL_TARGET_STREAMING_DELAY_MS", "160")),
+        )
+
+    raise RuntimeError("Unsupported STT_PROVIDER. Use 'deepgram_flux', 'deepgram_nova3', or 'mistral'.")
 
 
 def build_vad():
