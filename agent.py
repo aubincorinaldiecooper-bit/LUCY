@@ -1,5 +1,6 @@
 import os
 import asyncio
+import inspect
 import logging
 import time
 from typing import Any
@@ -9,7 +10,6 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from livekit.agents import Agent, AgentSession, InterruptionOptions, JobContext, TurnHandlingOptions, WorkerOptions, cli, room_io
 from livekit.plugins import ai_coustics, deepgram, hume, mistralai, openai, silero
-from livekit.plugins.turn_detector.multilingual import MultilingualModel
 from tavily import TavilyClient
 
 from kokoro_plugin import KokoroTTS
@@ -65,9 +65,9 @@ If the user may hurt themselves or someone else, stop being casual and be direct
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT)
 
 TTS_PROVIDER = os.getenv("TTS_PROVIDER", "deepgram").strip().lower()
-STT_PROVIDER = os.getenv("STT_PROVIDER", "deepgram_flux").strip().lower()
+STT_PROVIDER = os.getenv("STT_PROVIDER", "mistral").strip().lower()
 VAD_PROVIDER = os.getenv("VAD_PROVIDER", "ai_coustics").strip().lower()
-LIVEKIT_TURN_DETECTION_MODE = os.getenv("LIVEKIT_TURN_DETECTION_MODE", "stt").strip().lower()
+LIVEKIT_TURN_DETECTION_MODE = os.getenv("LIVEKIT_TURN_DETECTION_MODE", "vad").strip().lower()
 
 _speech_counter = 0
 
@@ -577,119 +577,21 @@ def build_stt():
 
     if STT_PROVIDER == "mistral":
         logger.info("Using Mistral Voxtral STT provider")
-        return mistralai.STT(
-            model=os.getenv("MISTRAL_STT_MODEL", "voxtral-mini-transcribe-realtime-2602"),
-            target_streaming_delay_ms=int(os.getenv("MISTRAL_TARGET_STREAMING_DELAY_MS", "160")),
-        )
+        mistral_stt_model = os.getenv("MISTRAL_STT_MODEL", "voxtral-mini-transcribe-realtime-2602")
+        mistral_target_streaming_delay_ms = int(os.getenv("MISTRAL_TARGET_STREAMING_DELAY_MS", "160"))
+        logger.info("MISTRAL_STT_MODEL=%s", mistral_stt_model)
+        mistral_stt_signature = inspect.signature(mistralai.STT)
+        if "target_streaming_delay_ms" in mistral_stt_signature.parameters:
+            logger.info("MISTRAL_TARGET_STREAMING_DELAY_MS applied=true value=%s", mistral_target_streaming_delay_ms)
+            return mistralai.STT(
+                model=mistral_stt_model,
+                target_streaming_delay_ms=mistral_target_streaming_delay_ms,
+            )
+        logger.info("MISTRAL_TARGET_STREAMING_DELAY_MS applied=false reason=unsupported_constructor")
+        return mistralai.STT(model=mistral_stt_model)
 
     raise RuntimeError("Unsupported STT_PROVIDER. Use 'deepgram_flux', 'deepgram_nova3', or 'mistral'.")
 
-
-def build_vad():
-    if VAD_PROVIDER == "ai_coustics":
-        logger.info("Using ai-coustics VAD provider")
-        return ai_coustics.VAD()
-
-    if VAD_PROVIDER == "silero":
-        logger.info("Using Silero VAD provider")
-        return silero.VAD.load()
-
-    logger.warning("Unknown VAD_PROVIDER=%s. Falling back to ai-coustics VAD provider", VAD_PROVIDER)
-    return ai_coustics.VAD()
-
-
-def build_stt():
-    if STT_PROVIDER == "deepgram_flux":
-        logger.info("Using Deepgram Flux STT provider")
-        return deepgram.STTv2(
-            model=os.getenv("DEEPGRAM_STT_MODEL", "flux-general-en"),
-            eager_eot_threshold=float(os.getenv("DEEPGRAM_EAGER_EOT_THRESHOLD", "0.4")),
-            eot_threshold=float(os.getenv("DEEPGRAM_EOT_THRESHOLD", "0.7")),
-            eot_timeout_ms=int(os.getenv("DEEPGRAM_EOT_TIMEOUT_MS", "700")),
-        )
-
-    if STT_PROVIDER == "deepgram_nova3":
-        logger.info("Using Deepgram Nova-3 STT provider")
-        return deepgram.STT(
-            model=os.getenv("DEEPGRAM_STT_MODEL", "nova-3"),
-            language=os.getenv("DEEPGRAM_STT_LANGUAGE", "en"),
-        )
-
-    if STT_PROVIDER == "mistral":
-        logger.info("Using Mistral Voxtral STT provider")
-        return mistralai.STT(
-            model=os.getenv("MISTRAL_STT_MODEL", "voxtral-mini-transcribe-realtime-2602"),
-            target_streaming_delay_ms=int(os.getenv("MISTRAL_TARGET_STREAMING_DELAY_MS", "160")),
-        )
-
-    raise RuntimeError("Unsupported STT_PROVIDER. Use 'deepgram_flux', 'deepgram_nova3', or 'mistral'.")
-
-
-def build_vad():
-    if VAD_PROVIDER == "ai_coustics":
-        logger.info("Using ai-coustics VAD provider")
-        return ai_coustics.VAD()
-
-    if VAD_PROVIDER == "silero":
-        logger.info("Using Silero VAD provider")
-        return silero.VAD.load()
-
-    logger.warning("Unknown VAD_PROVIDER=%s. Falling back to ai-coustics VAD provider", VAD_PROVIDER)
-    return ai_coustics.VAD()
-
-
-def build_stt():
-    if STT_PROVIDER == "deepgram_flux":
-        logger.info("Using Deepgram Flux STT provider")
-        return deepgram.STTv2(
-            model=os.getenv("DEEPGRAM_STT_MODEL", "flux-general-en"),
-            eager_eot_threshold=float(os.getenv("DEEPGRAM_EAGER_EOT_THRESHOLD", "0.4")),
-            eot_threshold=float(os.getenv("DEEPGRAM_EOT_THRESHOLD", "0.7")),
-            eot_timeout_ms=int(os.getenv("DEEPGRAM_EOT_TIMEOUT_MS", "700")),
-        )
-
-    if STT_PROVIDER == "deepgram_nova3":
-        logger.info("Using Deepgram Nova-3 STT provider")
-        return deepgram.STT(
-            model=os.getenv("DEEPGRAM_STT_MODEL", "nova-3"),
-            language=os.getenv("DEEPGRAM_STT_LANGUAGE", "en"),
-        )
-
-    if STT_PROVIDER == "mistral":
-        logger.info("Using Mistral Voxtral STT provider")
-        return mistralai.STT(
-            model=os.getenv("MISTRAL_STT_MODEL", "voxtral-mini-transcribe-realtime-2602"),
-            target_streaming_delay_ms=int(os.getenv("MISTRAL_TARGET_STREAMING_DELAY_MS", "160")),
-        )
-
-    raise RuntimeError("Unsupported STT_PROVIDER. Use 'deepgram_flux', 'deepgram_nova3', or 'mistral'.")
-
-
-def build_stt():
-    if STT_PROVIDER == "deepgram_flux":
-        logger.info("Using Deepgram Flux STT provider")
-        return deepgram.STTv2(
-            model=os.getenv("DEEPGRAM_STT_MODEL", "flux-general-en"),
-            eager_eot_threshold=float(os.getenv("DEEPGRAM_EAGER_EOT_THRESHOLD", "0.4")),
-            eot_threshold=float(os.getenv("DEEPGRAM_EOT_THRESHOLD", "0.7")),
-            eot_timeout_ms=int(os.getenv("DEEPGRAM_EOT_TIMEOUT_MS", "700")),
-        )
-
-    if STT_PROVIDER == "deepgram_nova3":
-        logger.info("Using Deepgram Nova-3 STT provider")
-        return deepgram.STT(
-            model=os.getenv("DEEPGRAM_STT_MODEL", "nova-3"),
-            language=os.getenv("DEEPGRAM_STT_LANGUAGE", "en"),
-        )
-
-    if STT_PROVIDER == "mistral":
-        logger.info("Using Mistral Voxtral STT provider")
-        return mistralai.STT(
-            model=os.getenv("MISTRAL_STT_MODEL", "voxtral-mini-transcribe-realtime-2602"),
-            target_streaming_delay_ms=int(os.getenv("MISTRAL_TARGET_STREAMING_DELAY_MS", "160")),
-        )
-
-    raise RuntimeError("Unsupported STT_PROVIDER. Use 'deepgram_flux', 'deepgram_nova3', or 'mistral'.")
 
 def _tavily() -> TavilyClient:
     return TavilyClient(api_key=os.getenv("TAVILY_API_KEY", ""))
@@ -745,7 +647,43 @@ async def entrypoint(ctx: JobContext):
     # TODO: Re-enable Tavily using LiveKit's supported function-tool pattern.
     logger.warning("Skipping Tavily tools for MVP voice path")
 
-    logger.info("Startup provider config: STT_PROVIDER=%s VAD_PROVIDER(raw)=%s LIVEKIT_TURN_DETECTION_MODE(raw)=%s", STT_PROVIDER, os.getenv("VAD_PROVIDER", "ai_coustics"), os.getenv("LIVEKIT_TURN_DETECTION_MODE", "stt"))
+    livekit_turn_detection_mode_present = "LIVEKIT_TURN_DETECTION_MODE" in os.environ
+    livekit_turn_detection_mode_raw = os.getenv("LIVEKIT_TURN_DETECTION_MODE")
+    livekit_turn_detection_mode = (
+        livekit_turn_detection_mode_raw.strip().lower()
+        if isinstance(livekit_turn_detection_mode_raw, str)
+        else "vad"
+    )
+
+    if not livekit_turn_detection_mode_present:
+        logger.info("LIVEKIT_TURN_DETECTION_MODE missing; defaulting to vad")
+
+    if livekit_turn_detection_mode in {"vad", "stt", "default"}:
+        resolved_livekit_turn_detection_mode = livekit_turn_detection_mode
+    else:
+        logger.warning(
+            "Unknown LIVEKIT_TURN_DETECTION_MODE=%s. Falling back to vad.",
+            livekit_turn_detection_mode,
+        )
+        resolved_livekit_turn_detection_mode = "vad"
+
+    logger.info(
+        "Startup provider config: STT_PROVIDER=%s VAD_PROVIDER(raw)=%s",
+        STT_PROVIDER,
+        os.getenv("VAD_PROVIDER", "ai_coustics"),
+    )
+    logger.info(
+        "LIVEKIT_TURN_DETECTION_MODE present=%s raw=%s resolved=%s",
+        livekit_turn_detection_mode_present,
+        livekit_turn_detection_mode_raw if livekit_turn_detection_mode_present else "missing",
+        resolved_livekit_turn_detection_mode,
+    )
+    logger.info(
+        "Railway context: service=%s environment=%s deployment=%s",
+        os.getenv("RAILWAY_SERVICE_NAME", "n/a"),
+        os.getenv("RAILWAY_ENVIRONMENT_NAME", "n/a"),
+        os.getenv("RAILWAY_DEPLOYMENT_ID", "n/a"),
+    )
 
     interruption_options: InterruptionOptions = {
         "enabled": True,
@@ -762,16 +700,16 @@ async def entrypoint(ctx: JobContext):
         "vad": build_vad(),
     }
 
-    resolved_turn_detection_mode = "multilingual"
+    resolved_turn_detection_mode = "unknown"
     if STT_PROVIDER == "deepgram_flux":
-        if LIVEKIT_TURN_DETECTION_MODE == "stt":
+        if resolved_livekit_turn_detection_mode == "stt":
             session_kwargs["turn_handling"] = TurnHandlingOptions(
                 turn_detection="stt",
                 interruption=interruption_options,
             )
             resolved_turn_detection_mode = "stt"
             logger.info("Using Flux STT-based turn detection")
-        elif LIVEKIT_TURN_DETECTION_MODE == "vad":
+        elif resolved_livekit_turn_detection_mode == "vad":
             try:
                 session_kwargs["turn_handling"] = TurnHandlingOptions(
                     turn_detection="vad",
@@ -786,19 +724,9 @@ async def entrypoint(ctx: JobContext):
                     interruption=interruption_options,
                 )
                 resolved_turn_detection_mode = "stt"
-        elif LIVEKIT_TURN_DETECTION_MODE == "default":
+        elif resolved_livekit_turn_detection_mode == "default":
             resolved_turn_detection_mode = "default"
             logger.info("Using LiveKit default turn handling for Deepgram Flux")
-        else:
-            logger.warning(
-                "Unknown LIVEKIT_TURN_DETECTION_MODE=%s. Falling back to stt.",
-                LIVEKIT_TURN_DETECTION_MODE,
-            )
-            session_kwargs["turn_handling"] = TurnHandlingOptions(
-                turn_detection="stt",
-                interruption=interruption_options,
-            )
-            resolved_turn_detection_mode = "stt"
 
         logger.info(
             "Using Flux turn handling config: turn_detection_mode=%s interruption=%s resume_false_interruption=%s",
@@ -806,11 +734,24 @@ async def entrypoint(ctx: JobContext):
             interruption_options,
             interruption_options.get("resume_false_interruption"),
         )
+    elif STT_PROVIDER == "mistral":
+        session_kwargs["turn_handling"] = TurnHandlingOptions(
+            turn_detection="vad",
+            interruption=interruption_options,
+        )
+        resolved_turn_detection_mode = "vad"
+        logger.info("Using Mistral VAD-only turn handling")
     else:
-        session_kwargs["turn_detection"] = MultilingualModel()
-        logger.info("Using non-Flux turn handling config: turn_detection=%s", "multilingual")
+        session_kwargs["turn_handling"] = TurnHandlingOptions(
+            turn_detection="vad",
+            interruption=interruption_options,
+        )
+        resolved_turn_detection_mode = "vad"
+        logger.info("Using non-Flux VAD turn handling")
 
     session = AgentSession(**session_kwargs)
+    resolved_stt = session_kwargs.get("stt")
+    logger.info("Resolved STT type: %s", type(resolved_stt).__name__)
     resolved_vad = session_kwargs.get("vad")
     logger.info("Resolved VAD provider: provider=%s vad_type=%s", VAD_PROVIDER, type(resolved_vad).__name__)
     logger.info("Resolved turn detection mode: %s", resolved_turn_detection_mode)
