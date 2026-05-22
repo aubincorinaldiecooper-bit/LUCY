@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+import time
 from typing import Any
 
 from dotenv import load_dotenv
@@ -87,6 +88,9 @@ def attach_session_diagnostics(session: AgentSession) -> None:
     active_speech_handles: dict[str, object] = {}
     _local_speech_ids: dict[int, str] = {}
     payload_debug_logged = False
+    speech_start_times: dict[str, float] = {}
+    suppressed_speech_ids: set[str] = set()
+    overlap_suppress_window_seconds = float(os.getenv("ASSISTANT_OVERLAP_SUPPRESS_WINDOW_SECONDS", "4.0"))
 
     def _resolve_speech_handle(event_or_handle: object) -> object:
         for attr in ("speech_handle", "handle", "speech"):
@@ -126,13 +130,17 @@ def attach_session_diagnostics(session: AgentSession) -> None:
         return lowered.strip()
 
     def _clear_active_handles(reason: str) -> None:
-        if active_speech_handles:
+        cleared_count = len(active_speech_handles)
+        if cleared_count or speech_start_times or suppressed_speech_ids:
             logger.warning(
-                "Clearing stale active speech handles: reason=%s cleared_count=%s",
+                "Clearing stale active speech handles: reason=%s cleared_count=%s suppressed_count=%s",
                 reason,
-                len(active_speech_handles),
+                cleared_count,
+                len(suppressed_speech_ids),
             )
-            active_speech_handles.clear()
+        active_speech_handles.clear()
+        speech_start_times.clear()
+        suppressed_speech_ids.clear()
 
 
     @session.on("speech_created")
@@ -141,26 +149,86 @@ def attach_session_diagnostics(session: AgentSession) -> None:
 
         if not payload_debug_logged:
             payload_debug_logged = True
-            attrs = ("id", "speech_id", "handle", "speech", "speech_handle", "interrupted", "add_done_callback", "interrupt", "wait_for_playout")
+            attrs = ("id", "speech_id", "handle", "speech", "speech_handle", "interrupted", "add_done_callback", "interrupt", "wait_for_playout", "cancel", "stop", "close")
             attr_presence = {name: hasattr(event_or_handle, name) for name in attrs}
-            logger.info("speech_created payload debug: type=%s attrs=%s", type(event_or_handle).__name__, attr_presence)
+            logger.info("speech_created payload debug: type=%s attrs=%s suppress_window_seconds=%s", type(event_or_handle).__name__, attr_presence, overlap_suppress_window_seconds)
 
         resolved_handle = _resolve_speech_handle(event_or_handle)
         speech_id = _speech_id(resolved_handle)
+        now = time.monotonic()
+        speech_start_times[speech_id] = now
 
+        suppressed = False
         if active_speech_handles:
-            for active_id in list(active_speech_handles.keys()):
+            previous_id = None
+            previous_started_at = None
+            for active_id in active_speech_handles.keys():
                 if active_id == speech_id:
                     continue
+                started_at = speech_start_times.get(active_id)
+                if started_at is None:
+                    continue
+                if previous_started_at is None or started_at > previous_started_at:
+                    previous_started_at = started_at
+                    previous_id = active_id
+
+            if previous_id is not None and previous_started_at is not None:
+                age_seconds = now - previous_started_at
+                if age_seconds <= overlap_suppress_window_seconds:
+                    method_used = None
+                    for method_name in ("cancel", "stop", "close", "interrupt"):
+                        method = getattr(resolved_handle, method_name, None)
+                        if callable(method):
+                            try:
+                                method()
+                                method_used = method_name
+                                break
+                            except Exception as e:
+                                logger.warning(
+                                    "Duplicate speech suppression method failed: speech_id=%s method=%s err=%s",
+                                    speech_id,
+                                    method_name,
+                                    e,
+                                )
+
+                    if method_used is not None:
+                        suppressed = True
+                        suppressed_speech_ids.add(speech_id)
+                        logger.warning(
+                            "Suppressing duplicate assistant speech overlap: kept_speech_id=%s suppressed_speech_id=%s active_count=%s method=%s",
+                            previous_id,
+                            speech_id,
+                            len(active_speech_handles),
+                            method_used,
+                        )
+                    else:
+                        logger.warning(
+                            "Possible assistant speech overlap not suppressed: previous_speech_id=%s new_speech_id=%s reason=%s active_count=%s",
+                            previous_id,
+                            speech_id,
+                            "no_supported_suppression_method",
+                            len(active_speech_handles),
+                        )
+                else:
+                    logger.warning(
+                        "Possible assistant speech overlap not suppressed: previous_speech_id=%s new_speech_id=%s reason=%s active_count=%s",
+                        previous_id,
+                        speech_id,
+                        "previous_speech_outside_suppress_window",
+                        len(active_speech_handles),
+                    )
+            else:
                 logger.warning(
-                    "Possible overlap: new speech started while previous speech active: previous_speech_id=%s new_speech_id=%s active_count=%s",
-                    active_id,
+                    "Possible assistant speech overlap not suppressed: previous_speech_id=%s new_speech_id=%s reason=%s active_count=%s",
+                    "unknown",
                     speech_id,
+                    "missing_previous_speech_start_time",
                     len(active_speech_handles),
                 )
 
-        active_speech_handles[speech_id] = resolved_handle
-        logger.info("Assistant speech started: speech_id=%s active_count=%s", speech_id, len(active_speech_handles))
+        if not suppressed:
+            active_speech_handles[speech_id] = resolved_handle
+            logger.info("Assistant speech started: speech_id=%s active_count=%s", speech_id, len(active_speech_handles))
 
         add_done_callback = getattr(resolved_handle, "add_done_callback", None)
         if callable(add_done_callback):
@@ -168,8 +236,11 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                 done_resolved_handle = _resolve_speech_handle(done_event_or_handle)
                 done_id = _speech_id(done_resolved_handle)
                 active_speech_handles.pop(done_id, None)
+                speech_start_times.pop(done_id, None)
+                was_suppressed = done_id in suppressed_speech_ids
+                suppressed_speech_ids.discard(done_id)
                 interrupted = _safe_attr(done_resolved_handle, "interrupted", "unknown")
-                logger.info("Assistant speech finished: speech_id=%s interrupted=%s active_count=%s", done_id, interrupted, len(active_speech_handles))
+                logger.info("Assistant speech finished: speech_id=%s interrupted=%s active_count=%s was_suppressed=%s", done_id, interrupted, len(active_speech_handles), was_suppressed)
 
             add_done_callback(_on_done)
         else:
