@@ -10,7 +10,6 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from livekit.agents import Agent, AgentSession, InterruptionOptions, JobContext, TurnHandlingOptions, WorkerOptions, cli, room_io
 from livekit.plugins import ai_coustics, deepgram, hume, mistralai, openai, silero
-from livekit.plugins.turn_detector.multilingual import MultilingualModel
 from tavily import TavilyClient
 
 from kokoro_plugin import KokoroTTS
@@ -701,7 +700,7 @@ async def entrypoint(ctx: JobContext):
         "vad": build_vad(),
     }
 
-    resolved_turn_detection_mode = "multilingual"
+    resolved_turn_detection_mode = "unknown"
     if STT_PROVIDER == "deepgram_flux":
         if resolved_livekit_turn_detection_mode == "stt":
             session_kwargs["turn_handling"] = TurnHandlingOptions(
@@ -735,9 +734,20 @@ async def entrypoint(ctx: JobContext):
             interruption_options,
             interruption_options.get("resume_false_interruption"),
         )
+    elif STT_PROVIDER == "mistral":
+        session_kwargs["turn_handling"] = TurnHandlingOptions(
+            turn_detection="vad",
+            interruption=interruption_options,
+        )
+        resolved_turn_detection_mode = "vad"
+        logger.info("Using Mistral VAD-only turn handling")
     else:
-        session_kwargs["turn_detection"] = MultilingualModel()
-        logger.info("Using non-Flux turn handling config: turn_detection=%s", "multilingual")
+        session_kwargs["turn_handling"] = TurnHandlingOptions(
+            turn_detection="vad",
+            interruption=interruption_options,
+        )
+        resolved_turn_detection_mode = "vad"
+        logger.info("Using non-Flux VAD turn handling")
 
     session = AgentSession(**session_kwargs)
     resolved_stt = session_kwargs.get("stt")
