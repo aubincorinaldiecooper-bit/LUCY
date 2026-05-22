@@ -8,8 +8,8 @@ const inter = Inter({
 });
 
 export const metadata: Metadata = {
-  title: "LUCY",
-  description: "Voice agent",
+  title: "The Academy for Imaginary Friends",
+  description: "Imaginary friends in digital space, built for low pressure conversations.",
 };
 
 export const viewport: Viewport = {
