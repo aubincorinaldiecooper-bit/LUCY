@@ -834,6 +834,12 @@ wheels = [
 codecs = [
     { name = "numpy" },
 ]
+deepgram = [
+    { name = "livekit-plugins-deepgram" },
+]
+hume = [
+    { name = "livekit-plugins-hume" },
+]
 images = [
     { name = "pillow" },
 ]
@@ -896,6 +902,49 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/72/08/93ed14e757f3bb3d22c40e11900ea2815883b7beb331fe758c8d40ea1dd0/livekit_blingfire-1.1.0-cp314-cp314t-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:20b95b2c15c4a1af4e68c1aa7d885bf295f89ee6eb5c1a1fdfa315a51795b30d", size = 170081, upload-time = "2025-12-16T00:48:31.268Z" },
     { url = "https://files.pythonhosted.org/packages/0f/6d/b2a23cafabf55561c463490b3a87e323640259ae340e6db26bb71e0fa26d/livekit_blingfire-1.1.0-cp314-cp314t-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:6c13ef26e5234674ac353b7cfaadeb23468e951eb07461b6b6c77f79cd5ff763", size = 176755, upload-time = "2025-12-16T00:48:32.294Z" },
     { url = "https://files.pythonhosted.org/packages/60/93/c00c175d2187160bdb2dac6b338203d51396307dfce23f03defb3b5e5572/livekit_blingfire-1.1.0-cp314-cp314t-win_amd64.whl", hash = "sha256:c91b2315e0497383384304d33554d70b8a63dec5ad96cd43437c67f4172077cf", size = 141072, upload-time = "2025-12-16T00:48:33.423Z" },
+]
+
+[[package]]
+name = "livekit-plugins-ai-coustics"
+version = "0.2.15"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "livekit" },
+    { name = "livekit-agents" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/22/bc/b70e0fe118bff65b09997a1ce3fba2537f929d02ad94e7e63654cd90c54a/livekit_plugins_ai_coustics-0.2.15.tar.gz", hash = "sha256:60704ee5354a062e08f8091dad99eeb930c7edb61a505fb686c307e3a36e36b4", size = 18467, upload-time = "2026-05-22T15:07:03.557Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/52/30/9b116dc8018c4a5902f10a8f15e9c6e4d680a3f510be46f30b9c19fd98a9/livekit_plugins_ai_coustics-0.2.15-cp310-abi3-macosx_10_9_x86_64.whl", hash = "sha256:8f59834eafe13e38d5ee381450053cf4dec83ee34adc4e42ad046d150096f4d8", size = 70533524, upload-time = "2026-05-22T15:06:42.396Z" },
+    { url = "https://files.pythonhosted.org/packages/d9/07/39a83256a8e8845dc1cb38bd2f68a32c6327b688e80e720119405a9d347b/livekit_plugins_ai_coustics-0.2.15-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:05a7d35dcc516152d298a683c52b48c0097a129ded394afc7eb63541070f11d8", size = 70711341, upload-time = "2026-05-22T15:06:48.528Z" },
+    { url = "https://files.pythonhosted.org/packages/44/fb/a13307fcd74a15903537d51f8e24078073d5a9b408643fdf60165328a0b1/livekit_plugins_ai_coustics-0.2.15-cp310-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:aab3ba0403680471530adfe8fa4460222d315f3a4b1bc3a741018b727c46ee18", size = 70343065, upload-time = "2026-05-22T15:06:52.682Z" },
+    { url = "https://files.pythonhosted.org/packages/dd/94/0fa72899cb0eb35722faed75562b70afa7aa4e23f2eed1944145e171b05a/livekit_plugins_ai_coustics-0.2.15-cp310-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:cfa3dc21d810625c0eab962da8728329b1ca5598caa23267c57082e869780f0c", size = 70686031, upload-time = "2026-05-22T15:06:56.56Z" },
+    { url = "https://files.pythonhosted.org/packages/55/b3/392f4c6cbf6b9d8e1f6f4e61116dbf521e873a4e6d6f80dc3315268bb5d5/livekit_plugins_ai_coustics-0.2.15-cp310-abi3-win_amd64.whl", hash = "sha256:b961901c511be28add75c7ef584c2d31d07072975fceab4b03a0dd70e1c5855b", size = 70098340, upload-time = "2026-05-22T15:07:00.203Z" },
+]
+
+[[package]]
+name = "livekit-plugins-deepgram"
+version = "1.5.7"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "livekit-agents", extra = ["codecs"] },
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e9/00/b766d9737a16e38e63a1502352913cd719ee25bf17ea69a175ab926b7301/livekit_plugins_deepgram-1.5.7.tar.gz", hash = "sha256:37d4aedcb7a26366898a9d4b8be9d69fc05541bd4ea7310bdd300c37fc295689", size = 18033, upload-time = "2026-04-30T20:38:55.195Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/17/db/b5e3fa254a2a7ad40a4d3c62cfe45f0aa57a959abdded87aa9fac2fd889e/livekit_plugins_deepgram-1.5.7-py3-none-any.whl", hash = "sha256:1bd45f40ff4c449bb63e7e2b5aa50818f4801ef81f2d2d84dc51f5ccc2f88c9c", size = 22820, upload-time = "2026-04-30T20:38:54.1Z" },
+]
+
+[[package]]
+name = "livekit-plugins-hume"
+version = "1.5.7"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "aiohttp" },
+    { name = "livekit-agents" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/58/5e/2c7450b83ea3ea7cf1306aa577aa19a151edeada304a797df918ffe9821f/livekit_plugins_hume-1.5.7.tar.gz", hash = "sha256:6fd6c585e4954c4667f0071e0441c7339adfbdb0dd083e8af03c4af15d580402", size = 6365, upload-time = "2026-04-30T20:39:24.735Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b3/3d/cadae06b65e2e55eb8d9d9479684d8848d1ee153ad66ddd2628f60436e54/livekit_plugins_hume-1.5.7-py3-none-any.whl", hash = "sha256:18c7f478f2aede7a91f8572a245ae0f8fe7d9276559798f30d07f5893e854d1c", size = 6804, upload-time = "2026-04-30T20:39:23.342Z" },
 ]
 
 [[package]]
@@ -973,8 +1022,9 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "fastapi" },
-    { name = "livekit-agents", extra = ["mistralai", "openai", "silero", "turn-detector"] },
+    { name = "livekit-agents", extra = ["deepgram", "hume", "mistralai", "openai", "silero", "turn-detector"] },
     { name = "livekit-api" },
+    { name = "livekit-plugins-ai-coustics" },
     { name = "python-dotenv" },
     { name = "tavily-python" },
     { name = "uvicorn" },
@@ -983,8 +1033,9 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "fastapi" },
-    { name = "livekit-agents", extras = ["mistralai", "openai", "silero", "turn-detector"], specifier = "~=1.5" },
+    { name = "livekit-agents", extras = ["mistralai", "openai", "silero", "turn-detector", "deepgram", "hume"], specifier = "~=1.5" },
     { name = "livekit-api" },
+    { name = "livekit-plugins-ai-coustics", specifier = ">=0.2.15" },
     { name = "python-dotenv" },
     { name = "tavily-python" },
     { name = "uvicorn" },
