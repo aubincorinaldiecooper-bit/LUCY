@@ -67,6 +67,7 @@ SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT)
 TTS_PROVIDER = os.getenv("TTS_PROVIDER", "deepgram").strip().lower()
 STT_PROVIDER = os.getenv("STT_PROVIDER", "deepgram_flux").strip().lower()
 VAD_PROVIDER = os.getenv("VAD_PROVIDER", "ai_coustics").strip().lower()
+LIVEKIT_TURN_DETECTION_MODE = os.getenv("LIVEKIT_TURN_DETECTION_MODE", "stt").strip().lower()
 
 _speech_counter = 0
 
@@ -544,6 +545,46 @@ def build_stt():
     raise RuntimeError("Unsupported STT_PROVIDER. Use 'deepgram_flux', 'deepgram_nova3', or 'mistral'.")
 
 
+def build_vad():
+    if VAD_PROVIDER == "ai_coustics":
+        logger.info("Using ai-coustics VAD provider")
+        return ai_coustics.VAD()
+
+    if VAD_PROVIDER == "silero":
+        logger.info("Using Silero VAD provider")
+        return silero.VAD.load()
+
+    logger.warning("Unknown VAD_PROVIDER=%s. Falling back to ai-coustics VAD provider", VAD_PROVIDER)
+    return ai_coustics.VAD()
+
+
+def build_stt():
+    if STT_PROVIDER == "deepgram_flux":
+        logger.info("Using Deepgram Flux STT provider")
+        return deepgram.STTv2(
+            model=os.getenv("DEEPGRAM_STT_MODEL", "flux-general-en"),
+            eager_eot_threshold=float(os.getenv("DEEPGRAM_EAGER_EOT_THRESHOLD", "0.4")),
+            eot_threshold=float(os.getenv("DEEPGRAM_EOT_THRESHOLD", "0.7")),
+            eot_timeout_ms=int(os.getenv("DEEPGRAM_EOT_TIMEOUT_MS", "700")),
+        )
+
+    if STT_PROVIDER == "deepgram_nova3":
+        logger.info("Using Deepgram Nova-3 STT provider")
+        return deepgram.STT(
+            model=os.getenv("DEEPGRAM_STT_MODEL", "nova-3"),
+            language=os.getenv("DEEPGRAM_STT_LANGUAGE", "en"),
+        )
+
+    if STT_PROVIDER == "mistral":
+        logger.info("Using Mistral Voxtral STT provider")
+        return mistralai.STT(
+            model=os.getenv("MISTRAL_STT_MODEL", "voxtral-mini-transcribe-realtime-2602"),
+            target_streaming_delay_ms=int(os.getenv("MISTRAL_TARGET_STREAMING_DELAY_MS", "160")),
+        )
+
+    raise RuntimeError("Unsupported STT_PROVIDER. Use 'deepgram_flux', 'deepgram_nova3', or 'mistral'.")
+
+
 def build_stt():
     if STT_PROVIDER == "deepgram_flux":
         logger.info("Using Deepgram Flux STT provider")
@@ -624,7 +665,7 @@ async def entrypoint(ctx: JobContext):
     # TODO: Re-enable Tavily using LiveKit's supported function-tool pattern.
     logger.warning("Skipping Tavily tools for MVP voice path")
 
-    logger.info("Startup provider config: STT_PROVIDER=%s VAD_PROVIDER(raw)=%s", STT_PROVIDER, os.getenv("VAD_PROVIDER", "ai_coustics"))
+    logger.info("Startup provider config: STT_PROVIDER=%s VAD_PROVIDER(raw)=%s LIVEKIT_TURN_DETECTION_MODE(raw)=%s", STT_PROVIDER, os.getenv("VAD_PROVIDER", "ai_coustics"), os.getenv("LIVEKIT_TURN_DETECTION_MODE", "stt"))
 
     interruption_options: InterruptionOptions = {
         "enabled": True,
@@ -641,15 +682,47 @@ async def entrypoint(ctx: JobContext):
         "vad": build_vad(),
     }
 
+    resolved_turn_detection_mode = "multilingual"
     if STT_PROVIDER == "deepgram_flux":
-        # Flux has STT-native end-of-turn detection; do not pass deprecated turn_detection for this provider.
-        session_kwargs["turn_handling"] = TurnHandlingOptions(
-            turn_detection="stt",
-            interruption=interruption_options,
-        )
+        if LIVEKIT_TURN_DETECTION_MODE == "stt":
+            session_kwargs["turn_handling"] = TurnHandlingOptions(
+                turn_detection="stt",
+                interruption=interruption_options,
+            )
+            resolved_turn_detection_mode = "stt"
+            logger.info("Using Flux STT-based turn detection")
+        elif LIVEKIT_TURN_DETECTION_MODE == "vad":
+            try:
+                session_kwargs["turn_handling"] = TurnHandlingOptions(
+                    turn_detection="vad",
+                    interruption=interruption_options,
+                )
+                resolved_turn_detection_mode = "vad"
+                logger.info("Using Flux VAD-based turn detection")
+            except Exception as e:
+                logger.warning("VAD turn_detection mode unavailable in this LiveKit version, falling back to stt: %s", e)
+                session_kwargs["turn_handling"] = TurnHandlingOptions(
+                    turn_detection="stt",
+                    interruption=interruption_options,
+                )
+                resolved_turn_detection_mode = "stt"
+        elif LIVEKIT_TURN_DETECTION_MODE == "default":
+            resolved_turn_detection_mode = "default"
+            logger.info("Using LiveKit default turn handling for Deepgram Flux")
+        else:
+            logger.warning(
+                "Unknown LIVEKIT_TURN_DETECTION_MODE=%s. Falling back to stt.",
+                LIVEKIT_TURN_DETECTION_MODE,
+            )
+            session_kwargs["turn_handling"] = TurnHandlingOptions(
+                turn_detection="stt",
+                interruption=interruption_options,
+            )
+            resolved_turn_detection_mode = "stt"
+
         logger.info(
-            "Using Flux turn handling config: turn_detection=%s interruption=%s resume_false_interruption=%s",
-            "stt",
+            "Using Flux turn handling config: turn_detection_mode=%s interruption=%s resume_false_interruption=%s",
+            resolved_turn_detection_mode,
             interruption_options,
             interruption_options.get("resume_false_interruption"),
         )
@@ -660,6 +733,7 @@ async def entrypoint(ctx: JobContext):
     session = AgentSession(**session_kwargs)
     resolved_vad = session_kwargs.get("vad")
     logger.info("Resolved VAD provider: provider=%s vad_type=%s", VAD_PROVIDER, type(resolved_vad).__name__)
+    logger.info("Resolved turn detection mode: %s", resolved_turn_detection_mode)
 
     attach_session_diagnostics(session)
     _attach_optional_interruption_diagnostics(session)
