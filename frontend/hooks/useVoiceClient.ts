@@ -29,13 +29,94 @@ export function useVoiceClient() {
   const [isMuted, setIsMuted] = useState(false);
   const roomRef = useRef<Room | null>(null);
   const remoteAudioElsRef = useRef<Set<HTMLMediaElement>>(new Set());
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const gainNodeRef = useRef<GainNode | null>(null);
+  const mediaSourceNodesRef = useRef<Map<HTMLMediaElement, MediaElementAudioSourceNode>>(new Map());
+
+  const getRemoteAudioGain = useCallback(() => {
+    const raw = Number.parseFloat(process.env.NEXT_PUBLIC_REMOTE_AUDIO_GAIN ?? "1.35");
+    if (!Number.isFinite(raw)) return 1.35;
+    return Math.max(1.0, Math.min(2.0, raw));
+  }, []);
+
+  const setupAudioGainForElement = useCallback((audioElement: HTMLMediaElement) => {
+    if (typeof window === "undefined") return;
+    const AudioContextCtor = window.AudioContext || (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioContextCtor) return;
+
+    try {
+      const audioContext = audioContextRef.current ?? new AudioContextCtor();
+      audioContextRef.current = audioContext;
+
+      let gainNode = gainNodeRef.current;
+      if (!gainNode) {
+        gainNode = audioContext.createGain();
+        gainNode.connect(audioContext.destination);
+        gainNodeRef.current = gainNode;
+      }
+      gainNode.gain.value = getRemoteAudioGain();
+      if (!mediaSourceNodesRef.current.has(audioElement)) {
+        const sourceNode = audioContext.createMediaElementSource(audioElement);
+        sourceNode.connect(gainNode);
+        mediaSourceNodesRef.current.set(audioElement, sourceNode);
+      }
+
+      if (audioContext.state === "suspended") {
+        void audioContext.resume().catch(() => {
+          // Browser autoplay policies may delay resume until user gesture.
+        });
+      }
+    } catch (err) {
+      console.warn("Failed to setup remote audio gain", err);
+    }
+  }, [getRemoteAudioGain]);
+
+  const cleanupAudioNodeForElement = useCallback((audioElement: HTMLMediaElement) => {
+    const sourceNode = mediaSourceNodesRef.current.get(audioElement);
+    if (!sourceNode) return;
+    try {
+      sourceNode.disconnect();
+    } catch {
+      // best-effort disconnect
+    }
+    mediaSourceNodesRef.current.delete(audioElement);
+  }, []);
+
+  const teardownAudioGainResources = useCallback(() => {
+    mediaSourceNodesRef.current.forEach((sourceNode) => {
+      try {
+        sourceNode.disconnect();
+      } catch {
+        // best-effort disconnect
+      }
+    });
+    mediaSourceNodesRef.current.clear();
+
+    if (gainNodeRef.current) {
+      try {
+        gainNodeRef.current.disconnect();
+      } catch {
+        // best-effort disconnect
+      }
+      gainNodeRef.current = null;
+    }
+
+    if (audioContextRef.current) {
+      void audioContextRef.current.close().catch(() => {
+        // best-effort close
+      });
+      audioContextRef.current = null;
+    }
+  }, []);
 
   const clearRemoteAudioElements = useCallback(() => {
     for (const el of remoteAudioElsRef.current) {
+      cleanupAudioNodeForElement(el);
       el.remove();
     }
     remoteAudioElsRef.current.clear();
-  }, []);
+    teardownAudioGainResources();
+  }, [cleanupAudioNodeForElement, teardownAudioGainResources]);
 
   const disconnect = useCallback(async () => {
     const room = roomRef.current;
@@ -64,10 +145,12 @@ export function useVoiceClient() {
         if (track.kind !== Track.Kind.Audio) return;
         const audioElement = (track as RemoteTrack).attach();
         audioElement.autoplay = true;
+        audioElement.volume = 1.0;
         audioElement.setAttribute("playsinline", "true");
         audioElement.style.display = "none";
         document.body.appendChild(audioElement);
         remoteAudioElsRef.current.add(audioElement);
+        setupAudioGainForElement(audioElement);
         audioElement.play().catch((err) => {
           console.warn("Remote audio autoplay was blocked by the browser", err);
         });
@@ -76,6 +159,7 @@ export function useVoiceClient() {
         if (track.kind !== Track.Kind.Audio) return;
         const detachedEls = (track as RemoteTrack).detach();
         detachedEls.forEach((el) => {
+          cleanupAudioNodeForElement(el);
           remoteAudioElsRef.current.delete(el);
           el.remove();
         });
@@ -93,7 +177,7 @@ export function useVoiceClient() {
       setState("idle");
       roomRef.current = null;
     }
-  }, [clearRemoteAudioElements, isMuted]);
+  }, [clearRemoteAudioElements, cleanupAudioNodeForElement, isMuted, setupAudioGainForElement]);
 
   const toggleMute = useCallback(async () => {
     const next = !isMuted;
