@@ -905,6 +905,23 @@ wheels = [
 ]
 
 [[package]]
+name = "livekit-plugins-ai-coustics"
+version = "0.2.15"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "livekit" },
+    { name = "livekit-agents" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/22/bc/b70e0fe118bff65b09997a1ce3fba2537f929d02ad94e7e63654cd90c54a/livekit_plugins_ai_coustics-0.2.15.tar.gz", hash = "sha256:60704ee5354a062e08f8091dad99eeb930c7edb61a505fb686c307e3a36e36b4", size = 18467, upload-time = "2026-05-22T15:07:03.557Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/52/30/9b116dc8018c4a5902f10a8f15e9c6e4d680a3f510be46f30b9c19fd98a9/livekit_plugins_ai_coustics-0.2.15-cp310-abi3-macosx_10_9_x86_64.whl", hash = "sha256:8f59834eafe13e38d5ee381450053cf4dec83ee34adc4e42ad046d150096f4d8", size = 70533524, upload-time = "2026-05-22T15:06:42.396Z" },
+    { url = "https://files.pythonhosted.org/packages/d9/07/39a83256a8e8845dc1cb38bd2f68a32c6327b688e80e720119405a9d347b/livekit_plugins_ai_coustics-0.2.15-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:05a7d35dcc516152d298a683c52b48c0097a129ded394afc7eb63541070f11d8", size = 70711341, upload-time = "2026-05-22T15:06:48.528Z" },
+    { url = "https://files.pythonhosted.org/packages/44/fb/a13307fcd74a15903537d51f8e24078073d5a9b408643fdf60165328a0b1/livekit_plugins_ai_coustics-0.2.15-cp310-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:aab3ba0403680471530adfe8fa4460222d315f3a4b1bc3a741018b727c46ee18", size = 70343065, upload-time = "2026-05-22T15:06:52.682Z" },
+    { url = "https://files.pythonhosted.org/packages/dd/94/0fa72899cb0eb35722faed75562b70afa7aa4e23f2eed1944145e171b05a/livekit_plugins_ai_coustics-0.2.15-cp310-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:cfa3dc21d810625c0eab962da8728329b1ca5598caa23267c57082e869780f0c", size = 70686031, upload-time = "2026-05-22T15:06:56.56Z" },
+    { url = "https://files.pythonhosted.org/packages/55/b3/392f4c6cbf6b9d8e1f6f4e61116dbf521e873a4e6d6f80dc3315268bb5d5/livekit_plugins_ai_coustics-0.2.15-cp310-abi3-win_amd64.whl", hash = "sha256:b961901c511be28add75c7ef584c2d31d07072975fceab4b03a0dd70e1c5855b", size = 70098340, upload-time = "2026-05-22T15:07:00.203Z" },
+]
+
+[[package]]
 name = "livekit-plugins-deepgram"
 version = "1.5.7"
 source = { registry = "https://pypi.org/simple" }
@@ -1007,6 +1024,7 @@ dependencies = [
     { name = "fastapi" },
     { name = "livekit-agents", extra = ["deepgram", "hume", "mistralai", "openai", "silero", "turn-detector"] },
     { name = "livekit-api" },
+    { name = "livekit-plugins-ai-coustics" },
     { name = "python-dotenv" },
     { name = "tavily-python" },
     { name = "uvicorn" },
@@ -1017,6 +1035,7 @@ requires-dist = [
     { name = "fastapi" },
     { name = "livekit-agents", extras = ["mistralai", "openai", "silero", "turn-detector", "deepgram", "hume"], specifier = "~=1.5" },
     { name = "livekit-api" },
+    { name = "livekit-plugins-ai-coustics", specifier = ">=0.2.15" },
     { name = "python-dotenv" },
     { name = "tavily-python" },
     { name = "uvicorn" },

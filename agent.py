@@ -7,8 +7,8 @@ from typing import Any
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from livekit.agents import Agent, AgentSession, InterruptionOptions, JobContext, TurnHandlingOptions, WorkerOptions, cli
-from livekit.plugins import deepgram, hume, mistralai, openai, silero
+from livekit.agents import Agent, AgentSession, InterruptionOptions, JobContext, TurnHandlingOptions, WorkerOptions, cli, room_io
+from livekit.plugins import ai_coustics, deepgram, hume, mistralai, openai, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 from tavily import TavilyClient
 
@@ -298,6 +298,62 @@ def env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "on")
 
 
+
+AI_COUSTICS_ENABLED = env_bool("AI_COUSTICS_ENABLED", True)
+
+
+def _resolve_ai_coustics_model(model_name: str):
+    normalized = (model_name or "").strip().upper()
+    model_map = {
+        "QUAIL_VF_S": ai_coustics.EnhancerModel.QUAIL_VF_S,
+        "QUAIL_VF_L": ai_coustics.EnhancerModel.QUAIL_VF_L,
+        "QUAIL_L": ai_coustics.EnhancerModel.QUAIL_L,
+    }
+    if normalized in model_map:
+        return model_map[normalized], normalized
+
+    logger.warning("Unknown AI_COUSTICS_MODEL provided: %s. Falling back to QUAIL_VF_S", model_name)
+    return ai_coustics.EnhancerModel.QUAIL_VF_S, "QUAIL_VF_S"
+
+
+def build_room_options() -> room_io.RoomOptions | None:
+    if not AI_COUSTICS_ENABLED:
+        logger.info("ai-coustics disabled: AI_COUSTICS_ENABLED=false")
+        return None
+
+    selected_model, selected_model_name = _resolve_ai_coustics_model(os.getenv("AI_COUSTICS_MODEL", "QUAIL_VF_S"))
+    raw_level = os.getenv("AI_COUSTICS_ENHANCEMENT_LEVEL", "0.8")
+    try:
+        enhancement_level = float(raw_level)
+    except ValueError:
+        logger.warning("Invalid AI_COUSTICS_ENHANCEMENT_LEVEL=%s. Falling back to 0.8", raw_level)
+        enhancement_level = 0.8
+    enhancement_level = max(0.0, min(1.0, enhancement_level))
+
+    logger.info(
+        "ai-coustics configuration: enabled=%s model=%s enhancement_level=%s",
+        True,
+        selected_model_name,
+        enhancement_level,
+    )
+
+    try:
+        if hasattr(ai_coustics, "ModelParameters"):
+            model_parameters = ai_coustics.ModelParameters(enhancement_level=enhancement_level)
+            enhancer = ai_coustics.audio_enhancement(model=selected_model, model_parameters=model_parameters)
+        else:
+            logger.warning("ai-coustics ModelParameters unavailable; using model-only audio enhancement")
+            enhancer = ai_coustics.audio_enhancement(model=selected_model)
+    except TypeError as e:
+        logger.warning("ai-coustics model_parameters unsupported in installed package, using model-only enhancement: %s", e)
+        enhancer = ai_coustics.audio_enhancement(model=selected_model)
+
+    return room_io.RoomOptions(
+        audio_input=room_io.AudioInputOptions(
+            noise_cancellation=enhancer,
+        )
+    )
+
 def _resolve_hume_model_version() -> str | None:
     hume_model = os.getenv("HUME_MODEL", "octave-2").strip().lower()
     if not hume_model:
@@ -496,7 +552,13 @@ async def entrypoint(ctx: JobContext):
     attach_session_diagnostics(session)
     _attach_optional_interruption_diagnostics(session)
 
-    await session.start(room=ctx.room, agent=LucyAgent())
+    room_options = build_room_options()
+    if room_options is not None:
+        logger.info("Starting session with ai-coustics room_options attached")
+        await session.start(room=ctx.room, agent=LucyAgent(), room_options=room_options)
+    else:
+        logger.info("Starting session without ai-coustics room_options")
+        await session.start(room=ctx.room, agent=LucyAgent())
     logger.info("About to generate greeting reply")
     greeting_handle = await session.generate_reply(
         instructions="Greet the user in one short casual sentence as Crash. Say: Yo. What’s going on?",
