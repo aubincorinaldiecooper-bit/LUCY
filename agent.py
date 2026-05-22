@@ -543,6 +543,33 @@ def build_stt():
 
     raise RuntimeError("Unsupported STT_PROVIDER. Use 'deepgram_flux', 'deepgram_nova3', or 'mistral'.")
 
+
+def build_stt():
+    if STT_PROVIDER == "deepgram_flux":
+        logger.info("Using Deepgram Flux STT provider")
+        return deepgram.STTv2(
+            model=os.getenv("DEEPGRAM_STT_MODEL", "flux-general-en"),
+            eager_eot_threshold=float(os.getenv("DEEPGRAM_EAGER_EOT_THRESHOLD", "0.4")),
+            eot_threshold=float(os.getenv("DEEPGRAM_EOT_THRESHOLD", "0.7")),
+            eot_timeout_ms=int(os.getenv("DEEPGRAM_EOT_TIMEOUT_MS", "700")),
+        )
+
+    if STT_PROVIDER == "deepgram_nova3":
+        logger.info("Using Deepgram Nova-3 STT provider")
+        return deepgram.STT(
+            model=os.getenv("DEEPGRAM_STT_MODEL", "nova-3"),
+            language=os.getenv("DEEPGRAM_STT_LANGUAGE", "en"),
+        )
+
+    if STT_PROVIDER == "mistral":
+        logger.info("Using Mistral Voxtral STT provider")
+        return mistralai.STT(
+            model=os.getenv("MISTRAL_STT_MODEL", "voxtral-mini-transcribe-realtime-2602"),
+            target_streaming_delay_ms=int(os.getenv("MISTRAL_TARGET_STREAMING_DELAY_MS", "160")),
+        )
+
+    raise RuntimeError("Unsupported STT_PROVIDER. Use 'deepgram_flux', 'deepgram_nova3', or 'mistral'.")
+
 def _tavily() -> TavilyClient:
     return TavilyClient(api_key=os.getenv("TAVILY_API_KEY", ""))
 
