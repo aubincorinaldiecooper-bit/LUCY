@@ -692,6 +692,15 @@ async def entrypoint(ctx: JobContext):
         "resume_false_interruption": env_bool("LIVEKIT_RESUME_FALSE_INTERRUPTION", False),
         "false_interruption_timeout": 1.8,
     }
+    endpointing_mode = os.getenv("LIVEKIT_ENDPOINTING_MODE", "fixed")
+    endpointing_min_delay = float(os.getenv("LIVEKIT_ENDPOINTING_MIN_DELAY", "0.4"))
+    endpointing_max_delay = float(os.getenv("LIVEKIT_ENDPOINTING_MAX_DELAY", "1.5"))
+    logger.info(
+        "Endpointing config: mode=%s min_delay=%s max_delay=%s",
+        endpointing_mode,
+        endpointing_min_delay,
+        endpointing_max_delay,
+    )
 
     session_kwargs: dict[str, Any] = {
         "stt": build_stt(),
@@ -738,6 +747,11 @@ async def entrypoint(ctx: JobContext):
         session_kwargs["turn_handling"] = TurnHandlingOptions(
             turn_detection="vad",
             interruption=interruption_options,
+            endpointing={
+                "mode": endpointing_mode,
+                "min_delay": endpointing_min_delay,
+                "max_delay": endpointing_max_delay,
+            },
         )
         resolved_turn_detection_mode = "vad"
         logger.info("Using Mistral VAD-only turn handling")
