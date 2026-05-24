@@ -5,6 +5,7 @@ import logging
 import time
 from typing import Any, AsyncIterable
 
+import aiohttp
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
@@ -121,6 +122,37 @@ def _safe_error_summary(error: object) -> dict[str, str]:
         summary["message"] = _redact_sensitive_text(message)
 
     return summary
+
+
+def _extract_text_for_debug(obj: object) -> str:
+    if obj is None:
+        return ""
+    item = getattr(obj, "item", None)
+    target = item if item is not None else obj
+
+    text_content = getattr(target, "text_content", None)
+    if isinstance(text_content, str):
+        return text_content
+
+    text = getattr(target, "text", None)
+    if isinstance(text, str):
+        return text
+
+    content = getattr(target, "content", None)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            else:
+                part_text = getattr(part, "text", None)
+                if isinstance(part_text, str):
+                    parts.append(part_text)
+        return " ".join(p for p in parts if p).strip()
+
+    return str(content or "")
 
 
 def attach_session_diagnostics(session: AgentSession) -> None:
@@ -432,9 +464,41 @@ def attach_session_diagnostics(session: AgentSession) -> None:
 
     @session.on("conversation_item_added")
     def _on_conversation_item_added(item: object) -> None:
-        role = _safe_attr(item, "role")
-        interrupted = _safe_attr(item, "interrupted")
+        event_item = getattr(item, "item", None)
+        target = event_item if event_item is not None else item
+        role = _safe_attr(target, "role")
+        interrupted = _safe_attr(target, "interrupted")
+        if PIPELINE_TEXT_DEBUG:
+            text_str = _extract_text_for_debug(target)
+            logger.info(
+                "Conversation item added: role=%s interrupted=%s text_length=%s preview=%s",
+                role,
+                interrupted,
+                len(text_str),
+                _redact_sensitive_text(text_str)[:200],
+            )
+            return
         logger.info("Conversation item added: role=%s interrupted=%s", role, interrupted)
+
+    @session.on("user_input_transcribed")
+    def _on_user_input_transcribed(event: object) -> None:
+        if not PIPELINE_TEXT_DEBUG:
+            return
+        final = getattr(event, "final", getattr(event, "is_final", "n/a"))
+        language = _safe_attr(event, "language", "n/a")
+        speaker_id = getattr(event, "speaker_id", None)
+        transcript = getattr(event, "transcript", None)
+        if transcript is None:
+            transcript = getattr(event, "text", "")
+        transcript_str = str(transcript or "")
+        logger.info(
+            "STT debug: final=%s language=%s speaker_id_present=%s transcript_length=%s preview=%s",
+            final,
+            language,
+            speaker_id is not None,
+            len(transcript_str),
+            _redact_sensitive_text(transcript_str)[:200],
+        )
 
     @session.on("error")
     def _on_error(error: object) -> None:
@@ -460,6 +524,9 @@ def env_bool(name: str, default: bool = False) -> bool:
 
 
 AI_COUSTICS_ENABLED = env_bool("AI_COUSTICS_ENABLED", True)
+SPOKEN_TEXT_NORMALIZATION = env_bool("SPOKEN_TEXT_NORMALIZATION", False)
+TTS_TEXT_DEBUG = env_bool("TTS_TEXT_DEBUG", False)
+PIPELINE_TEXT_DEBUG = env_bool("PIPELINE_TEXT_DEBUG", False)
 
 
 def _resolve_ai_coustics_model(model_name: str):
@@ -560,19 +627,31 @@ def build_tts():
             raise RuntimeError("HUME_VOICE_ID or HUME_VOICE_NAME is required when HUME_INSTANT_MODE=true")
 
         hume_speed = float(os.getenv("HUME_SPEED", "0.9"))
+        hume_tts_debug_http = env_bool("HUME_TTS_DEBUG_HTTP", False)
         hume_description = os.getenv("HUME_DESCRIPTION") or (
             "A warm, calm, natural companion voice. Speak with relaxed pacing, soft sentence endings, "
             "and brief natural pauses between thoughts. Do not sound rushed, clipped, or abrupt at the end of sentences."
         )
+        hume_description_present = bool(hume_description)
+        hume_description_length = len(hume_description)
         hume_trailing_silence = float(os.getenv("HUME_TRAILING_SILENCE", "0.25"))
+        hume_model_version = _resolve_hume_model_version()
         hume_tts_signature = inspect.signature(hume.TTS)
         hume_tts_kwargs: dict[str, Any] = {
             "voice": voice,
-            "model_version": _resolve_hume_model_version(),
-            "description": hume_description,
+            "model_version": hume_model_version,
             "speed": hume_speed,
             "instant_mode": instant_mode,
         }
+        description_applied = hume_model_version != "2"
+        if description_applied:
+            hume_tts_kwargs["description"] = hume_description
+        else:
+            logger.info(
+                "Hume description skipped: model_version=2 reason=octave2_unsupported description_present=%s description_length=%s",
+                hume_description_present,
+                hume_description_length,
+            )
         trailing_silence_applied = False
         trailing_silence_supported = "trailing_silence" in hume_tts_signature.parameters
         if trailing_silence_supported:
@@ -588,11 +667,101 @@ def build_tts():
         logger.info(
             "Hume TTS config: speed=%s description_present=%s trailing_silence_value=%s trailing_silence_supported=%s trailing_silence_applied=%s",
             hume_speed,
-            bool(hume_description),
+            hume_description_present,
             hume_trailing_silence if trailing_silence_applied else "n/a",
             trailing_silence_supported,
             trailing_silence_applied,
         )
+        voice_kind = "None"
+        voice_provider_effective = "n/a"
+        if hume_voice_id:
+            voice_kind = "VoiceById"
+        elif hume_voice_name:
+            voice_kind = "VoiceByName"
+            voice_provider_effective = hume_voice_provider or "hume"
+        logger.info(
+            "Hume TTS effective config: model_version=%s voice_kind=%s voice_present=%s voice_provider=%s instant_mode=%s speed=%s description_present=%s description_applied=%s description_length=%s trailing_silence_supported=%s trailing_silence_applied=%s trailing_silence_value=%s debug_http=%s",
+            hume_tts_kwargs.get("model_version"),
+            voice_kind,
+            bool(voice),
+            voice_provider_effective,
+            instant_mode,
+            hume_speed,
+            hume_description_present,
+            description_applied,
+            hume_description_length,
+            trailing_silence_supported,
+            trailing_silence_applied,
+            hume_trailing_silence if trailing_silence_applied else "n/a",
+            hume_tts_debug_http,
+        )
+
+        if hume_tts_debug_http:
+            trace_config = aiohttp.TraceConfig()
+
+            async def _log_hume_tts_error_detail(
+                response: aiohttp.ClientResponse | None = None,
+                response_url: Any = None,
+                body_read_error: object | None = None,
+            ) -> None:
+                status = getattr(response, "status", "n/a")
+                reason = _redact_sensitive_text(getattr(response, "reason", "n/a"))
+                path = _redact_sensitive_text(getattr(response_url, "path", "n/a"))
+                if body_read_error is not None:
+                    logger.warning(
+                        "Hume TTS HTTP error detail unavailable: status=%s reason=%s body_read_error=%s",
+                        status,
+                        reason,
+                        _redact_sensitive_text(body_read_error),
+                    )
+                    return
+                if response is None:
+                    return
+                body_text = await response.text()
+                redacted_body = _redact_sensitive_text(body_text)[:2000]
+                logger.warning(
+                    "Hume TTS HTTP error detail: status=%s reason=%s path=%s body=%s",
+                    status,
+                    reason,
+                    path,
+                    redacted_body,
+                )
+
+            async def _on_request_start(session, trace_config_ctx, params):
+                logger.info(
+                    "Hume TTS HTTP request: method=%s path=%s debug=true",
+                    params.method,
+                    _redact_sensitive_text(params.url.path),
+                )
+
+            async def _on_request_end(session, trace_config_ctx, params):
+                if params.response.status >= 400:
+                    try:
+                        await _log_hume_tts_error_detail(response=params.response, response_url=params.url)
+                    except Exception as body_error:
+                        await _log_hume_tts_error_detail(
+                            response=params.response,
+                            response_url=params.url,
+                            body_read_error=body_error,
+                        )
+
+            async def _on_request_exception(session, trace_config_ctx, params):
+                response = getattr(params, "response", None)
+                if response is not None and getattr(response, "status", 0) >= 400:
+                    try:
+                        await _log_hume_tts_error_detail(response=response, response_url=params.url)
+                    except Exception as body_error:
+                        await _log_hume_tts_error_detail(
+                            response=response,
+                            response_url=params.url,
+                            body_read_error=body_error,
+                        )
+
+            trace_config.on_request_start.append(_on_request_start)
+            trace_config.on_request_end.append(_on_request_end)
+            trace_config.on_request_exception.append(_on_request_exception)
+            hume_tts_kwargs["http_session"] = aiohttp.ClientSession(trace_configs=[trace_config])
+
         return hume.TTS(**hume_tts_kwargs)
 
     if TTS_PROVIDER == "kokoro":
@@ -634,48 +803,123 @@ class LucyAgent(Agent):
         return normalized
 
     def tts_node(self, text: AsyncIterable[str], model_settings):
-        logger.info("Spoken text normalization enabled=true")
+        if not SPOKEN_TEXT_NORMALIZATION:
+            logger.info("Spoken text normalization enabled=false")
+            if not TTS_TEXT_DEBUG:
+                return Agent.default.tts_node(self, text, model_settings)
+
+            async def _passthrough_debug_stream() -> AsyncIterable[str]:
+                chunks: list[str] = []
+                count = 0
+                async for chunk in text:
+                    count += 1
+                    chunks.append(chunk)
+                    yield chunk
+                raw_text = "".join(chunks)
+                preview = _redact_sensitive_text(raw_text)[:200]
+                logger.info(
+                    "TTS text debug: raw_chunk_count=%s raw_total_length=%s raw_preview=%s final_preview=%s",
+                    count,
+                    len(raw_text),
+                    preview,
+                    preview,
+                )
+
+            return Agent.default.tts_node(self, _passthrough_debug_stream(), model_settings)
+
+        logger.info("Spoken text normalization enabled=true mode=buffered_full_segment")
 
         async def _normalized_text_stream() -> AsyncIterable[str]:
+            chunks: list[str] = []
+            chunk_count = 0
             async for chunk in text:
-                yield self._normalize_spoken_text(chunk)
+                chunk_count += 1
+                chunks.append(chunk)
+            raw_text = "".join(chunks)
+            normalized = self._normalize_spoken_text(raw_text)
+            if TTS_TEXT_DEBUG:
+                logger.info(
+                    "TTS text debug: raw_chunk_count=%s raw_total_length=%s raw_preview=%s final_preview=%s",
+                    chunk_count,
+                    len(raw_text),
+                    _redact_sensitive_text(raw_text)[:200],
+                    _redact_sensitive_text(normalized)[:200],
+                )
+            if normalized:
+                yield normalized
 
         return Agent.default.tts_node(self, _normalized_text_stream(), model_settings)
 
+    def llm_node(self, chat_ctx, tools, model_settings):
+        stream = Agent.default.llm_node(self, chat_ctx, tools, model_settings)
 
+        async def _llm_stream():
+            assistant_fragments: list[str] = []
+            chunk_count = 0
+            async for chunk in stream:
+                chunk_count += 1
+                if PIPELINE_TEXT_DEBUG:
+                    text_delta: object = None
+                    delta = getattr(chunk, "delta", None)
+                    if delta is not None:
+                        delta_content = getattr(delta, "content", None)
+                        if isinstance(delta_content, str):
+                            text_delta = delta_content
+                        elif isinstance(delta_content, list):
+                            parts: list[str] = []
+                            for part in delta_content:
+                                if isinstance(part, str):
+                                    parts.append(part)
+                                else:
+                                    part_text = getattr(part, "text", None)
+                                    if isinstance(part_text, str):
+                                        parts.append(part_text)
+                            if parts:
+                                text_delta = "".join(parts)
+                        if text_delta is None:
+                            delta_text = getattr(delta, "text", None)
+                            if isinstance(delta_text, str):
+                                text_delta = delta_text
+                    if text_delta is None:
+                        chunk_text = getattr(chunk, "text", None)
+                        if isinstance(chunk_text, str):
+                            text_delta = chunk_text
+                    if text_delta is None:
+                        chunk_content = getattr(chunk, "content", None)
+                        if isinstance(chunk_content, str):
+                            text_delta = chunk_content
+                    if text_delta is None and isinstance(chunk, str):
+                        text_delta = chunk
+                    if isinstance(text_delta, str):
+                        assistant_fragments.append(text_delta)
+                yield chunk
+            if PIPELINE_TEXT_DEBUG:
+                combined = "".join(assistant_fragments)
+                logger.info(
+                    "LLM output debug: chunk_count=%s text_length=%s preview=%s",
+                    chunk_count,
+                    len(combined),
+                    _redact_sensitive_text(combined)[:200],
+                )
 
-def build_vad():
-    if VAD_PROVIDER == "ai_coustics":
-        logger.info("Using ai-coustics VAD provider")
-        return ai_coustics.VAD()
+        return _llm_stream()
 
-    if VAD_PROVIDER == "silero":
-        logger.info("Using Silero VAD provider")
-        return silero.VAD.load()
-
-    logger.warning("Unknown VAD_PROVIDER=%s. Falling back to ai-coustics VAD provider", VAD_PROVIDER)
-    return ai_coustics.VAD()
-
-
-def build_stt():
-    if STT_PROVIDER == "deepgram_flux":
-        logger.info("Using Deepgram Flux STT provider")
-        return deepgram.STTv2(
-            model=os.getenv("DEEPGRAM_STT_MODEL", "flux-general-en"),
-            eager_eot_threshold=float(os.getenv("DEEPGRAM_EAGER_EOT_THRESHOLD", "0.4")),
-            eot_threshold=float(os.getenv("DEEPGRAM_EOT_THRESHOLD", "0.7")),
-            eot_timeout_ms=int(os.getenv("DEEPGRAM_EOT_TIMEOUT_MS", "700")),
-        )
-
-    if STT_PROVIDER == "deepgram_nova3":
-        logger.info("Using Deepgram Nova-3 STT provider")
-        return deepgram.STT(
-            model=os.getenv("DEEPGRAM_STT_MODEL", "nova-3"),
-            language=os.getenv("DEEPGRAM_STT_LANGUAGE", "en"),
-        )
-
-
-        return Agent.default.tts_node(self, _normalized_text_stream(), model_settings)
+    async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
+        if PIPELINE_TEXT_DEBUG:
+            msg_str = _extract_text_for_debug(new_message)
+            messages = getattr(turn_ctx, "messages", None)
+            message_count = "n/a"
+            if messages is not None:
+                try:
+                    message_count = len(messages)
+                except Exception:
+                    message_count = "n/a"
+            logger.info(
+                "User turn debug: new_message_length=%s preview=%s turn_ctx_message_count=%s",
+                len(msg_str),
+                _redact_sensitive_text(msg_str)[:200],
+                message_count,
+            )
 
 
 
@@ -914,16 +1158,15 @@ async def entrypoint(ctx: JobContext):
     else:
         logger.info("Starting session without ai-coustics room_options")
         await session.start(room=ctx.room, agent=LucyAgent())
-    logger.info("About to generate greeting reply")
-    greeting_handle = await session.generate_reply(
-        instructions="Greet the user in one short casual sentence as Crash. Say: Yo. What’s going on?",
+    logger.info("About to say fixed greeting")
+    greeting_handle = await session.say(
+        "Yo. What’s going on?",
         allow_interruptions=False,
     )
     logger.info(
-        "Greeting generate_reply completed: handle_type=%s handle_id=%s allow_interruptions=%s interrupted=%s",
+        "Fixed greeting say completed: handle_type=%s handle_id=%s interrupted=%s",
         type(greeting_handle).__name__,
         _safe_attr(greeting_handle, "id"),
-        _safe_attr(greeting_handle, "allow_interruptions"),
         _safe_attr(greeting_handle, "interrupted"),
     )
 
