@@ -435,7 +435,39 @@ def attach_session_diagnostics(session: AgentSession) -> None:
     def _on_conversation_item_added(item: object) -> None:
         role = _safe_attr(item, "role")
         interrupted = _safe_attr(item, "interrupted")
+        if PIPELINE_TEXT_DEBUG:
+            text = getattr(item, "text", None)
+            if text is None:
+                content = getattr(item, "content", None)
+                text = content if isinstance(content, str) else str(content or "")
+            text_str = str(text or "")
+            logger.info(
+                "Conversation item added: role=%s interrupted=%s text_length=%s preview=%s",
+                role,
+                interrupted,
+                len(text_str),
+                _redact_sensitive_text(text_str)[:200],
+            )
+            return
         logger.info("Conversation item added: role=%s interrupted=%s", role, interrupted)
+
+    @session.on("user_input_transcribed")
+    def _on_user_input_transcribed(event: object) -> None:
+        if not PIPELINE_TEXT_DEBUG:
+            return
+        final = getattr(event, "final", getattr(event, "is_final", "n/a"))
+        language = _safe_attr(event, "language", "n/a")
+        speaker_id = getattr(event, "speaker_id", None)
+        transcript = getattr(event, "transcript", getattr(event, "text", ""))
+        transcript_str = str(transcript or "")
+        logger.info(
+            "STT debug: final=%s language=%s speaker_id_present=%s transcript_length=%s preview=%s",
+            final,
+            language,
+            speaker_id is not None,
+            len(transcript_str),
+            _redact_sensitive_text(transcript_str)[:200],
+        )
 
     @session.on("error")
     def _on_error(error: object) -> None:
@@ -461,6 +493,9 @@ def env_bool(name: str, default: bool = False) -> bool:
 
 
 AI_COUSTICS_ENABLED = env_bool("AI_COUSTICS_ENABLED", True)
+SPOKEN_TEXT_NORMALIZATION = env_bool("SPOKEN_TEXT_NORMALIZATION", False)
+TTS_TEXT_DEBUG = env_bool("TTS_TEXT_DEBUG", False)
+PIPELINE_TEXT_DEBUG = env_bool("PIPELINE_TEXT_DEBUG", False)
 
 
 def _resolve_ai_coustics_model(model_name: str):
@@ -737,13 +772,103 @@ class LucyAgent(Agent):
         return normalized
 
     def tts_node(self, text: AsyncIterable[str], model_settings):
-        logger.info("Spoken text normalization enabled=true")
+        if not SPOKEN_TEXT_NORMALIZATION:
+            logger.info("Spoken text normalization enabled=false")
+            if not TTS_TEXT_DEBUG:
+                return Agent.default.tts_node(self, text, model_settings)
+
+            async def _passthrough_debug_stream() -> AsyncIterable[str]:
+                chunks: list[str] = []
+                count = 0
+                async for chunk in text:
+                    count += 1
+                    chunks.append(chunk)
+                    yield chunk
+                raw_text = "".join(chunks)
+                preview = _redact_sensitive_text(raw_text)[:200]
+                logger.info(
+                    "TTS text debug: raw_chunk_count=%s raw_total_length=%s raw_preview=%s final_preview=%s",
+                    count,
+                    len(raw_text),
+                    preview,
+                    preview,
+                )
+
+            return Agent.default.tts_node(self, _passthrough_debug_stream(), model_settings)
+
+        logger.info("Spoken text normalization enabled=true mode=buffered_full_segment")
 
         async def _normalized_text_stream() -> AsyncIterable[str]:
+            chunks: list[str] = []
+            chunk_count = 0
             async for chunk in text:
-                yield self._normalize_spoken_text(chunk)
+                chunk_count += 1
+                chunks.append(chunk)
+            raw_text = "".join(chunks)
+            normalized = self._normalize_spoken_text(raw_text)
+            if TTS_TEXT_DEBUG:
+                logger.info(
+                    "TTS text debug: raw_chunk_count=%s raw_total_length=%s raw_preview=%s final_preview=%s",
+                    chunk_count,
+                    len(raw_text),
+                    _redact_sensitive_text(raw_text)[:200],
+                    _redact_sensitive_text(normalized)[:200],
+                )
+            if normalized:
+                yield normalized
 
         return Agent.default.tts_node(self, _normalized_text_stream(), model_settings)
+
+    def llm_node(self, chat_ctx, tools, model_settings):
+        stream = Agent.default.llm_node(self, chat_ctx, tools, model_settings)
+
+        async def _llm_stream():
+            assistant_fragments: list[str] = []
+            chunk_count = 0
+            async for chunk in stream:
+                chunk_count += 1
+                if PIPELINE_TEXT_DEBUG:
+                    text_delta = getattr(chunk, "text", None)
+                    if text_delta is None:
+                        delta = getattr(chunk, "delta", None)
+                        text_delta = getattr(delta, "text", None) if delta is not None else None
+                    if isinstance(text_delta, str):
+                        assistant_fragments.append(text_delta)
+                yield chunk
+            if PIPELINE_TEXT_DEBUG:
+                combined = "".join(assistant_fragments)
+                logger.info(
+                    "LLM output debug: chunk_count=%s text_length=%s preview=%s",
+                    chunk_count,
+                    len(combined),
+                    _redact_sensitive_text(combined)[:200],
+                )
+
+        return _llm_stream()
+
+    def on_user_turn_completed(self, turn_ctx, new_message):
+        if PIPELINE_TEXT_DEBUG:
+            msg_text = getattr(new_message, "text", None)
+            if msg_text is None:
+                msg_text = getattr(new_message, "content", "")
+            msg_str = str(msg_text or "")
+            messages = getattr(turn_ctx, "messages", None)
+            message_count = "n/a"
+            if messages is not None:
+                try:
+                    message_count = len(messages)
+                except Exception:
+                    message_count = "n/a"
+            logger.info(
+                "User turn debug: new_message_length=%s preview=%s turn_ctx_message_count=%s",
+                len(msg_str),
+                _redact_sensitive_text(msg_str)[:200],
+                message_count,
+            )
+        default_hook = getattr(Agent.default, "on_user_turn_completed", None)
+        if callable(default_hook):
+            return default_hook(self, turn_ctx, new_message)
+        return None
 
 
 
