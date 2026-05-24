@@ -566,15 +566,26 @@ def build_tts():
             "A warm, calm, natural companion voice. Speak with relaxed pacing, soft sentence endings, "
             "and brief natural pauses between thoughts. Do not sound rushed, clipped, or abrupt at the end of sentences."
         )
+        hume_description_present = bool(hume_description)
+        hume_description_length = len(hume_description)
         hume_trailing_silence = float(os.getenv("HUME_TRAILING_SILENCE", "0.25"))
+        hume_model_version = _resolve_hume_model_version()
         hume_tts_signature = inspect.signature(hume.TTS)
         hume_tts_kwargs: dict[str, Any] = {
             "voice": voice,
-            "model_version": _resolve_hume_model_version(),
-            "description": hume_description,
+            "model_version": hume_model_version,
             "speed": hume_speed,
             "instant_mode": instant_mode,
         }
+        description_applied = hume_model_version != "2"
+        if description_applied:
+            hume_tts_kwargs["description"] = hume_description
+        else:
+            logger.info(
+                "Hume description skipped: model_version=2 reason=octave2_unsupported description_present=%s description_length=%s",
+                hume_description_present,
+                hume_description_length,
+            )
         trailing_silence_applied = False
         trailing_silence_supported = "trailing_silence" in hume_tts_signature.parameters
         if trailing_silence_supported:
@@ -590,7 +601,7 @@ def build_tts():
         logger.info(
             "Hume TTS config: speed=%s description_present=%s trailing_silence_value=%s trailing_silence_supported=%s trailing_silence_applied=%s",
             hume_speed,
-            bool(hume_description),
+            hume_description_present,
             hume_trailing_silence if trailing_silence_applied else "n/a",
             trailing_silence_supported,
             trailing_silence_applied,
@@ -603,14 +614,16 @@ def build_tts():
             voice_kind = "VoiceByName"
             voice_provider_effective = hume_voice_provider or "hume"
         logger.info(
-            "Hume TTS effective config: model_version=%s voice_kind=%s voice_present=%s voice_provider=%s instant_mode=%s speed=%s description_length=%s trailing_silence_supported=%s trailing_silence_applied=%s trailing_silence_value=%s debug_http=%s",
+            "Hume TTS effective config: model_version=%s voice_kind=%s voice_present=%s voice_provider=%s instant_mode=%s speed=%s description_present=%s description_applied=%s description_length=%s trailing_silence_supported=%s trailing_silence_applied=%s trailing_silence_value=%s debug_http=%s",
             hume_tts_kwargs.get("model_version"),
             voice_kind,
             bool(voice),
             voice_provider_effective,
             instant_mode,
             hume_speed,
-            len(hume_description),
+            hume_description_present,
+            description_applied,
+            hume_description_length,
             trailing_silence_supported,
             trailing_silence_applied,
             hume_trailing_silence if trailing_silence_applied else "n/a",
