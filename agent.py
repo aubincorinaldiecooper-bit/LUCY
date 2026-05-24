@@ -134,6 +134,12 @@ def attach_session_diagnostics(session: AgentSession) -> None:
     latest_user_state_timestamp = 0.0
     latest_agent_state = "unknown"
     latest_agent_state_timestamp = 0.0
+    speech_created_at: dict[str, float] = {}
+    assistant_speech_started_at: dict[str, float] = {}
+    agent_speaking_at: dict[str, float] = {}
+    agent_listening_at: dict[str, float] = {}
+    assistant_speech_finished_at: dict[str, float] = {}
+    pending_user_handoff_speech_id: str | None = None
 
     def _resolve_speech_handle(event_or_handle: object) -> object:
         for attr in ("speech_handle", "handle", "speech"):
@@ -218,6 +224,8 @@ def attach_session_diagnostics(session: AgentSession) -> None:
         speech_id = _speech_id(resolved_handle)
         now = time.monotonic()
         speech_start_times[speech_id] = now
+        speech_created_at[speech_id] = now
+        assistant_speech_started_at[speech_id] = now
 
         suppressed = False
         suppression_attempted = False
@@ -332,14 +340,35 @@ def attach_session_diagnostics(session: AgentSession) -> None:
         add_done_callback = getattr(resolved_handle, "add_done_callback", None)
         if callable(add_done_callback):
             def _on_done(done_event_or_handle: object) -> None:
+                nonlocal pending_user_handoff_speech_id
                 done_resolved_handle = _resolve_speech_handle(done_event_or_handle)
                 done_id = _speech_id(done_resolved_handle)
                 active_speech_handles.pop(done_id, None)
-                speech_start_times.pop(done_id, None)
+                finished_at = time.monotonic()
+                started_at = speech_start_times.pop(done_id, None)
                 was_suppressed = done_id in suppressed_speech_ids
                 suppressed_speech_ids.discard(done_id)
                 interrupted = _safe_attr(done_resolved_handle, "interrupted", "unknown")
+                speaking_at = agent_speaking_at.get(done_id)
+                listening_at = agent_listening_at.get(done_id)
+                speech_duration_seconds = (finished_at - started_at) if started_at is not None else -1.0
+                agent_speaking_to_finished_seconds = (finished_at - speaking_at) if speaking_at is not None else -1.0
+                finish_to_agent_listening_seconds = (
+                    listening_at - finished_at if listening_at is not None else -1.0
+                )
+                assistant_speech_finished_at[done_id] = finished_at
+                pending_user_handoff_speech_id = done_id
                 logger.info("Assistant speech finished: speech_id=%s interrupted=%s active_count=%s was_suppressed=%s", done_id, interrupted, len(active_speech_handles), was_suppressed)
+                logger.info(
+                    "Assistant handoff timing: speech_id=%s speech_duration_seconds=%.3f agent_speaking_to_finished_seconds=%.3f finish_to_agent_listening_seconds=%.3f interrupted=%s was_suppressed=%s active_count=%s",
+                    done_id,
+                    speech_duration_seconds,
+                    agent_speaking_to_finished_seconds,
+                    finish_to_agent_listening_seconds,
+                    interrupted,
+                    was_suppressed,
+                    len(active_speech_handles),
+                )
 
             add_done_callback(_on_done)
         else:
@@ -357,6 +386,17 @@ def attach_session_diagnostics(session: AgentSession) -> None:
         latest_agent_state_timestamp = time.monotonic()
         current_speech = getattr(session, "current_speech", None)
         has_current_speech = current_speech is not None
+        current_speech_id = _speech_id(current_speech) if has_current_speech else None
+        if extracted_new_state == "speaking" and current_speech_id is not None:
+            agent_speaking_at[current_speech_id] = latest_agent_state_timestamp
+        old_state = getattr(state, "old_state", None)
+        old_state_normalized = str(old_state).strip().lower() if old_state is not None else ""
+        if (
+            old_state_normalized == "speaking"
+            and extracted_new_state == "listening"
+            and current_speech_id is not None
+        ):
+            agent_listening_at[current_speech_id] = latest_agent_state_timestamp
         logger.info(
             "Agent state changed: state=%s extracted_new_state=%s has_current_speech=%s assistant_active_count=%s",
             state,
@@ -369,10 +409,22 @@ def attach_session_diagnostics(session: AgentSession) -> None:
 
     @session.on("user_state_changed")
     def _on_user_state_changed(state: object) -> None:
-        nonlocal latest_user_state, latest_user_state_timestamp
+        nonlocal latest_user_state, latest_user_state_timestamp, pending_user_handoff_speech_id
         latest_user_state = _extract_user_new_state(state)
         latest_user_state_timestamp = time.monotonic()
         logger.info("User state changed: state=%s assistant_active_count=%s", state, len(active_speech_handles))
+        if latest_user_state == "speaking" and pending_user_handoff_speech_id is not None:
+            previous_speech_id = pending_user_handoff_speech_id
+            finished_at = assistant_speech_finished_at.get(previous_speech_id)
+            if finished_at is not None and latest_user_state_timestamp >= finished_at:
+                logger.info(
+                    "Assistant handoff to user: previous_speech_id=%s finish_to_user_speaking_seconds=%.3f latest_agent_state=%s active_count=%s",
+                    previous_speech_id,
+                    latest_user_state_timestamp - finished_at,
+                    latest_agent_state,
+                    len(active_speech_handles),
+                )
+                pending_user_handoff_speech_id = None
 
     @session.on("agent_false_interruption")
     def _on_agent_false_interruption(*_: object) -> None:
@@ -534,9 +586,11 @@ def build_tts():
             logger.info("trailing_silence_supported=false trailing_silence_applied=false")
 
         logger.info(
-            "Hume TTS config: speed=%s description_present=%s trailing_silence_applied=%s",
+            "Hume TTS config: speed=%s description_present=%s trailing_silence_value=%s trailing_silence_supported=%s trailing_silence_applied=%s",
             hume_speed,
             bool(hume_description),
+            hume_trailing_silence if trailing_silence_applied else "n/a",
+            trailing_silence_supported,
             trailing_silence_applied,
         )
         return hume.TTS(**hume_tts_kwargs)
@@ -585,6 +639,41 @@ class LucyAgent(Agent):
         async def _normalized_text_stream() -> AsyncIterable[str]:
             async for chunk in text:
                 yield self._normalize_spoken_text(chunk)
+
+        return Agent.default.tts_node(self, _normalized_text_stream(), model_settings)
+
+
+
+def build_vad():
+    if VAD_PROVIDER == "ai_coustics":
+        logger.info("Using ai-coustics VAD provider")
+        return ai_coustics.VAD()
+
+    if VAD_PROVIDER == "silero":
+        logger.info("Using Silero VAD provider")
+        return silero.VAD.load()
+
+    logger.warning("Unknown VAD_PROVIDER=%s. Falling back to ai-coustics VAD provider", VAD_PROVIDER)
+    return ai_coustics.VAD()
+
+
+def build_stt():
+    if STT_PROVIDER == "deepgram_flux":
+        logger.info("Using Deepgram Flux STT provider")
+        return deepgram.STTv2(
+            model=os.getenv("DEEPGRAM_STT_MODEL", "flux-general-en"),
+            eager_eot_threshold=float(os.getenv("DEEPGRAM_EAGER_EOT_THRESHOLD", "0.4")),
+            eot_threshold=float(os.getenv("DEEPGRAM_EOT_THRESHOLD", "0.7")),
+            eot_timeout_ms=int(os.getenv("DEEPGRAM_EOT_TIMEOUT_MS", "700")),
+        )
+
+    if STT_PROVIDER == "deepgram_nova3":
+        logger.info("Using Deepgram Nova-3 STT provider")
+        return deepgram.STT(
+            model=os.getenv("DEEPGRAM_STT_MODEL", "nova-3"),
+            language=os.getenv("DEEPGRAM_STT_LANGUAGE", "en"),
+        )
+
 
         return Agent.default.tts_node(self, _normalized_text_stream(), model_settings)
 
