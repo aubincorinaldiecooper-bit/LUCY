@@ -3,7 +3,7 @@ import asyncio
 import inspect
 import logging
 import time
-from typing import Any
+from typing import Any, AsyncIterable
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -507,13 +507,39 @@ def build_tts():
         if instant_mode and voice is None:
             raise RuntimeError("HUME_VOICE_ID or HUME_VOICE_NAME is required when HUME_INSTANT_MODE=true")
 
-        return hume.TTS(
-            voice=voice,
-            model_version=_resolve_hume_model_version(),
-            description=os.getenv("HUME_DESCRIPTION") or None,
-            speed=float(os.getenv("HUME_SPEED", "1.0")),
-            instant_mode=instant_mode,
+        hume_speed = float(os.getenv("HUME_SPEED", "0.9"))
+        hume_description = os.getenv("HUME_DESCRIPTION") or (
+            "A warm, calm, natural companion voice. Speak with relaxed pacing, soft sentence endings, "
+            "and brief natural pauses between thoughts. Do not sound rushed, clipped, or abrupt at the end of sentences."
         )
+        hume_trailing_silence = float(os.getenv("HUME_TRAILING_SILENCE", "0.25"))
+        hume_tts_signature = inspect.signature(hume.TTS)
+        hume_tts_kwargs: dict[str, Any] = {
+            "voice": voice,
+            "model_version": _resolve_hume_model_version(),
+            "description": hume_description,
+            "speed": hume_speed,
+            "instant_mode": instant_mode,
+        }
+        trailing_silence_applied = False
+        trailing_silence_supported = "trailing_silence" in hume_tts_signature.parameters
+        if trailing_silence_supported:
+            hume_tts_kwargs["trailing_silence"] = hume_trailing_silence
+            trailing_silence_applied = True
+            logger.info(
+                "trailing_silence_supported=true trailing_silence_applied=true value=%s",
+                hume_trailing_silence,
+            )
+        else:
+            logger.info("trailing_silence_supported=false trailing_silence_applied=false")
+
+        logger.info(
+            "Hume TTS config: speed=%s description_present=%s trailing_silence_applied=%s",
+            hume_speed,
+            bool(hume_description),
+            trailing_silence_applied,
+        )
+        return hume.TTS(**hume_tts_kwargs)
 
     if TTS_PROVIDER == "kokoro":
         kokoro_endpoint = os.getenv("KOKORO_TTS_ENDPOINT")
@@ -542,6 +568,25 @@ async def health() -> JSONResponse:
 class LucyAgent(Agent):
     def __init__(self) -> None:
         super().__init__(instructions=SYSTEM_PROMPT)
+
+    def _normalize_spoken_text(self, text: str) -> str:
+        normalized = text.strip()
+        if not normalized:
+            return normalized
+        if "```" in normalized:
+            return normalized
+        if normalized[-1] not in {".", "?", "!", "…"}:
+            return normalized + "."
+        return normalized
+
+    def tts_node(self, text: AsyncIterable[str], model_settings):
+        logger.info("Spoken text normalization enabled=true")
+
+        async def _normalized_text_stream() -> AsyncIterable[str]:
+            async for chunk in text:
+                yield self._normalize_spoken_text(chunk)
+
+        return Agent.default.tts_node(self, _normalized_text_stream(), model_settings)
 
 
 
