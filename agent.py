@@ -155,6 +155,30 @@ def _extract_text_for_debug(obj: object) -> str:
     return str(content or "")
 
 
+def _safe_nested_error_details(error: object) -> dict[str, str]:
+    details: dict[str, str] = {}
+    current = error
+    for idx in range(3):
+        if current is None:
+            break
+        prefix = f"err{idx}"
+        details[f"{prefix}_type"] = type(current).__name__
+        for field in ("message", "detail", "status_code", "code", "retryable", "details"):
+            value = getattr(current, field, None)
+            if value is not None:
+                details[f"{prefix}_{field}"] = _redact_sensitive_text(value)
+        body = getattr(current, "body", None)
+        if body is not None:
+            body_message = getattr(body, "message", None)
+            body_code = getattr(body, "code", None)
+            if body_message is not None:
+                details[f"{prefix}_body_message"] = _redact_sensitive_text(body_message)
+            if body_code is not None:
+                details[f"{prefix}_body_code"] = _redact_sensitive_text(body_code)
+        current = getattr(current, "error", None)
+    return details
+
+
 def attach_session_diagnostics(session: AgentSession) -> None:
     active_speech_handles: dict[str, object] = {}
     _local_speech_ids: dict[int, str] = {}
@@ -172,6 +196,14 @@ def attach_session_diagnostics(session: AgentSession) -> None:
     agent_listening_at: dict[str, float] = {}
     assistant_speech_finished_at: dict[str, float] = {}
     pending_user_handoff_speech_id: str | None = None
+    stt_partial_count = 0
+    stt_final_count = 0
+    last_stt_any_at = 0.0
+    last_stt_final_at = 0.0
+    last_stt_preview = ""
+    last_stt_final_preview = ""
+    last_user_speaking_at = 0.0
+    last_user_listening_at = 0.0
 
     def _resolve_speech_handle(event_or_handle: object) -> object:
         for attr in ("speech_handle", "handle", "speech"):
@@ -441,9 +473,13 @@ def attach_session_diagnostics(session: AgentSession) -> None:
 
     @session.on("user_state_changed")
     def _on_user_state_changed(state: object) -> None:
-        nonlocal latest_user_state, latest_user_state_timestamp, pending_user_handoff_speech_id
+        nonlocal latest_user_state, latest_user_state_timestamp, pending_user_handoff_speech_id, last_user_speaking_at, last_user_listening_at
         latest_user_state = _extract_user_new_state(state)
         latest_user_state_timestamp = time.monotonic()
+        if latest_user_state == "speaking":
+            last_user_speaking_at = latest_user_state_timestamp
+        if latest_user_state == "listening":
+            last_user_listening_at = latest_user_state_timestamp
         logger.info("User state changed: state=%s assistant_active_count=%s", state, len(active_speech_handles))
         if latest_user_state == "speaking" and pending_user_handoff_speech_id is not None:
             previous_speech_id = pending_user_handoff_speech_id
@@ -482,8 +518,7 @@ def attach_session_diagnostics(session: AgentSession) -> None:
 
     @session.on("user_input_transcribed")
     def _on_user_input_transcribed(event: object) -> None:
-        if not PIPELINE_TEXT_DEBUG:
-            return
+        nonlocal stt_partial_count, stt_final_count, last_stt_any_at, last_stt_final_at, last_stt_preview, last_stt_final_preview
         final = getattr(event, "final", getattr(event, "is_final", "n/a"))
         language = _safe_attr(event, "language", "n/a")
         speaker_id = getattr(event, "speaker_id", None)
@@ -491,13 +526,24 @@ def attach_session_diagnostics(session: AgentSession) -> None:
         if transcript is None:
             transcript = getattr(event, "text", "")
         transcript_str = str(transcript or "")
+        last_stt_any_at = time.monotonic()
+        last_stt_preview = _redact_sensitive_text(transcript_str)[:200]
+        is_final = str(final).strip().lower() in {"true", "1", "yes"}
+        if is_final:
+            stt_final_count += 1
+            last_stt_final_at = last_stt_any_at
+            last_stt_final_preview = last_stt_preview
+        else:
+            stt_partial_count += 1
+        if not PIPELINE_TEXT_DEBUG:
+            return
         logger.info(
             "STT debug: final=%s language=%s speaker_id_present=%s transcript_length=%s preview=%s",
             final,
             language,
             speaker_id is not None,
             len(transcript_str),
-            _redact_sensitive_text(transcript_str)[:200],
+            last_stt_preview,
         )
 
     @session.on("error")
@@ -508,6 +554,35 @@ def attach_session_diagnostics(session: AgentSession) -> None:
         searchable_safe_text = " ".join(str(v).lower() for v in safe_summary.values())
         if "tts" in searchable_safe_text:
             _clear_active_handles("tts_error")
+        if MISTRAL_STT_DIAGNOSTICS:
+            stt_error_markers = ("stt", "mistral", "grpc", "http/2", "unavailable", "failed parsing", "3803")
+            if any(marker in searchable_safe_text for marker in stt_error_markers):
+                now = time.monotonic()
+                stt_since_any = now - last_stt_any_at if last_stt_any_at > 0 else -1.0
+                stt_since_final = now - last_stt_final_at if last_stt_final_at > 0 else -1.0
+                logger.warning(
+                    "Mistral STT diagnostic snapshot: error_chain=%s stt_partial_count=%s stt_final_count=%s seconds_since_last_stt=%s seconds_since_last_final_stt=%s last_stt_preview=%s last_final_stt_preview=%s latest_user_state=%s latest_agent_state=%s active_assistant_speech_count=%s STT_PROVIDER=%s MISTRAL_STT_MODEL=%s MISTRAL_TARGET_STREAMING_DELAY_MS=%s VAD_PROVIDER=%s AI_COUSTICS_ENABLED=%s AI_COUSTICS_MODEL=%s AI_COUSTICS_LEVEL=%s endpointing_mode=%s endpointing_min_delay=%s endpointing_max_delay=%s",
+                    _safe_nested_error_details(error),
+                    stt_partial_count,
+                    stt_final_count,
+                    stt_since_any,
+                    stt_since_final,
+                    last_stt_preview,
+                    last_stt_final_preview,
+                    latest_user_state,
+                    latest_agent_state,
+                    len(active_speech_handles),
+                    STT_PROVIDER,
+                    os.getenv("MISTRAL_STT_MODEL", "voxtral-mini-transcribe-realtime-2602"),
+                    os.getenv("MISTRAL_TARGET_STREAMING_DELAY_MS", "160"),
+                    VAD_PROVIDER,
+                    AI_COUSTICS_ENABLED,
+                    os.getenv("AI_COUSTICS_MODEL", "QUAIL_L"),
+                    os.getenv("AI_COUSTICS_LEVEL", "0.7"),
+                    os.getenv("LIVEKIT_ENDPOINTING_MODE", "fixed"),
+                    os.getenv("LIVEKIT_ENDPOINTING_MIN_DELAY", "0.4"),
+                    os.getenv("LIVEKIT_ENDPOINTING_MAX_DELAY", "1.5"),
+                )
 
     @session.on("close")
     def _on_close() -> None:
@@ -527,6 +602,7 @@ AI_COUSTICS_ENABLED = env_bool("AI_COUSTICS_ENABLED", True)
 SPOKEN_TEXT_NORMALIZATION = env_bool("SPOKEN_TEXT_NORMALIZATION", False)
 TTS_TEXT_DEBUG = env_bool("TTS_TEXT_DEBUG", False)
 PIPELINE_TEXT_DEBUG = env_bool("PIPELINE_TEXT_DEBUG", False)
+MISTRAL_STT_DIAGNOSTICS = env_bool("MISTRAL_STT_DIAGNOSTICS", True)
 
 
 def _resolve_ai_coustics_model(model_name: str):
@@ -1064,12 +1140,13 @@ async def entrypoint(ctx: JobContext):
     )
 
     interruption_options: InterruptionOptions = {
-        "enabled": True,
-        "min_words": 1,
-        "min_duration": 0.6,
+        "enabled": env_bool("LIVEKIT_INTERRUPTION_ENABLED", True),
+        "min_words": int(os.getenv("LIVEKIT_INTERRUPTION_MIN_WORDS", "1")),
+        "min_duration": float(os.getenv("LIVEKIT_INTERRUPTION_MIN_DURATION", "0.6")),
         "resume_false_interruption": env_bool("LIVEKIT_RESUME_FALSE_INTERRUPTION", False),
-        "false_interruption_timeout": 1.8,
+        "false_interruption_timeout": float(os.getenv("LIVEKIT_FALSE_INTERRUPTION_TIMEOUT", "1.8")),
     }
+    logger.info("Resolved interruption config: %s", interruption_options)
     endpointing_mode = os.getenv("LIVEKIT_ENDPOINTING_MODE", "fixed")
     endpointing_min_delay = float(os.getenv("LIVEKIT_ENDPOINTING_MIN_DELAY", "0.4"))
     endpointing_max_delay = float(os.getenv("LIVEKIT_ENDPOINTING_MAX_DELAY", "1.5"))
@@ -1079,6 +1156,13 @@ async def entrypoint(ctx: JobContext):
         endpointing_min_delay,
         endpointing_max_delay,
     )
+    mistral_stt_model = os.getenv("MISTRAL_STT_MODEL", "voxtral-mini-transcribe-realtime-2602")
+    mistral_target_streaming_delay_ms = int(os.getenv("MISTRAL_TARGET_STREAMING_DELAY_MS", "160"))
+    mistral_target_delay_supported = "target_streaming_delay_ms" in inspect.signature(mistralai.STT).parameters
+    logger.info("Startup Mistral STT config: model=%s target_streaming_delay_ms=%s applied=%s", mistral_stt_model, mistral_target_streaming_delay_ms, mistral_target_delay_supported)
+    logger.info("MISTRAL_STT_DIAGNOSTICS enabled=%s", MISTRAL_STT_DIAGNOSTICS)
+    if os.getenv("GRPC_TRACE") is not None or os.getenv("GRPC_VERBOSITY") is not None:
+        logger.warning("Low-level gRPC tracing env vars are enabled and may be noisy")
 
     session_kwargs: dict[str, Any] = {
         "stt": build_stt(),
