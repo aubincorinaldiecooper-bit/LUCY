@@ -1158,16 +1158,15 @@ async def entrypoint(ctx: JobContext):
     else:
         logger.info("Starting session without ai-coustics room_options")
         await session.start(room=ctx.room, agent=LucyAgent())
-    logger.info("About to generate greeting reply")
-    greeting_handle = await session.generate_reply(
-        instructions="Greet the user in one short casual sentence as Crash. Say: Yo. What’s going on?",
+    logger.info("About to say fixed greeting")
+    greeting_handle = await session.say(
+        "Yo. What’s going on?",
         allow_interruptions=False,
     )
     logger.info(
-        "Greeting generate_reply completed: handle_type=%s handle_id=%s allow_interruptions=%s interrupted=%s",
+        "Fixed greeting say completed: handle_type=%s handle_id=%s interrupted=%s",
         type(greeting_handle).__name__,
         _safe_attr(greeting_handle, "id"),
-        _safe_attr(greeting_handle, "allow_interruptions"),
         _safe_attr(greeting_handle, "interrupted"),
     )
 
