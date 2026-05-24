@@ -5,6 +5,7 @@ import logging
 import time
 from typing import Any, AsyncIterable
 
+import aiohttp
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
@@ -560,6 +561,7 @@ def build_tts():
             raise RuntimeError("HUME_VOICE_ID or HUME_VOICE_NAME is required when HUME_INSTANT_MODE=true")
 
         hume_speed = float(os.getenv("HUME_SPEED", "0.9"))
+        hume_tts_debug_http = env_bool("HUME_TTS_DEBUG_HTTP", False)
         hume_description = os.getenv("HUME_DESCRIPTION") or (
             "A warm, calm, natural companion voice. Speak with relaxed pacing, soft sentence endings, "
             "and brief natural pauses between thoughts. Do not sound rushed, clipped, or abrupt at the end of sentences."
@@ -593,6 +595,94 @@ def build_tts():
             trailing_silence_supported,
             trailing_silence_applied,
         )
+        voice_kind = "None"
+        voice_provider_effective = "n/a"
+        if isinstance(voice, hume.VoiceById):
+            voice_kind = "VoiceById"
+        elif isinstance(voice, hume.VoiceByName):
+            voice_kind = "VoiceByName"
+            voice_provider_effective = _safe_attr(voice, "provider", "n/a")
+        logger.info(
+            "Hume TTS effective config: model_version=%s voice_kind=%s voice_present=%s voice_provider=%s instant_mode=%s speed=%s description_length=%s trailing_silence_supported=%s trailing_silence_applied=%s trailing_silence_value=%s debug_http=%s",
+            hume_tts_kwargs.get("model_version"),
+            voice_kind,
+            bool(voice),
+            voice_provider_effective,
+            instant_mode,
+            hume_speed,
+            len(hume_description),
+            trailing_silence_supported,
+            trailing_silence_applied,
+            hume_trailing_silence if trailing_silence_applied else "n/a",
+            hume_tts_debug_http,
+        )
+
+        if hume_tts_debug_http:
+            trace_config = aiohttp.TraceConfig()
+
+            async def _log_hume_tts_error_detail(
+                response: aiohttp.ClientResponse | None = None,
+                response_url: Any = None,
+                body_read_error: object | None = None,
+            ) -> None:
+                status = getattr(response, "status", "n/a")
+                reason = _redact_sensitive_text(getattr(response, "reason", "n/a"))
+                path = _redact_sensitive_text(getattr(response_url, "path", "n/a"))
+                if body_read_error is not None:
+                    logger.warning(
+                        "Hume TTS HTTP error detail unavailable: status=%s reason=%s body_read_error=%s",
+                        status,
+                        reason,
+                        _redact_sensitive_text(body_read_error),
+                    )
+                    return
+                if response is None:
+                    return
+                body_text = await response.text()
+                redacted_body = _redact_sensitive_text(body_text)[:2000]
+                logger.warning(
+                    "Hume TTS HTTP error detail: status=%s reason=%s path=%s body=%s",
+                    status,
+                    reason,
+                    path,
+                    redacted_body,
+                )
+
+            async def _on_request_start(session, trace_config_ctx, params):
+                logger.info(
+                    "Hume TTS HTTP request: method=%s path=%s debug=true",
+                    params.method,
+                    _redact_sensitive_text(params.url.path),
+                )
+
+            async def _on_request_end(session, trace_config_ctx, params):
+                if params.response.status >= 400:
+                    try:
+                        await _log_hume_tts_error_detail(response=params.response, response_url=params.url)
+                    except Exception as body_error:
+                        await _log_hume_tts_error_detail(
+                            response=params.response,
+                            response_url=params.url,
+                            body_read_error=body_error,
+                        )
+
+            async def _on_request_exception(session, trace_config_ctx, params):
+                response = getattr(params, "response", None)
+                if response is not None and getattr(response, "status", 0) >= 400:
+                    try:
+                        await _log_hume_tts_error_detail(response=response, response_url=params.url)
+                    except Exception as body_error:
+                        await _log_hume_tts_error_detail(
+                            response=response,
+                            response_url=params.url,
+                            body_read_error=body_error,
+                        )
+
+            trace_config.on_request_start.append(_on_request_start)
+            trace_config.on_request_end.append(_on_request_end)
+            trace_config.on_request_exception.append(_on_request_exception)
+            hume_tts_kwargs["http_session"] = aiohttp.ClientSession(trace_configs=[trace_config])
+
         return hume.TTS(**hume_tts_kwargs)
 
     if TTS_PROVIDER == "kokoro":
