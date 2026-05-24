@@ -124,6 +124,37 @@ def _safe_error_summary(error: object) -> dict[str, str]:
     return summary
 
 
+def _extract_text_for_debug(obj: object) -> str:
+    if obj is None:
+        return ""
+    item = getattr(obj, "item", None)
+    target = item if item is not None else obj
+
+    text_content = getattr(target, "text_content", None)
+    if isinstance(text_content, str):
+        return text_content
+
+    text = getattr(target, "text", None)
+    if isinstance(text, str):
+        return text
+
+    content = getattr(target, "content", None)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            else:
+                part_text = getattr(part, "text", None)
+                if isinstance(part_text, str):
+                    parts.append(part_text)
+        return " ".join(p for p in parts if p).strip()
+
+    return str(content or "")
+
+
 def attach_session_diagnostics(session: AgentSession) -> None:
     active_speech_handles: dict[str, object] = {}
     _local_speech_ids: dict[int, str] = {}
@@ -433,14 +464,12 @@ def attach_session_diagnostics(session: AgentSession) -> None:
 
     @session.on("conversation_item_added")
     def _on_conversation_item_added(item: object) -> None:
-        role = _safe_attr(item, "role")
-        interrupted = _safe_attr(item, "interrupted")
+        event_item = getattr(item, "item", None)
+        target = event_item if event_item is not None else item
+        role = _safe_attr(target, "role")
+        interrupted = _safe_attr(target, "interrupted")
         if PIPELINE_TEXT_DEBUG:
-            text = getattr(item, "text", None)
-            if text is None:
-                content = getattr(item, "content", None)
-                text = content if isinstance(content, str) else str(content or "")
-            text_str = str(text or "")
+            text_str = _extract_text_for_debug(target)
             logger.info(
                 "Conversation item added: role=%s interrupted=%s text_length=%s preview=%s",
                 role,
@@ -458,7 +487,9 @@ def attach_session_diagnostics(session: AgentSession) -> None:
         final = getattr(event, "final", getattr(event, "is_final", "n/a"))
         language = _safe_attr(event, "language", "n/a")
         speaker_id = getattr(event, "speaker_id", None)
-        transcript = getattr(event, "transcript", getattr(event, "text", ""))
+        transcript = getattr(event, "transcript", None)
+        if transcript is None:
+            transcript = getattr(event, "text", "")
         transcript_str = str(transcript or "")
         logger.info(
             "STT debug: final=%s language=%s speaker_id_present=%s transcript_length=%s preview=%s",
@@ -828,10 +859,37 @@ class LucyAgent(Agent):
             async for chunk in stream:
                 chunk_count += 1
                 if PIPELINE_TEXT_DEBUG:
-                    text_delta = getattr(chunk, "text", None)
+                    text_delta: object = None
+                    delta = getattr(chunk, "delta", None)
+                    if delta is not None:
+                        delta_content = getattr(delta, "content", None)
+                        if isinstance(delta_content, str):
+                            text_delta = delta_content
+                        elif isinstance(delta_content, list):
+                            parts: list[str] = []
+                            for part in delta_content:
+                                if isinstance(part, str):
+                                    parts.append(part)
+                                else:
+                                    part_text = getattr(part, "text", None)
+                                    if isinstance(part_text, str):
+                                        parts.append(part_text)
+                            if parts:
+                                text_delta = "".join(parts)
+                        if text_delta is None:
+                            delta_text = getattr(delta, "text", None)
+                            if isinstance(delta_text, str):
+                                text_delta = delta_text
                     if text_delta is None:
-                        delta = getattr(chunk, "delta", None)
-                        text_delta = getattr(delta, "text", None) if delta is not None else None
+                        chunk_text = getattr(chunk, "text", None)
+                        if isinstance(chunk_text, str):
+                            text_delta = chunk_text
+                    if text_delta is None:
+                        chunk_content = getattr(chunk, "content", None)
+                        if isinstance(chunk_content, str):
+                            text_delta = chunk_content
+                    if text_delta is None and isinstance(chunk, str):
+                        text_delta = chunk
                     if isinstance(text_delta, str):
                         assistant_fragments.append(text_delta)
                 yield chunk
@@ -846,12 +904,9 @@ class LucyAgent(Agent):
 
         return _llm_stream()
 
-    def on_user_turn_completed(self, turn_ctx, new_message):
+    async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
         if PIPELINE_TEXT_DEBUG:
-            msg_text = getattr(new_message, "text", None)
-            if msg_text is None:
-                msg_text = getattr(new_message, "content", "")
-            msg_str = str(msg_text or "")
+            msg_str = _extract_text_for_debug(new_message)
             messages = getattr(turn_ctx, "messages", None)
             message_count = "n/a"
             if messages is not None:
@@ -865,10 +920,6 @@ class LucyAgent(Agent):
                 _redact_sensitive_text(msg_str)[:200],
                 message_count,
             )
-        default_hook = getattr(Agent.default, "on_user_turn_completed", None)
-        if callable(default_hook):
-            return default_hook(self, turn_ctx, new_message)
-        return None
 
 
 
