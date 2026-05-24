@@ -597,11 +597,11 @@ def build_tts():
         )
         voice_kind = "None"
         voice_provider_effective = "n/a"
-        if isinstance(voice, hume.VoiceById):
+        if hume_voice_id:
             voice_kind = "VoiceById"
-        elif isinstance(voice, hume.VoiceByName):
+        elif hume_voice_name:
             voice_kind = "VoiceByName"
-            voice_provider_effective = _safe_attr(voice, "provider", "n/a")
+            voice_provider_effective = hume_voice_provider or "hume"
         logger.info(
             "Hume TTS effective config: model_version=%s voice_kind=%s voice_present=%s voice_provider=%s instant_mode=%s speed=%s description_length=%s trailing_silence_supported=%s trailing_silence_applied=%s trailing_silence_value=%s debug_http=%s",
             hume_tts_kwargs.get("model_version"),
