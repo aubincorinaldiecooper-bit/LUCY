@@ -46,9 +46,8 @@ Style rules:
 - Never over-explain emotions.
 - Never use therapy-style or motivational language.
 - Never sound overly polished.
-- Respond specifically to the user’s latest words.
-- Vary wording across nearby turns and avoid repetitive filler phrases.
-- Stay casual, warm, and minimal without canned-sounding loops.
+- Write replies as spoken lines with emotion carried by wording itself; use natural pauses, simple phrasing, and short reactions.
+- Do not use bracketed stage directions like “[warmly]” or “[laughs]”.
 
 Response limits:
 - Most replies should be 5 to 14 words.
@@ -74,6 +73,8 @@ Safety:
 If the user may hurt themselves or someone else, stop being casual and be direct. Tell them to pause, step away from anything dangerous, contact emergency services or a local crisis line, and reach out to someone they trust right now. Do not encourage self-harm, violence, revenge, or escalation.""".strip()
 
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT)
+if "SYSTEM_PROMPT" in os.environ:
+    logger.warning("SYSTEM_PROMPT env override detected; code-level prompt edits may not affect production unless Railway SYSTEM_PROMPT is updated")
 
 TTS_PROVIDER = os.getenv("TTS_PROVIDER", "deepgram").strip().lower()
 STT_PROVIDER = os.getenv("STT_PROVIDER", "mistral").strip().lower()
@@ -858,6 +859,10 @@ def build_tts():
 
         hume_speed = float(os.getenv("HUME_SPEED", "0.9"))
         hume_tts_debug_http = env_bool("HUME_TTS_DEBUG_HTTP", False)
+        hume_style_context = (os.getenv("HUME_STYLE_CONTEXT") or "").strip()
+        hume_style_context_present = bool(hume_style_context)
+        hume_style_context_length = len(hume_style_context)
+        hume_context_source = "HUME_STYLE_CONTEXT" if hume_style_context_present else "none"
         hume_description = os.getenv("HUME_DESCRIPTION") or (
             "A warm, calm, natural companion voice. Speak with relaxed pacing, soft sentence endings, "
             "and brief natural pauses between thoughts. Do not sound rushed, clipped, or abrupt at the end of sentences."
@@ -882,6 +887,22 @@ def build_tts():
                 hume_description_present,
                 hume_description_length,
             )
+        hume_style_context_applied = False
+        if hume_style_context_present:
+            if "context" in hume_tts_signature.parameters:
+                hume_tts_kwargs["context"] = hume_style_context
+                hume_style_context_applied = True
+            else:
+                logger.warning("Hume style context unsupported by installed constructor; context not applied")
+        logger.info(
+            "Hume style context: hume_style_context_present=%s hume_style_context_length=%s hume_style_context_applied=%s hume_context_source=%s description_applied=%s model_version=%s",
+            hume_style_context_present,
+            hume_style_context_length,
+            hume_style_context_applied,
+            hume_context_source,
+            description_applied,
+            hume_model_version,
+        )
         trailing_silence_applied = False
         trailing_silence_supported = "trailing_silence" in hume_tts_signature.parameters
         if trailing_silence_supported:
@@ -910,7 +931,7 @@ def build_tts():
             voice_kind = "VoiceByName"
             voice_provider_effective = hume_voice_provider or "hume"
         logger.info(
-            "Hume TTS effective config: model_version=%s voice_kind=%s voice_present=%s voice_provider=%s instant_mode=%s speed=%s description_present=%s description_applied=%s description_length=%s trailing_silence_supported=%s trailing_silence_applied=%s trailing_silence_value=%s debug_http=%s",
+            "Hume TTS effective config: model_version=%s voice_kind=%s voice_present=%s voice_provider=%s instant_mode=%s speed=%s description_present=%s description_applied=%s description_length=%s trailing_silence_supported=%s trailing_silence_applied=%s trailing_silence_value=%s hume_style_context_present=%s hume_style_context_length=%s hume_style_context_applied=%s debug_http=%s",
             hume_tts_kwargs.get("model_version"),
             voice_kind,
             bool(voice),
@@ -923,6 +944,9 @@ def build_tts():
             trailing_silence_supported,
             trailing_silence_applied,
             hume_trailing_silence if trailing_silence_applied else "n/a",
+            hume_style_context_present,
+            hume_style_context_length,
+            hume_style_context_applied,
             hume_tts_debug_http,
         )
 
