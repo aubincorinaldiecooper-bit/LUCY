@@ -3,6 +3,7 @@ import asyncio
 import inspect
 import logging
 import time
+import hashlib
 from typing import Any, AsyncIterable
 
 import aiohttp
@@ -71,6 +72,11 @@ VAD_PROVIDER = os.getenv("VAD_PROVIDER", "ai_coustics").strip().lower()
 LIVEKIT_TURN_DETECTION_MODE = os.getenv("LIVEKIT_TURN_DETECTION_MODE", "vad").strip().lower()
 
 _speech_counter = 0
+_hume_tts_request_counter = 0
+_latest_normalized_text_hash = "n/a"
+_latest_agent_state_for_hume = "unknown"
+_latest_active_assistant_count_for_hume = 0
+_latest_current_speech_id_for_hume = "n/a"
 
 
 def _next_local_speech_id() -> str:
@@ -180,6 +186,7 @@ def _safe_nested_error_details(error: object) -> dict[str, str]:
 
 
 def attach_session_diagnostics(session: AgentSession) -> None:
+    global _latest_agent_state_for_hume, _latest_active_assistant_count_for_hume, _latest_current_speech_id_for_hume
     active_speech_handles: dict[str, object] = {}
     _local_speech_ids: dict[int, str] = {}
     payload_debug_logged = False
@@ -204,6 +211,8 @@ def attach_session_diagnostics(session: AgentSession) -> None:
     last_stt_final_preview = ""
     last_user_speaking_at = 0.0
     last_user_listening_at = 0.0
+    hume_request_count_at_speech_start: dict[str, int] = {}
+    hume_request_count_at_speech_finish: dict[str, int] = {}
 
     def _resolve_speech_handle(event_or_handle: object) -> object:
         for attr in ("speech_handle", "handle", "speech"):
@@ -399,7 +408,16 @@ def attach_session_diagnostics(session: AgentSession) -> None:
 
         if not suppressed:
             active_speech_handles[speech_id] = resolved_handle
+            hume_request_count_at_speech_start[speech_id] = _hume_tts_request_counter
+            _latest_current_speech_id_for_hume = speech_id
+            _latest_active_assistant_count_for_hume = len(active_speech_handles)
             logger.info("Assistant speech started: speech_id=%s active_count=%s", speech_id, len(active_speech_handles))
+            logger.info(
+                "Assistant speech Hume request baseline: speech_id=%s hume_request_count_at_start=%s active_count=%s",
+                speech_id,
+                hume_request_count_at_speech_start[speech_id],
+                len(active_speech_handles),
+            )
 
         add_done_callback = getattr(resolved_handle, "add_done_callback", None)
         if callable(add_done_callback):
@@ -408,6 +426,7 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                 done_resolved_handle = _resolve_speech_handle(done_event_or_handle)
                 done_id = _speech_id(done_resolved_handle)
                 active_speech_handles.pop(done_id, None)
+                _latest_active_assistant_count_for_hume = len(active_speech_handles)
                 finished_at = time.monotonic()
                 started_at = speech_start_times.pop(done_id, None)
                 was_suppressed = done_id in suppressed_speech_ids
@@ -421,8 +440,24 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                     listening_at - finished_at if listening_at is not None else -1.0
                 )
                 assistant_speech_finished_at[done_id] = finished_at
+                hume_request_count_at_speech_finish[done_id] = _hume_tts_request_counter
                 pending_user_handoff_speech_id = done_id
                 logger.info("Assistant speech finished: speech_id=%s interrupted=%s active_count=%s was_suppressed=%s", done_id, interrupted, len(active_speech_handles), was_suppressed)
+                start_count = hume_request_count_at_speech_start.get(done_id, -1)
+                finish_count = hume_request_count_at_speech_finish.get(done_id, -1)
+                during_count = finish_count - start_count if start_count >= 0 and finish_count >= 0 else -1
+                logger.info(
+                    "Assistant speech Hume request summary: speech_id=%s interrupted=%s was_suppressed=%s hume_request_count_at_start=%s hume_request_count_at_finish=%s hume_requests_during_speech=%s speech_duration_seconds=%.3f latest_agent_state=%s latest_user_state=%s",
+                    done_id,
+                    interrupted,
+                    was_suppressed,
+                    start_count,
+                    finish_count,
+                    during_count,
+                    speech_duration_seconds,
+                    latest_agent_state,
+                    latest_user_state,
+                )
                 logger.info(
                     "Assistant handoff timing: speech_id=%s speech_duration_seconds=%.3f agent_speaking_to_finished_seconds=%.3f finish_to_agent_listening_seconds=%.3f interrupted=%s was_suppressed=%s active_count=%s",
                     done_id,
@@ -447,10 +482,14 @@ def attach_session_diagnostics(session: AgentSession) -> None:
         nonlocal latest_agent_state, latest_agent_state_timestamp
         extracted_new_state = _extract_agent_new_state(state)
         latest_agent_state = extracted_new_state
+        _latest_agent_state_for_hume = extracted_new_state
         latest_agent_state_timestamp = time.monotonic()
         current_speech = getattr(session, "current_speech", None)
         has_current_speech = current_speech is not None
         current_speech_id = _speech_id(current_speech) if has_current_speech else None
+        if current_speech_id is not None:
+            _latest_current_speech_id_for_hume = current_speech_id
+        _latest_active_assistant_count_for_hume = len(active_speech_handles)
         if extracted_new_state == "speaking" and current_speech_id is not None:
             agent_speaking_at[current_speech_id] = latest_agent_state_timestamp
         old_state = getattr(state, "old_state", None)
@@ -804,10 +843,20 @@ def build_tts():
                 )
 
             async def _on_request_start(session, trace_config_ctx, params):
+                global _hume_tts_request_counter
+                _hume_tts_request_counter += 1
                 logger.info(
-                    "Hume TTS HTTP request: method=%s path=%s debug=true",
+                    "Hume TTS HTTP request: hume_request_index=%s method=%s path=%s latest_agent_state=%s active_assistant_count=%s current_speech_id=%s instant_mode=%s speed=%s trailing_silence=%s normalized_text_hash=%s debug=true",
+                    _hume_tts_request_counter,
                     params.method,
                     _redact_sensitive_text(params.url.path),
+                    _latest_agent_state_for_hume,
+                    _latest_active_assistant_count_for_hume,
+                    _latest_current_speech_id_for_hume,
+                    instant_mode,
+                    hume_speed,
+                    hume_trailing_silence,
+                    _latest_normalized_text_hash,
                 )
 
             async def _on_request_end(session, trace_config_ctx, params):
@@ -879,6 +928,7 @@ class LucyAgent(Agent):
         return normalized
 
     def tts_node(self, text: AsyncIterable[str], model_settings):
+        global _latest_normalized_text_hash
         if not SPOKEN_TEXT_NORMALIZATION:
             logger.info("Spoken text normalization enabled=false")
             if not TTS_TEXT_DEBUG:
@@ -913,6 +963,26 @@ class LucyAgent(Agent):
                 chunks.append(chunk)
             raw_text = "".join(chunks)
             normalized = self._normalize_spoken_text(raw_text)
+            normalized_hash = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:12] if normalized else "empty"
+            _latest_normalized_text_hash = normalized_hash
+            sentence_end_count = sum(normalized.count(mark) for mark in (".", "?", "!", "…"))
+            newline_count = normalized.count("\n")
+            logger.info(
+                "TTS normalized yield diagnostics: tts_normalized_yield_count=%s raw_chunk_count=%s raw_total_length=%s normalized_text_length=%s normalized_text_preview=%s normalized_text_hash=%s sentence_end_count=%s newline_count=%s SPOKEN_TEXT_NORMALIZATION=%s TTS_PROVIDER=%s HUME_INSTANT_MODE=%s HUME_SPEED=%s HUME_TRAILING_SILENCE=%s",
+                1,
+                chunk_count,
+                len(raw_text),
+                len(normalized),
+                _redact_sensitive_text(normalized)[:200],
+                normalized_hash,
+                sentence_end_count,
+                newline_count,
+                SPOKEN_TEXT_NORMALIZATION,
+                TTS_PROVIDER,
+                env_bool("HUME_INSTANT_MODE", True),
+                os.getenv("HUME_SPEED", "0.9"),
+                os.getenv("HUME_TRAILING_SILENCE", "0.25"),
+            )
             if TTS_TEXT_DEBUG:
                 logger.info(
                     "TTS text debug: raw_chunk_count=%s raw_total_length=%s raw_preview=%s final_preview=%s",
