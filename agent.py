@@ -971,6 +971,7 @@ class LucyAgent(Agent):
         logger.info("Spoken text normalization enabled=true mode=buffered_full_segment")
 
         async def _normalized_text_stream() -> AsyncIterable[str]:
+            global _latest_normalized_text_hash
             chunks: list[str] = []
             chunk_count = 0
             async for chunk in text:
@@ -1012,13 +1013,21 @@ class LucyAgent(Agent):
                 yield normalized
 
         if TTS_PROVIDER == "hume":
+            full_utterance_requested = bool(HUME_FULL_UTTERANCE_TTS)
+            full_utterance_supported = False
+            full_utterance_used = False
+            fallback_reason = "not_requested"
+            if full_utterance_requested:
+                fallback_reason = "no_verified_supported_livekit_or_hume_one_shot_path_in_current_environment"
             logger.info(
-                "Hume full-utterance mode: enabled=%s attempted=%s path=%s",
-                HUME_FULL_UTTERANCE_TTS,
-                HUME_FULL_UTTERANCE_TTS,
+                "Hume full-utterance mode: full_utterance_requested=%s full_utterance_supported=%s full_utterance_used=%s path=%s fallback_reason=%s",
+                full_utterance_requested,
+                full_utterance_supported,
+                full_utterance_used,
                 "default_livekit_tts_node_single_segment",
+                fallback_reason,
             )
-            if HUME_FULL_UTTERANCE_TTS:
+            if full_utterance_requested:
                 logger.warning(
                     "Hume full-utterance mode fallback: installed LiveKit source could not be inspected in this build environment; no documented runtime sentence-tokenizer override detected here, using default LiveKit tts_node with single normalized segment."
                 )
