@@ -656,6 +656,80 @@ TTS_TEXT_DEBUG = env_bool("TTS_TEXT_DEBUG", False)
 PIPELINE_TEXT_DEBUG = env_bool("PIPELINE_TEXT_DEBUG", False)
 MISTRAL_STT_DIAGNOSTICS = env_bool("MISTRAL_STT_DIAGNOSTICS", True)
 HUME_FULL_UTTERANCE_TTS = env_bool("HUME_FULL_UTTERANCE_TTS", False)
+LIVEKIT_TTS_SOURCE_INSPECTION = env_bool("LIVEKIT_TTS_SOURCE_INSPECTION", False)
+
+
+def _safe_source_excerpt(obj: object, max_chars: int) -> str:
+    try:
+        src = inspect.getsource(obj)
+    except Exception as e:
+        return f"<unavailable: {_redact_sensitive_text(e)}>"
+    sanitized = src.replace("\r", "")
+    return sanitized[:max_chars]
+
+
+def _log_livekit_tts_source_inspection() -> None:
+    if not LIVEKIT_TTS_SOURCE_INSPECTION:
+        return
+    try:
+        import livekit.agents as lk_agents  # type: ignore
+        import livekit.plugins.hume as lk_hume  # type: ignore
+        from livekit.agents import Agent as LKAgent  # type: ignore
+    except Exception as e:
+        logger.warning("LiveKit TTS source inspection unavailable: reason=%s", _redact_sensitive_text(e))
+        return
+
+    inspect_terms = ("sentence", "tokenizer", "tokenize", "segment", "chunk", "synthesize", "stream", "capabilities")
+    agents_version = getattr(lk_agents, "__version__", "unknown")
+    agents_path = getattr(lk_agents, "__file__", "unknown")
+    hume_module_path = getattr(lk_hume, "__file__", "unknown")
+    default_tts_node = getattr(LKAgent.default, "tts_node", None)
+    tts_node_signature = str(inspect.signature(default_tts_node)) if callable(default_tts_node) else "unavailable"
+    tts_node_file = inspect.getsourcefile(default_tts_node) if callable(default_tts_node) else "unavailable"
+    tts_node_src = _safe_source_excerpt(default_tts_node, 5000) if callable(default_tts_node) else "<unavailable>"
+
+    hume_tts_cls = getattr(lk_hume, "TTS", None)
+    hume_init_sig = "unavailable"
+    hume_src = "<unavailable>"
+    hume_synthesize_sig = "unavailable"
+    hume_synthesize_src = "<unavailable>"
+    hume_stream_sig = "unavailable"
+    hume_stream_src = "<unavailable>"
+    hume_caps = "unavailable"
+    if hume_tts_cls is not None:
+        hume_src = _safe_source_excerpt(hume_tts_cls, 8000)
+        init_fn = getattr(hume_tts_cls, "__init__", None)
+        if callable(init_fn):
+            hume_init_sig = str(inspect.signature(init_fn))
+        synth_fn = getattr(hume_tts_cls, "synthesize", None)
+        if callable(synth_fn):
+            hume_synthesize_sig = str(inspect.signature(synth_fn))
+            hume_synthesize_src = _safe_source_excerpt(synth_fn, 4000)
+        stream_fn = getattr(hume_tts_cls, "stream", None)
+        if callable(stream_fn):
+            hume_stream_sig = str(inspect.signature(stream_fn))
+            hume_stream_src = _safe_source_excerpt(stream_fn, 4000)
+        caps = getattr(hume_tts_cls, "capabilities", None)
+        if caps is not None:
+            hume_caps = _redact_sensitive_text(caps)
+
+    combined = "\n".join([tts_node_src, hume_src, hume_synthesize_src, hume_stream_src]).lower()
+    term_presence = {term: (term in combined) for term in inspect_terms}
+    logger.info(
+        "LiveKit TTS source inspection summary: agents_version=%s agents_module=%s agent_default_tts_node_file=%s agent_default_tts_node_signature=%s hume_module=%s hume_tts_init_signature=%s hume_tts_capabilities=%s term_presence=%s",
+        agents_version,
+        agents_path,
+        tts_node_file or "unknown",
+        tts_node_signature,
+        hume_module_path,
+        hume_init_sig,
+        hume_caps,
+        term_presence,
+    )
+    logger.info("LiveKit Agent.default.tts_node source excerpt (max_5000): %s", tts_node_src)
+    logger.info("LiveKit Hume TTS class source excerpt (max_8000): %s", hume_src)
+    logger.info("LiveKit Hume TTS.synthesize signature=%s source_excerpt(max_4000): %s", hume_synthesize_sig, hume_synthesize_src)
+    logger.info("LiveKit Hume TTS.stream signature=%s source_excerpt(max_4000): %s", hume_stream_sig, hume_stream_src)
 
 
 def _resolve_ai_coustics_model(model_name: str):
@@ -1205,6 +1279,7 @@ def _attach_optional_interruption_diagnostics(session: AgentSession) -> None:
 
 
 async def entrypoint(ctx: JobContext):
+    _log_livekit_tts_source_inspection()
     llm = openai.LLM.with_openrouter(model=os.getenv("OPENROUTER_MODEL", "openai/gpt-4o"))
     # TODO: Re-enable Tavily using LiveKit's supported function-tool pattern.
     logger.warning("Skipping Tavily tools for MVP voice path")
