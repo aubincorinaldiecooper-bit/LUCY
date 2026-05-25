@@ -6,6 +6,9 @@ import time
 import hashlib
 import re
 import contextvars
+import struct
+import wave
+import io
 from typing import Any, AsyncIterable
 
 import aiohttp
@@ -13,6 +16,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from livekit.agents import Agent, AgentSession, InterruptionOptions, JobContext, TurnHandlingOptions, WorkerOptions, cli, room_io
+from livekit import rtc
 from livekit.plugins import ai_coustics, deepgram, hume, mistralai, openai, silero
 from tavily import TavilyClient
 
@@ -83,6 +87,7 @@ _latest_agent_state_for_hume = "unknown"
 _latest_active_assistant_count_for_hume = 0
 _latest_current_speech_id_for_hume = "n/a"
 _normalized_text_hash_ctx: contextvars.ContextVar[str] = contextvars.ContextVar("normalized_text_hash", default="n/a")
+_direct_hume_request_counter = 0
 
 
 def _next_local_speech_id() -> str:
@@ -657,6 +662,28 @@ PIPELINE_TEXT_DEBUG = env_bool("PIPELINE_TEXT_DEBUG", False)
 MISTRAL_STT_DIAGNOSTICS = env_bool("MISTRAL_STT_DIAGNOSTICS", True)
 HUME_FULL_UTTERANCE_TTS = env_bool("HUME_FULL_UTTERANCE_TTS", False)
 LIVEKIT_TTS_SOURCE_INSPECTION = env_bool("LIVEKIT_TTS_SOURCE_INSPECTION", False)
+HUME_DIRECT_API_TTS = env_bool("HUME_DIRECT_API_TTS", False)
+
+
+def _pcm16_to_audio_frames(pcm_data: bytes, sample_rate: int, channels: int) -> list[rtc.AudioFrame]:
+    bytes_per_sample = 2
+    frame_samples_per_channel = max(1, int(sample_rate * 0.02))
+    frame_bytes = frame_samples_per_channel * channels * bytes_per_sample
+    frames: list[rtc.AudioFrame] = []
+    cursor = 0
+    while cursor < len(pcm_data):
+        chunk = pcm_data[cursor : cursor + frame_bytes]
+        cursor += frame_bytes
+        if len(chunk) < frame_bytes:
+            chunk = chunk + (b"\x00" * (frame_bytes - len(chunk)))
+        frame = rtc.AudioFrame(
+            data=chunk,
+            sample_rate=sample_rate,
+            num_channels=channels,
+            samples_per_channel=frame_samples_per_channel,
+        )
+        frames.append(frame)
+    return frames
 
 
 def _safe_source_excerpt(obj: object, max_chars: int) -> str:
@@ -1106,6 +1133,121 @@ class LucyAgent(Agent):
                     "Hume full-utterance mode fallback: installed LiveKit source could not be inspected in this build environment; no documented runtime sentence-tokenizer override detected here, using default LiveKit tts_node with single normalized segment."
                 )
 
+        if TTS_PROVIDER == "hume" and SPOKEN_TEXT_NORMALIZATION and HUME_DIRECT_API_TTS:
+            async def _direct_hume_or_fallback_stream() -> AsyncIterable[rtc.AudioFrame]:
+                global _direct_hume_request_counter
+                normalized_segments: list[str] = []
+                async for seg in _normalized_text_stream():
+                    if seg:
+                        normalized_segments.append(seg)
+                normalized_text = " ".join(normalized_segments).strip()
+                normalized_hash = _latest_normalized_text_hash if _latest_normalized_text_hash != "n/a" else _normalized_text_hash_ctx.get()
+                sentence_end_count = sum(normalized_text.count(mark) for mark in (".", "?", "!", "…"))
+                logger.info(
+                    "Direct Hume TTS attempt: hume_direct_api_tts_requested=%s normalized_text_hash=%s text_length=%s sentence_end_count=%s",
+                    True,
+                    normalized_hash,
+                    len(normalized_text),
+                    sentence_end_count,
+                )
+                if not normalized_text:
+                    logger.warning("Direct Hume TTS fallback: direct_api_fallback_reason=empty_normalized_text")
+                    async for frame in Agent.default.tts_node(self, _normalized_text_stream(), model_settings):
+                        yield frame
+                    return
+
+                hume_api_key = os.getenv("HUME_API_KEY", "").strip()
+                hume_voice_id = os.getenv("HUME_VOICE_ID", "").strip()
+                if not hume_api_key or not hume_voice_id:
+                    logger.warning("Direct Hume TTS fallback: direct_api_fallback_reason=missing_required_hume_api_key_or_voice_id")
+                    async for frame in Agent.default.tts_node(self, _normalized_text_stream(), model_settings):
+                        yield frame
+                    return
+
+                endpoint_path = "/v0/tts/stream/file"
+                endpoint_url = f"https://api.hume.ai{endpoint_path}"
+                request_body = {
+                    "utterances": [{"text": normalized_text, "voice": {"id": hume_voice_id}}],
+                    "split_utterances": False,
+                    "instant_mode": env_bool("HUME_INSTANT_MODE", True),
+                    "speed": float(os.getenv("HUME_SPEED", "0.9")),
+                    "trailing_silence": float(os.getenv("HUME_TRAILING_SILENCE", "0.25")),
+                    "format": {"type": "wav"},
+                }
+                headers = {
+                    "X-Hume-Api-Key": hume_api_key,
+                    "Content-Type": "application/json",
+                }
+                _direct_hume_request_counter += 1
+                request_index = _direct_hume_request_counter
+                start = time.monotonic()
+                yielded_count = 0
+                first_audio_at = None
+                try:
+                    async with aiohttp.ClientSession() as sess:
+                        async with sess.post(endpoint_url, json=request_body, headers=headers) as resp:
+                            if resp.status >= 400:
+                                logger.warning(
+                                    "Direct Hume TTS fallback: hume_direct_api_tts_used=%s direct_api_fallback_reason=http_status_%s endpoint_used=%s direct_hume_request_index=%s",
+                                    False,
+                                    resp.status,
+                                    endpoint_path,
+                                    request_index,
+                                )
+                                async for frame in Agent.default.tts_node(self, _normalized_text_stream(), model_settings):
+                                    yield frame
+                                return
+                            audio_bytes = await resp.read()
+                    with wave.open(io.BytesIO(audio_bytes), "rb") as wf:
+                        channels = wf.getnchannels()
+                        source_sample_rate = wf.getframerate()
+                        pcm = wf.readframes(wf.getnframes())
+                    frames = _pcm16_to_audio_frames(pcm, source_sample_rate, channels)
+                    for frame in frames:
+                        if first_audio_at is None:
+                            first_audio_at = time.monotonic()
+                        yielded_count += 1
+                        yield frame
+                    total_tts_seconds = time.monotonic() - start
+                    ttf = (first_audio_at - start) if first_audio_at is not None else -1.0
+                    logger.info(
+                        "Direct Hume TTS success: hume_direct_api_tts_used=%s direct_api_fallback_reason=%s normalized_text_hash=%s endpoint_used=%s audio_format_used=%s source_sample_rate=%s output_sample_rate=%s channels=%s frame_count_yielded=%s time_to_first_audio_seconds=%.3f total_tts_seconds=%.3f direct_hume_request_count=%s direct_hume_request_index=%s",
+                        True,
+                        "none",
+                        normalized_hash,
+                        endpoint_path,
+                        "wav",
+                        source_sample_rate,
+                        source_sample_rate,
+                        channels,
+                        yielded_count,
+                        ttf,
+                        total_tts_seconds,
+                        _direct_hume_request_counter,
+                        request_index,
+                    )
+                except Exception as e:
+                    if yielded_count > 0:
+                        logger.warning(
+                            "Direct Hume TTS ended after partial output: hume_direct_api_tts_used=%s direct_api_fallback_reason=%s frame_count_yielded=%s direct_hume_request_index=%s",
+                            True,
+                            _redact_sensitive_text(e),
+                            yielded_count,
+                            request_index,
+                        )
+                        return
+                    logger.warning(
+                        "Direct Hume TTS fallback: hume_direct_api_tts_used=%s direct_api_fallback_reason=%s endpoint_used=%s direct_hume_request_index=%s",
+                        False,
+                        _redact_sensitive_text(e),
+                        endpoint_path,
+                        request_index,
+                    )
+                    async for frame in Agent.default.tts_node(self, _normalized_text_stream(), model_settings):
+                        yield frame
+
+            return _direct_hume_or_fallback_stream()
+
         return Agent.default.tts_node(self, _normalized_text_stream(), model_settings)
 
     def llm_node(self, chat_ctx, tools, model_settings):
@@ -1345,6 +1487,7 @@ async def entrypoint(ctx: JobContext):
     logger.info("Startup Mistral STT config: model=%s target_streaming_delay_ms=%s applied=%s", mistral_stt_model, mistral_target_streaming_delay_ms, mistral_target_delay_supported)
     logger.info("MISTRAL_STT_DIAGNOSTICS enabled=%s", MISTRAL_STT_DIAGNOSTICS)
     logger.info("HUME_FULL_UTTERANCE_TTS enabled=%s", HUME_FULL_UTTERANCE_TTS)
+    logger.info("HUME_DIRECT_API_TTS enabled=%s", HUME_DIRECT_API_TTS)
     try:
         from livekit.agents import Agent as _AgentInspect
 
