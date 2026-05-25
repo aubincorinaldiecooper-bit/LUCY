@@ -812,15 +812,17 @@ def build_room_options() -> room_io.RoomOptions | None:
         )
     )
 
-def _resolve_hume_model_version() -> str | None:
-    hume_model = os.getenv("HUME_MODEL", "octave-2").strip().lower()
+def _resolve_hume_model_version() -> tuple[str, str]:
+    hume_model_raw = (os.getenv("HUME_MODEL", "octave-2") or "octave-2").strip()
+    hume_model = hume_model_raw.lower()
     if not hume_model:
-        return None
+        return "octave-2", "2"
     if hume_model in {"octave-2", "2", "v2"}:
-        return "2"
+        return hume_model_raw, "2"
     if hume_model in {"octave-1", "1", "v1"}:
-        return "1"
-    return hume_model
+        return hume_model_raw, "1"
+    logger.warning("Unsupported HUME_MODEL=%s; falling back to octave-2 (model_version=2)", _redact_sensitive_text(hume_model_raw))
+    return hume_model_raw, "2"
 
 
 def build_tts():
@@ -870,7 +872,7 @@ def build_tts():
         hume_description_present = bool(hume_description)
         hume_description_length = len(hume_description)
         hume_trailing_silence = float(os.getenv("HUME_TRAILING_SILENCE", "0.25"))
-        hume_model_version = _resolve_hume_model_version()
+        hume_model_raw, hume_model_version = _resolve_hume_model_version()
         hume_tts_signature = inspect.signature(hume.TTS)
         hume_tts_kwargs: dict[str, Any] = {
             "voice": voice,
@@ -888,20 +890,30 @@ def build_tts():
                 hume_description_length,
             )
         hume_style_context_applied = False
+        hume_style_context_skip_reason = "none"
         if hume_style_context_present:
-            if "context" in hume_tts_signature.parameters:
-                hume_tts_kwargs["context"] = hume_style_context
-                hume_style_context_applied = True
-            else:
-                logger.warning("Hume style context unsupported by installed constructor; context not applied")
+            hume_style_context_skip_reason = "freeform_context_not_supported"
         logger.info(
-            "Hume style context: hume_style_context_present=%s hume_style_context_length=%s hume_style_context_applied=%s hume_context_source=%s description_applied=%s model_version=%s",
+            "Hume style context: hume_style_context_present=%s hume_style_context_length=%s hume_style_context_applied=%s hume_style_context_skip_reason=%s hume_context_source=%s description_applied=%s model_version=%s",
             hume_style_context_present,
             hume_style_context_length,
             hume_style_context_applied,
+            hume_style_context_skip_reason,
             hume_context_source,
             description_applied,
             hume_model_version,
+        )
+        description_skip_reason = "none" if description_applied else "octave2_unsupported"
+        logger.info(
+            "Hume model/description summary: hume_model_raw=%s model_version=%s description_present=%s description_applied=%s description_skip_reason=%s hume_style_context_present=%s hume_style_context_applied=%s hume_style_context_skip_reason=%s",
+            _redact_sensitive_text(hume_model_raw),
+            hume_model_version,
+            hume_description_present,
+            description_applied,
+            description_skip_reason,
+            hume_style_context_present,
+            hume_style_context_applied,
+            hume_style_context_skip_reason,
         )
         trailing_silence_applied = False
         trailing_silence_supported = "trailing_silence" in hume_tts_signature.parameters
