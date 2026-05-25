@@ -4,6 +4,8 @@ import inspect
 import logging
 import time
 import hashlib
+import re
+import contextvars
 from typing import Any, AsyncIterable
 
 import aiohttp
@@ -40,6 +42,9 @@ Style rules:
 - Never over-explain emotions.
 - Never use therapy-style or motivational language.
 - Never sound overly polished.
+- Respond specifically to the user’s latest words.
+- Vary wording across nearby turns and avoid repetitive filler phrases.
+- Stay casual, warm, and minimal without canned-sounding loops.
 
 Response limits:
 - Most replies should be 5 to 14 words.
@@ -77,6 +82,7 @@ _latest_normalized_text_hash = "n/a"
 _latest_agent_state_for_hume = "unknown"
 _latest_active_assistant_count_for_hume = 0
 _latest_current_speech_id_for_hume = "n/a"
+_normalized_text_hash_ctx: contextvars.ContextVar[str] = contextvars.ContextVar("normalized_text_hash", default="n/a")
 
 
 def _next_local_speech_id() -> str:
@@ -183,6 +189,13 @@ def _safe_nested_error_details(error: object) -> dict[str, str]:
                 details[f"{prefix}_body_code"] = _redact_sensitive_text(body_code)
         current = getattr(current, "error", None)
     return details
+
+
+def _sanitize_spoken_laughter(text: str) -> str:
+    if not text:
+        return text
+    pattern = r"\b(lol|lmao|rofl|haha|hehe)\b"
+    return re.sub(pattern, "", text, flags=re.IGNORECASE).strip()
 
 
 def attach_session_diagnostics(session: AgentSession) -> None:
@@ -642,6 +655,7 @@ SPOKEN_TEXT_NORMALIZATION = env_bool("SPOKEN_TEXT_NORMALIZATION", False)
 TTS_TEXT_DEBUG = env_bool("TTS_TEXT_DEBUG", False)
 PIPELINE_TEXT_DEBUG = env_bool("PIPELINE_TEXT_DEBUG", False)
 MISTRAL_STT_DIAGNOSTICS = env_bool("MISTRAL_STT_DIAGNOSTICS", True)
+HUME_FULL_UTTERANCE_TTS = env_bool("HUME_FULL_UTTERANCE_TTS", False)
 
 
 def _resolve_ai_coustics_model(model_name: str):
@@ -845,6 +859,7 @@ def build_tts():
             async def _on_request_start(session, trace_config_ctx, params):
                 global _hume_tts_request_counter
                 _hume_tts_request_counter += 1
+                ctx_hash = _normalized_text_hash_ctx.get()
                 logger.info(
                     "Hume TTS HTTP request: hume_request_index=%s method=%s path=%s latest_agent_state=%s active_assistant_count=%s current_speech_id=%s instant_mode=%s speed=%s trailing_silence=%s normalized_text_hash=%s debug=true",
                     _hume_tts_request_counter,
@@ -856,7 +871,7 @@ def build_tts():
                     instant_mode,
                     hume_speed,
                     hume_trailing_silence,
-                    _latest_normalized_text_hash,
+                    ctx_hash if ctx_hash != "n/a" else _latest_normalized_text_hash,
                 )
 
             async def _on_request_end(session, trace_config_ctx, params):
@@ -962,9 +977,11 @@ class LucyAgent(Agent):
                 chunk_count += 1
                 chunks.append(chunk)
             raw_text = "".join(chunks)
-            normalized = self._normalize_spoken_text(raw_text)
+            sanitized = _sanitize_spoken_laughter(raw_text)
+            normalized = self._normalize_spoken_text(sanitized)
             normalized_hash = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:12] if normalized else "empty"
             _latest_normalized_text_hash = normalized_hash
+            _normalized_text_hash_ctx.set(normalized_hash)
             sentence_end_count = sum(normalized.count(mark) for mark in (".", "?", "!", "…"))
             newline_count = normalized.count("\n")
             logger.info(
@@ -993,6 +1010,18 @@ class LucyAgent(Agent):
                 )
             if normalized:
                 yield normalized
+
+        if TTS_PROVIDER == "hume":
+            logger.info(
+                "Hume full-utterance mode: enabled=%s attempted=%s path=%s",
+                HUME_FULL_UTTERANCE_TTS,
+                HUME_FULL_UTTERANCE_TTS,
+                "default_livekit_tts_node_single_segment",
+            )
+            if HUME_FULL_UTTERANCE_TTS:
+                logger.warning(
+                    "Hume full-utterance mode fallback: installed LiveKit source could not be inspected in this build environment; no documented runtime sentence-tokenizer override detected here, using default LiveKit tts_node with single normalized segment."
+                )
 
         return Agent.default.tts_node(self, _normalized_text_stream(), model_settings)
 
@@ -1231,6 +1260,20 @@ async def entrypoint(ctx: JobContext):
     mistral_target_delay_supported = "target_streaming_delay_ms" in inspect.signature(mistralai.STT).parameters
     logger.info("Startup Mistral STT config: model=%s target_streaming_delay_ms=%s applied=%s", mistral_stt_model, mistral_target_streaming_delay_ms, mistral_target_delay_supported)
     logger.info("MISTRAL_STT_DIAGNOSTICS enabled=%s", MISTRAL_STT_DIAGNOSTICS)
+    logger.info("HUME_FULL_UTTERANCE_TTS enabled=%s", HUME_FULL_UTTERANCE_TTS)
+    try:
+        from livekit.agents import Agent as _AgentInspect
+
+        tts_node_src = inspect.getsourcefile(_AgentInspect)
+        logger.info(
+            "LiveKit source inspection summary: Agent.default.tts_node source_file=%s note=runtime may sentence-split non-streaming TTS implementations",
+            tts_node_src or "unknown",
+        )
+    except Exception as e:
+        logger.warning(
+            "LiveKit source inspection unavailable in current build environment; keeping default behavior and diagnostics only: reason=%s",
+            _redact_sensitive_text(e),
+        )
     if os.getenv("GRPC_TRACE") is not None or os.getenv("GRPC_VERBOSITY") is not None:
         logger.warning("Low-level gRPC tracing env vars are enabled and may be noisy")
 
