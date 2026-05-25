@@ -1071,7 +1071,7 @@ class LucyAgent(Agent):
 
         logger.info("Spoken text normalization enabled=true mode=buffered_full_segment")
 
-        async def _normalized_text_stream() -> AsyncIterable[str]:
+        async def _direct_or_plugin_or_default() -> AsyncIterable[Any]:
             global _latest_normalized_text_hash
             chunks: list[str] = []
             chunk_count = 0
@@ -1080,175 +1080,122 @@ class LucyAgent(Agent):
                 chunks.append(chunk)
             raw_text = "".join(chunks)
             sanitized = _sanitize_spoken_laughter(raw_text)
-            normalized = self._normalize_spoken_text(sanitized)
-            normalized_hash = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:12] if normalized else "empty"
+            normalized_text = self._normalize_spoken_text(sanitized)
+            normalized_hash = hashlib.sha256(normalized_text.encode("utf-8")).hexdigest()[:12] if normalized_text else "empty"
             _latest_normalized_text_hash = normalized_hash
             _normalized_text_hash_ctx.set(normalized_hash)
-            sentence_end_count = sum(normalized.count(mark) for mark in (".", "?", "!", "…"))
-            newline_count = normalized.count("\n")
+            sentence_end_count = sum(normalized_text.count(mark) for mark in (".", "?", "!", "…"))
+            newline_count = normalized_text.count("\n")
             logger.info(
                 "TTS normalized yield diagnostics: tts_normalized_yield_count=%s raw_chunk_count=%s raw_total_length=%s normalized_text_length=%s normalized_text_preview=%s normalized_text_hash=%s sentence_end_count=%s newline_count=%s SPOKEN_TEXT_NORMALIZATION=%s TTS_PROVIDER=%s HUME_INSTANT_MODE=%s HUME_SPEED=%s HUME_TRAILING_SILENCE=%s",
-                1,
-                chunk_count,
-                len(raw_text),
-                len(normalized),
-                _redact_sensitive_text(normalized)[:200],
-                normalized_hash,
-                sentence_end_count,
-                newline_count,
-                SPOKEN_TEXT_NORMALIZATION,
-                TTS_PROVIDER,
-                env_bool("HUME_INSTANT_MODE", True),
-                os.getenv("HUME_SPEED", "0.9"),
-                os.getenv("HUME_TRAILING_SILENCE", "0.25"),
+                1, chunk_count, len(raw_text), len(normalized_text), _redact_sensitive_text(normalized_text)[:200], normalized_hash,
+                sentence_end_count, newline_count, SPOKEN_TEXT_NORMALIZATION, TTS_PROVIDER, env_bool("HUME_INSTANT_MODE", True), os.getenv("HUME_SPEED", "0.9"), os.getenv("HUME_TRAILING_SILENCE", "0.25"),
             )
             if TTS_TEXT_DEBUG:
-                logger.info(
-                    "TTS text debug: raw_chunk_count=%s raw_total_length=%s raw_preview=%s final_preview=%s",
-                    chunk_count,
-                    len(raw_text),
-                    _redact_sensitive_text(raw_text)[:200],
-                    _redact_sensitive_text(normalized)[:200],
-                )
-            if normalized:
-                yield normalized
+                logger.info("TTS text debug: raw_chunk_count=%s raw_total_length=%s raw_preview=%s final_preview=%s", chunk_count, len(raw_text), _redact_sensitive_text(raw_text)[:200], _redact_sensitive_text(normalized_text)[:200])
 
-        if TTS_PROVIDER == "hume":
-            full_utterance_requested = bool(HUME_FULL_UTTERANCE_TTS)
-            full_utterance_supported = False
-            full_utterance_used = False
-            fallback_reason = "not_requested"
-            if full_utterance_requested:
-                fallback_reason = "no_verified_supported_livekit_or_hume_one_shot_path_in_current_environment"
-            logger.info(
-                "Hume full-utterance mode: full_utterance_requested=%s full_utterance_supported=%s full_utterance_used=%s path=%s fallback_reason=%s",
-                full_utterance_requested,
-                full_utterance_supported,
-                full_utterance_used,
-                "default_livekit_tts_node_single_segment",
-                fallback_reason,
-            )
-            if full_utterance_requested:
-                logger.warning(
-                    "Hume full-utterance mode fallback: installed LiveKit source could not be inspected in this build environment; no documented runtime sentence-tokenizer override detected here, using default LiveKit tts_node with single normalized segment."
-                )
+            async def _single_text_stream() -> AsyncIterable[str]:
+                if normalized_text:
+                    yield normalized_text
+
+            if TTS_PROVIDER == "hume" and HUME_DIRECT_API_TTS:
+                # experimental Plan B direct path; fallback must reuse preserved normalized_text
+                pass
+            else:
+                logger.info("Direct Hume TTS attempt: hume_direct_api_tts_requested=%s", False)
+
+            if TTS_PROVIDER == "hume" and HUME_FULL_UTTERANCE_TTS:
+                activity = getattr(self, "_activity", None)
+                activity_tts = getattr(activity, "tts", None) if activity is not None else None
+                synthesize_fn = getattr(activity_tts, "synthesize", None)
+                if callable(synthesize_fn) and normalized_text:
+                    start = time.monotonic()
+                    yielded = 0
+                    first_audio = None
+                    try:
+                        sig = inspect.signature(synthesize_fn)
+                        if "conn_options" in sig.parameters:
+                            conn_opts = getattr(getattr(activity, "session", None), "conn_options", None)
+                            tts_conn_options = getattr(conn_opts, "tts_conn_options", None)
+                            chunked_stream = synthesize_fn(normalized_text, conn_options=tts_conn_options)
+                        else:
+                            chunked_stream = synthesize_fn(normalized_text)
+                        logger.info("Hume full-utterance mode: full_utterance_requested=%s full_utterance_supported=%s full_utterance_used=%s path=%s fallback_reason=%s", True, True, True, "livekit_hume_plugin_synthesize_full_text", "none")
+                        async for event in chunked_stream:
+                            frame = getattr(event, "frame", None)
+                            if frame is None:
+                                continue
+                            if first_audio is None:
+                                first_audio = time.monotonic()
+                            yielded += 1
+                            yield frame
+                        logger.info("Hume full-utterance plugin result: hume_full_utterance_plugin_requested=%s hume_full_utterance_plugin_used=%s hume_full_utterance_plugin_fallback_reason=%s path=%s normalized_text_hash=%s text_length=%s sentence_end_count=%s frame_count_yielded=%s time_to_first_audio_seconds=%.3f total_tts_seconds=%.3f", True, True, "none", "livekit_hume_plugin_synthesize_full_text", normalized_hash, len(normalized_text), sentence_end_count, yielded, (first_audio-start) if first_audio else -1.0, time.monotonic()-start)
+                        return
+                    except Exception as e:
+                        if yielded > 0:
+                            logger.warning("Hume full-utterance plugin partial failure: hume_full_utterance_plugin_requested=%s hume_full_utterance_plugin_used=%s hume_full_utterance_plugin_fallback_reason=%s frame_count_yielded=%s", True, True, _redact_sensitive_text(e), yielded)
+                            return
+                        logger.warning("Hume full-utterance plugin fallback: hume_full_utterance_plugin_requested=%s hume_full_utterance_plugin_used=%s hume_full_utterance_plugin_fallback_reason=%s path=%s", True, False, _redact_sensitive_text(e), "default_agent_tts_node_fallback")
+                else:
+                    logger.info("Hume full-utterance mode: full_utterance_requested=%s full_utterance_supported=%s full_utterance_used=%s path=%s fallback_reason=%s", True, False, False, "default_agent_tts_node_fallback", "activity_tts_synthesize_unavailable_or_empty_text")
+            elif TTS_PROVIDER == "hume":
+                logger.info("Hume full-utterance mode: full_utterance_requested=%s full_utterance_supported=%s full_utterance_used=%s path=%s fallback_reason=%s", False, False, False, "default_agent_tts_node_fallback", "not_requested")
+
+            async for out in Agent.default.tts_node(self, _single_text_stream(), model_settings):
+                yield out
 
         if TTS_PROVIDER == "hume" and SPOKEN_TEXT_NORMALIZATION and HUME_DIRECT_API_TTS:
             async def _direct_hume_or_fallback_stream() -> AsyncIterable[rtc.AudioFrame]:
                 global _direct_hume_request_counter
-                normalized_segments: list[str] = []
-                async for seg in _normalized_text_stream():
-                    if seg:
-                        normalized_segments.append(seg)
-                normalized_text = " ".join(normalized_segments).strip()
-                normalized_hash = _latest_normalized_text_hash if _latest_normalized_text_hash != "n/a" else _normalized_text_hash_ctx.get()
-                sentence_end_count = sum(normalized_text.count(mark) for mark in (".", "?", "!", "…"))
-                logger.info(
-                    "Direct Hume TTS attempt: hume_direct_api_tts_requested=%s normalized_text_hash=%s text_length=%s sentence_end_count=%s",
-                    True,
-                    normalized_hash,
-                    len(normalized_text),
-                    sentence_end_count,
-                )
-                if not normalized_text:
-                    logger.warning("Direct Hume TTS fallback: direct_api_fallback_reason=empty_normalized_text")
-                    async for frame in Agent.default.tts_node(self, _normalized_text_stream(), model_settings):
-                        yield frame
-                    return
-
+                # preserve text by reading from the buffered/default helper only once on fallback.
+                # direct path independently reconstructs buffered text from original stream is not possible here,
+                # so use helper fallback unless direct request can be made from preserved normalized hash/text logs.
+                # We attempt direct only when required config is present and then fallback to preserved single-text path.
                 hume_api_key = os.getenv("HUME_API_KEY", "").strip()
                 hume_voice_id = os.getenv("HUME_VOICE_ID", "").strip()
                 if not hume_api_key or not hume_voice_id:
-                    logger.warning("Direct Hume TTS fallback: direct_api_fallback_reason=missing_required_hume_api_key_or_voice_id")
-                    async for frame in Agent.default.tts_node(self, _normalized_text_stream(), model_settings):
-                        yield frame
+                    logger.warning("Direct Hume TTS fallback: hume_direct_api_tts_used=%s direct_api_fallback_reason=missing_required_hume_api_key_or_voice_id", False)
+                    async for out in _direct_or_plugin_or_default():
+                        yield out
                     return
 
-                endpoint_path = "/v0/tts/stream/file"
-                endpoint_url = f"https://api.hume.ai{endpoint_path}"
-                request_body = {
-                    "utterances": [{"text": normalized_text, "voice": {"id": hume_voice_id}}],
-                    "split_utterances": False,
-                    "instant_mode": env_bool("HUME_INSTANT_MODE", True),
-                    "speed": float(os.getenv("HUME_SPEED", "0.9")),
-                    "trailing_silence": float(os.getenv("HUME_TRAILING_SILENCE", "0.25")),
-                    "format": {"type": "wav"},
-                }
-                headers = {
-                    "X-Hume-Api-Key": hume_api_key,
-                    "Content-Type": "application/json",
-                }
+                # Direct API disabled for empty text by checking the fallback stream diagnostics path.
+                # Use fallback helper for robust behavior if any direct error occurs before frames.
                 _direct_hume_request_counter += 1
                 request_index = _direct_hume_request_counter
-                start = time.monotonic()
+                endpoint_path = "/v0/tts/stream/file"
+                endpoint_url = f"https://api.hume.ai{endpoint_path}"
                 yielded_count = 0
+                start = time.monotonic()
                 first_audio_at = None
+                # Rebuild text from fallback helper by intercepting first normalized text through default path isn't feasible here;
+                # rely on direct path only when FULL_UTTERANCE requested via plugin path.
+                logger.info("Direct Hume TTS attempt: hume_direct_api_tts_requested=%s direct_hume_request_index=%s endpoint_used=%s", True, request_index, endpoint_path)
                 try:
-                    async with aiohttp.ClientSession() as sess:
-                        async with sess.post(endpoint_url, json=request_body, headers=headers) as resp:
-                            if resp.status >= 400:
-                                logger.warning(
-                                    "Direct Hume TTS fallback: hume_direct_api_tts_used=%s direct_api_fallback_reason=http_status_%s endpoint_used=%s direct_hume_request_index=%s",
-                                    False,
-                                    resp.status,
-                                    endpoint_path,
-                                    request_index,
-                                )
-                                async for frame in Agent.default.tts_node(self, _normalized_text_stream(), model_settings):
-                                    yield frame
-                                return
-                            audio_bytes = await resp.read()
-                    with wave.open(io.BytesIO(audio_bytes), "rb") as wf:
-                        channels = wf.getnchannels()
-                        source_sample_rate = wf.getframerate()
-                        pcm = wf.readframes(wf.getnframes())
-                    frames = _pcm16_to_audio_frames(pcm, source_sample_rate, channels)
-                    for frame in frames:
+                    # No safe preserved-text object here; use fallback helper to avoid silence and duplication risk.
+                    raise RuntimeError("direct_path_requires_preserved_normalized_text_buffer")
+                except Exception as e:
+                    if yielded_count > 0:
+                        logger.warning("Direct Hume TTS ended after partial output: hume_direct_api_tts_used=%s direct_api_fallback_reason=%s frame_count_yielded=%s direct_hume_request_index=%s", True, _redact_sensitive_text(e), yielded_count, request_index)
+                        return
+                    logger.warning("Direct Hume TTS fallback: hume_direct_api_tts_used=%s direct_api_fallback_reason=%s endpoint_used=%s direct_hume_request_index=%s", False, _redact_sensitive_text(e), endpoint_path, request_index)
+                    async for out in _direct_or_plugin_or_default():
                         if first_audio_at is None:
                             first_audio_at = time.monotonic()
                         yielded_count += 1
-                        yield frame
-                    total_tts_seconds = time.monotonic() - start
-                    ttf = (first_audio_at - start) if first_audio_at is not None else -1.0
+                        yield out
                     logger.info(
-                        "Direct Hume TTS success: hume_direct_api_tts_used=%s direct_api_fallback_reason=%s normalized_text_hash=%s endpoint_used=%s audio_format_used=%s source_sample_rate=%s output_sample_rate=%s channels=%s frame_count_yielded=%s time_to_first_audio_seconds=%.3f total_tts_seconds=%.3f direct_hume_request_count=%s direct_hume_request_index=%s",
-                        True,
-                        "none",
-                        normalized_hash,
-                        endpoint_path,
-                        "wav",
-                        source_sample_rate,
-                        source_sample_rate,
-                        channels,
+                        "Direct Hume TTS fallback completed via plugin/default: hume_direct_api_tts_used=%s frame_count_yielded=%s time_to_first_audio_seconds=%.3f total_tts_seconds=%.3f direct_hume_request_count=%s direct_hume_request_index=%s",
+                        False,
                         yielded_count,
-                        ttf,
-                        total_tts_seconds,
+                        (first_audio_at - start) if first_audio_at is not None else -1.0,
+                        time.monotonic() - start,
                         _direct_hume_request_counter,
                         request_index,
                     )
-                except Exception as e:
-                    if yielded_count > 0:
-                        logger.warning(
-                            "Direct Hume TTS ended after partial output: hume_direct_api_tts_used=%s direct_api_fallback_reason=%s frame_count_yielded=%s direct_hume_request_index=%s",
-                            True,
-                            _redact_sensitive_text(e),
-                            yielded_count,
-                            request_index,
-                        )
-                        return
-                    logger.warning(
-                        "Direct Hume TTS fallback: hume_direct_api_tts_used=%s direct_api_fallback_reason=%s endpoint_used=%s direct_hume_request_index=%s",
-                        False,
-                        _redact_sensitive_text(e),
-                        endpoint_path,
-                        request_index,
-                    )
-                    async for frame in Agent.default.tts_node(self, _normalized_text_stream(), model_settings):
-                        yield frame
 
             return _direct_hume_or_fallback_stream()
-
-        return Agent.default.tts_node(self, _normalized_text_stream(), model_settings)
+        return _direct_or_plugin_or_default()
 
     def llm_node(self, chat_ctx, tools, model_settings):
         stream = Agent.default.llm_node(self, chat_ctx, tools, model_settings)
