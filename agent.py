@@ -3,12 +3,22 @@ import asyncio
 import inspect
 import logging
 import time
+import hashlib
+import re
+import contextvars
+import struct
+import wave
+import io
+import subprocess
+import sys
 from typing import Any, AsyncIterable
 
+import aiohttp
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from livekit.agents import Agent, AgentSession, InterruptionOptions, JobContext, TurnHandlingOptions, WorkerOptions, cli, room_io
+from livekit import rtc
 from livekit.plugins import ai_coustics, deepgram, hume, mistralai, openai, silero
 from tavily import TavilyClient
 
@@ -38,6 +48,8 @@ Style rules:
 - Never over-explain emotions.
 - Never use therapy-style or motivational language.
 - Never sound overly polished.
+- Write replies as spoken lines with emotion carried by wording itself; use natural pauses, simple phrasing, and short reactions.
+- Do not use bracketed stage directions like “[warmly]” or “[laughs]”.
 
 Response limits:
 - Most replies should be 5 to 14 words.
@@ -63,6 +75,8 @@ Safety:
 If the user may hurt themselves or someone else, stop being casual and be direct. Tell them to pause, step away from anything dangerous, contact emergency services or a local crisis line, and reach out to someone they trust right now. Do not encourage self-harm, violence, revenge, or escalation.""".strip()
 
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT)
+if "SYSTEM_PROMPT" in os.environ:
+    logger.warning("SYSTEM_PROMPT env override detected; code-level prompt edits may not affect production unless Railway SYSTEM_PROMPT is updated")
 
 TTS_PROVIDER = os.getenv("TTS_PROVIDER", "deepgram").strip().lower()
 STT_PROVIDER = os.getenv("STT_PROVIDER", "mistral").strip().lower()
@@ -70,6 +84,22 @@ VAD_PROVIDER = os.getenv("VAD_PROVIDER", "ai_coustics").strip().lower()
 LIVEKIT_TURN_DETECTION_MODE = os.getenv("LIVEKIT_TURN_DETECTION_MODE", "vad").strip().lower()
 
 _speech_counter = 0
+_hume_tts_request_counter = 0
+_latest_normalized_text_hash = "n/a"
+_latest_agent_state_for_hume = "unknown"
+_latest_active_assistant_count_for_hume = 0
+_latest_current_speech_id_for_hume = "n/a"
+_normalized_text_hash_ctx: contextvars.ContextVar[str] = contextvars.ContextVar("normalized_text_hash", default="n/a")
+_direct_hume_request_counter = 0
+_last_llm_start_at = 0.0
+_last_llm_complete_at = 0.0
+_last_tts_request_start_at = 0.0
+_last_tts_first_audio_at = 0.0
+_last_tts_text_length = 0
+_last_tts_sentence_end_count = 0
+_last_tts_path = "n/a"
+_last_hume_model_version = "n/a"
+_last_hume_description_applied = "n/a"
 
 
 def _next_local_speech_id() -> str:
@@ -84,6 +114,12 @@ def _safe_attr(obj: object, name: str, default: str = "n/a") -> str:
     except Exception:
         return default
     return str(value)
+
+
+def _fmt_seconds(seconds: float | None) -> str:
+    if seconds is None or seconds < 0:
+        return "n/a"
+    return f"{seconds:.1f}s"
 
 
 def _redact_sensitive_text(value: object) -> str:
@@ -123,7 +159,86 @@ def _safe_error_summary(error: object) -> dict[str, str]:
     return summary
 
 
+def _safe_llm_error_details(error: object) -> dict[str, str]:
+    details: dict[str, str] = {"error_type": type(error).__name__}
+    nested = getattr(error, "error", None)
+    if nested is not None:
+        details["nested_error_type"] = type(nested).__name__
+        for field in ("message", "reason", "detail", "status", "status_code", "code", "provider"):
+            value = getattr(nested, field, None)
+            if value is not None:
+                details[field] = _redact_sensitive_text(value)
+    for field in ("message", "reason", "detail", "status", "status_code", "code", "provider"):
+        value = getattr(error, field, None)
+        if value is not None and field not in details:
+            details[field] = _redact_sensitive_text(value)
+    return details
+
+
+def _extract_text_for_debug(obj: object) -> str:
+    if obj is None:
+        return ""
+    item = getattr(obj, "item", None)
+    target = item if item is not None else obj
+
+    text_content = getattr(target, "text_content", None)
+    if isinstance(text_content, str):
+        return text_content
+
+    text = getattr(target, "text", None)
+    if isinstance(text, str):
+        return text
+
+    content = getattr(target, "content", None)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            else:
+                part_text = getattr(part, "text", None)
+                if isinstance(part_text, str):
+                    parts.append(part_text)
+        return " ".join(p for p in parts if p).strip()
+
+    return str(content or "")
+
+
+def _safe_nested_error_details(error: object) -> dict[str, str]:
+    details: dict[str, str] = {}
+    current = error
+    for idx in range(3):
+        if current is None:
+            break
+        prefix = f"err{idx}"
+        details[f"{prefix}_type"] = type(current).__name__
+        for field in ("message", "detail", "status_code", "code", "retryable", "details"):
+            value = getattr(current, field, None)
+            if value is not None:
+                details[f"{prefix}_{field}"] = _redact_sensitive_text(value)
+        body = getattr(current, "body", None)
+        if body is not None:
+            body_message = getattr(body, "message", None)
+            body_code = getattr(body, "code", None)
+            if body_message is not None:
+                details[f"{prefix}_body_message"] = _redact_sensitive_text(body_message)
+            if body_code is not None:
+                details[f"{prefix}_body_code"] = _redact_sensitive_text(body_code)
+        current = getattr(current, "error", None)
+    return details
+
+
+def _sanitize_spoken_laughter(text: str) -> str:
+    if not text:
+        return text
+    pattern = r"\b(lol|lmao|rofl|haha|hehe)\b"
+    return re.sub(pattern, "", text, flags=re.IGNORECASE).strip()
+
+
 def attach_session_diagnostics(session: AgentSession) -> None:
+    global _latest_agent_state_for_hume, _latest_active_assistant_count_for_hume, _latest_current_speech_id_for_hume
     active_speech_handles: dict[str, object] = {}
     _local_speech_ids: dict[int, str] = {}
     payload_debug_logged = False
@@ -140,6 +255,16 @@ def attach_session_diagnostics(session: AgentSession) -> None:
     agent_listening_at: dict[str, float] = {}
     assistant_speech_finished_at: dict[str, float] = {}
     pending_user_handoff_speech_id: str | None = None
+    stt_partial_count = 0
+    stt_final_count = 0
+    last_stt_any_at = 0.0
+    last_stt_final_at = 0.0
+    last_stt_preview = ""
+    last_stt_final_preview = ""
+    last_user_speaking_at = 0.0
+    last_user_listening_at = 0.0
+    hume_request_count_at_speech_start: dict[str, int] = {}
+    hume_request_count_at_speech_finish: dict[str, int] = {}
 
     def _resolve_speech_handle(event_or_handle: object) -> object:
         for attr in ("speech_handle", "handle", "speech"):
@@ -335,7 +460,16 @@ def attach_session_diagnostics(session: AgentSession) -> None:
 
         if not suppressed:
             active_speech_handles[speech_id] = resolved_handle
+            hume_request_count_at_speech_start[speech_id] = _hume_tts_request_counter
+            _latest_current_speech_id_for_hume = speech_id
+            _latest_active_assistant_count_for_hume = len(active_speech_handles)
             logger.info("Assistant speech started: speech_id=%s active_count=%s", speech_id, len(active_speech_handles))
+            logger.info(
+                "Assistant speech Hume request baseline: speech_id=%s hume_request_count_at_start=%s active_count=%s",
+                speech_id,
+                hume_request_count_at_speech_start[speech_id],
+                len(active_speech_handles),
+            )
 
         add_done_callback = getattr(resolved_handle, "add_done_callback", None)
         if callable(add_done_callback):
@@ -344,6 +478,7 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                 done_resolved_handle = _resolve_speech_handle(done_event_or_handle)
                 done_id = _speech_id(done_resolved_handle)
                 active_speech_handles.pop(done_id, None)
+                _latest_active_assistant_count_for_hume = len(active_speech_handles)
                 finished_at = time.monotonic()
                 started_at = speech_start_times.pop(done_id, None)
                 was_suppressed = done_id in suppressed_speech_ids
@@ -357,8 +492,24 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                     listening_at - finished_at if listening_at is not None else -1.0
                 )
                 assistant_speech_finished_at[done_id] = finished_at
+                hume_request_count_at_speech_finish[done_id] = _hume_tts_request_counter
                 pending_user_handoff_speech_id = done_id
                 logger.info("Assistant speech finished: speech_id=%s interrupted=%s active_count=%s was_suppressed=%s", done_id, interrupted, len(active_speech_handles), was_suppressed)
+                start_count = hume_request_count_at_speech_start.get(done_id, -1)
+                finish_count = hume_request_count_at_speech_finish.get(done_id, -1)
+                during_count = finish_count - start_count if start_count >= 0 and finish_count >= 0 else -1
+                logger.info(
+                    "Assistant speech Hume request summary: speech_id=%s interrupted=%s was_suppressed=%s hume_request_count_at_start=%s hume_request_count_at_finish=%s hume_requests_during_speech=%s speech_duration_seconds=%.3f latest_agent_state=%s latest_user_state=%s",
+                    done_id,
+                    interrupted,
+                    was_suppressed,
+                    start_count,
+                    finish_count,
+                    during_count,
+                    speech_duration_seconds,
+                    latest_agent_state,
+                    latest_user_state,
+                )
                 logger.info(
                     "Assistant handoff timing: speech_id=%s speech_duration_seconds=%.3f agent_speaking_to_finished_seconds=%.3f finish_to_agent_listening_seconds=%.3f interrupted=%s was_suppressed=%s active_count=%s",
                     done_id,
@@ -368,6 +519,32 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                     interrupted,
                     was_suppressed,
                     len(active_speech_handles),
+                )
+                start_count = hume_request_count_at_speech_start.get(done_id, -1)
+                finish_count = hume_request_count_at_speech_finish.get(done_id, _hume_tts_request_counter)
+                hume_requests_during = finish_count - start_count if start_count >= 0 and finish_count >= 0 else -1
+                user_stopped_to_final_stt = (last_stt_final_at - last_user_listening_at) if (last_stt_final_at > 0 and last_user_listening_at > 0) else -1.0
+                final_stt_to_llm_start = (_last_llm_start_at - last_stt_final_at) if (_last_llm_start_at > 0 and last_stt_final_at > 0) else -1.0
+                final_stt_to_llm_complete = (_last_llm_complete_at - last_stt_final_at) if (_last_llm_complete_at > 0 and last_stt_final_at > 0) else -1.0
+                llm_complete_to_tts_request = (_last_tts_request_start_at - _last_llm_complete_at) if (_last_tts_request_start_at > 0 and _last_llm_complete_at > 0) else -1.0
+                tts_request_to_first_audio = (_last_tts_first_audio_at - _last_tts_request_start_at) if (_last_tts_first_audio_at > 0 and _last_tts_request_start_at > 0) else -1.0
+                final_stt_to_first_audio = (_last_tts_first_audio_at - last_stt_final_at) if (_last_tts_first_audio_at > 0 and last_stt_final_at > 0) else -1.0
+                user_stopped_to_first_audio = (_last_tts_first_audio_at - last_user_listening_at) if (_last_tts_first_audio_at > 0 and last_user_listening_at > 0) else -1.0
+                logger.info(
+                    "Voice latency summary: user_stopped_to_final_stt=%s final_stt_to_llm_start=%s final_stt_to_llm_complete=%s llm_complete_to_tts_request=%s tts_request_to_first_audio=%s final_stt_to_first_audio=%s user_stopped_to_first_audio=%s text_length=%s sentence_end_count=%s hume_requests_during_speech=%s tts_path=%s model_version=%s description_applied=%s",
+                    _fmt_seconds(user_stopped_to_final_stt),
+                    _fmt_seconds(final_stt_to_llm_start),
+                    _fmt_seconds(final_stt_to_llm_complete),
+                    _fmt_seconds(llm_complete_to_tts_request),
+                    _fmt_seconds(tts_request_to_first_audio),
+                    _fmt_seconds(final_stt_to_first_audio),
+                    _fmt_seconds(user_stopped_to_first_audio),
+                    _last_tts_text_length,
+                    _last_tts_sentence_end_count,
+                    hume_requests_during,
+                    _last_tts_path,
+                    _last_hume_model_version,
+                    _last_hume_description_applied,
                 )
 
             add_done_callback(_on_done)
@@ -383,10 +560,14 @@ def attach_session_diagnostics(session: AgentSession) -> None:
         nonlocal latest_agent_state, latest_agent_state_timestamp
         extracted_new_state = _extract_agent_new_state(state)
         latest_agent_state = extracted_new_state
+        _latest_agent_state_for_hume = extracted_new_state
         latest_agent_state_timestamp = time.monotonic()
         current_speech = getattr(session, "current_speech", None)
         has_current_speech = current_speech is not None
         current_speech_id = _speech_id(current_speech) if has_current_speech else None
+        if current_speech_id is not None:
+            _latest_current_speech_id_for_hume = current_speech_id
+        _latest_active_assistant_count_for_hume = len(active_speech_handles)
         if extracted_new_state == "speaking" and current_speech_id is not None:
             agent_speaking_at[current_speech_id] = latest_agent_state_timestamp
         old_state = getattr(state, "old_state", None)
@@ -409,9 +590,13 @@ def attach_session_diagnostics(session: AgentSession) -> None:
 
     @session.on("user_state_changed")
     def _on_user_state_changed(state: object) -> None:
-        nonlocal latest_user_state, latest_user_state_timestamp, pending_user_handoff_speech_id
+        nonlocal latest_user_state, latest_user_state_timestamp, pending_user_handoff_speech_id, last_user_speaking_at, last_user_listening_at
         latest_user_state = _extract_user_new_state(state)
         latest_user_state_timestamp = time.monotonic()
+        if latest_user_state == "speaking":
+            last_user_speaking_at = latest_user_state_timestamp
+        if latest_user_state == "listening":
+            last_user_listening_at = latest_user_state_timestamp
         logger.info("User state changed: state=%s assistant_active_count=%s", state, len(active_speech_handles))
         if latest_user_state == "speaking" and pending_user_handoff_speech_id is not None:
             previous_speech_id = pending_user_handoff_speech_id
@@ -432,18 +617,95 @@ def attach_session_diagnostics(session: AgentSession) -> None:
 
     @session.on("conversation_item_added")
     def _on_conversation_item_added(item: object) -> None:
-        role = _safe_attr(item, "role")
-        interrupted = _safe_attr(item, "interrupted")
+        event_item = getattr(item, "item", None)
+        target = event_item if event_item is not None else item
+        role = _safe_attr(target, "role")
+        interrupted = _safe_attr(target, "interrupted")
+        if PIPELINE_TEXT_DEBUG:
+            text_str = _extract_text_for_debug(target)
+            logger.info(
+                "Conversation item added: role=%s interrupted=%s text_length=%s preview=%s",
+                role,
+                interrupted,
+                len(text_str),
+                _redact_sensitive_text(text_str)[:200],
+            )
+            return
         logger.info("Conversation item added: role=%s interrupted=%s", role, interrupted)
+
+    @session.on("user_input_transcribed")
+    def _on_user_input_transcribed(event: object) -> None:
+        nonlocal stt_partial_count, stt_final_count, last_stt_any_at, last_stt_final_at, last_stt_preview, last_stt_final_preview
+        final = getattr(event, "final", getattr(event, "is_final", "n/a"))
+        language = _safe_attr(event, "language", "n/a")
+        speaker_id = getattr(event, "speaker_id", None)
+        transcript = getattr(event, "transcript", None)
+        if transcript is None:
+            transcript = getattr(event, "text", "")
+        transcript_str = str(transcript or "")
+        last_stt_any_at = time.monotonic()
+        last_stt_preview = _redact_sensitive_text(transcript_str)[:200]
+        is_final = str(final).strip().lower() in {"true", "1", "yes"}
+        if is_final:
+            stt_final_count += 1
+            last_stt_final_at = last_stt_any_at
+            last_stt_final_preview = last_stt_preview
+        else:
+            stt_partial_count += 1
+        if not PIPELINE_TEXT_DEBUG:
+            return
+        logger.info(
+            "STT debug: final=%s language=%s speaker_id_present=%s transcript_length=%s preview=%s",
+            final,
+            language,
+            speaker_id is not None,
+            len(transcript_str),
+            last_stt_preview,
+        )
 
     @session.on("error")
     def _on_error(error: object) -> None:
         safe_summary = _safe_error_summary(error)
         logger.error("Session error event summary: %s", safe_summary)
-
         searchable_safe_text = " ".join(str(v).lower() for v in safe_summary.values())
+        if "llm" in searchable_safe_text:
+            logger.error(
+                "LLM error diagnostic: details=%s openrouter_api_key_present=%s openrouter_model=%s",
+                _safe_llm_error_details(error),
+                bool(os.getenv("OPENROUTER_API_KEY", "").strip()),
+                os.getenv("OPENROUTER_MODEL", "openai/gpt-4o"),
+            )
         if "tts" in searchable_safe_text:
             _clear_active_handles("tts_error")
+        if MISTRAL_STT_DIAGNOSTICS:
+            stt_error_markers = ("stt", "mistral", "grpc", "http/2", "unavailable", "failed parsing", "3803")
+            if any(marker in searchable_safe_text for marker in stt_error_markers):
+                now = time.monotonic()
+                stt_since_any = now - last_stt_any_at if last_stt_any_at > 0 else -1.0
+                stt_since_final = now - last_stt_final_at if last_stt_final_at > 0 else -1.0
+                logger.warning(
+                    "Mistral STT diagnostic snapshot: error_chain=%s stt_partial_count=%s stt_final_count=%s seconds_since_last_stt=%s seconds_since_last_final_stt=%s last_stt_preview=%s last_final_stt_preview=%s latest_user_state=%s latest_agent_state=%s active_assistant_speech_count=%s STT_PROVIDER=%s MISTRAL_STT_MODEL=%s MISTRAL_TARGET_STREAMING_DELAY_MS=%s VAD_PROVIDER=%s AI_COUSTICS_ENABLED=%s AI_COUSTICS_MODEL=%s AI_COUSTICS_LEVEL=%s endpointing_mode=%s endpointing_min_delay=%s endpointing_max_delay=%s",
+                    _safe_nested_error_details(error),
+                    stt_partial_count,
+                    stt_final_count,
+                    stt_since_any,
+                    stt_since_final,
+                    last_stt_preview,
+                    last_stt_final_preview,
+                    latest_user_state,
+                    latest_agent_state,
+                    len(active_speech_handles),
+                    STT_PROVIDER,
+                    os.getenv("MISTRAL_STT_MODEL", "voxtral-mini-transcribe-realtime-2602"),
+                    os.getenv("MISTRAL_TARGET_STREAMING_DELAY_MS", "160"),
+                    VAD_PROVIDER,
+                    AI_COUSTICS_ENABLED,
+                    os.getenv("AI_COUSTICS_MODEL", "QUAIL_L"),
+                    os.getenv("AI_COUSTICS_LEVEL", "0.7"),
+                    os.getenv("LIVEKIT_ENDPOINTING_MODE", "fixed"),
+                    os.getenv("LIVEKIT_ENDPOINTING_MIN_DELAY", "0.4"),
+                    os.getenv("LIVEKIT_ENDPOINTING_MAX_DELAY", "1.5"),
+                )
 
     @session.on("close")
     def _on_close() -> None:
@@ -458,8 +720,156 @@ def env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "on")
 
 
+def env_int_clamped(name: str, default: int, min_value: int, max_value: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw.strip())
+    except Exception:
+        return default
+    return max(min_value, min(max_value, value))
+
+
 
 AI_COUSTICS_ENABLED = env_bool("AI_COUSTICS_ENABLED", True)
+SPOKEN_TEXT_NORMALIZATION = env_bool("SPOKEN_TEXT_NORMALIZATION", False)
+TTS_TEXT_DEBUG = env_bool("TTS_TEXT_DEBUG", False)
+PIPELINE_TEXT_DEBUG = env_bool("PIPELINE_TEXT_DEBUG", False)
+MISTRAL_STT_DIAGNOSTICS = env_bool("MISTRAL_STT_DIAGNOSTICS", True)
+HUME_FULL_UTTERANCE_TTS = env_bool("HUME_FULL_UTTERANCE_TTS", False)
+LIVEKIT_TTS_SOURCE_INSPECTION = env_bool("LIVEKIT_TTS_SOURCE_INSPECTION", False)
+HUME_DIRECT_API_TTS = env_bool("HUME_DIRECT_API_TTS", False)
+RUN_DB_MIGRATIONS_ON_STARTUP = env_bool("RUN_DB_MIGRATIONS_ON_STARTUP", False)
+GREETING_AUDIO_PATH = (os.getenv("GREETING_AUDIO_PATH") or "").strip()
+
+
+def _pcm16_to_audio_frames(pcm_data: bytes, sample_rate: int, channels: int) -> list[rtc.AudioFrame]:
+    bytes_per_sample = 2
+    frame_samples_per_channel = max(1, int(sample_rate * 0.02))
+    frame_bytes = frame_samples_per_channel * channels * bytes_per_sample
+    frames: list[rtc.AudioFrame] = []
+    cursor = 0
+    while cursor < len(pcm_data):
+        chunk = pcm_data[cursor : cursor + frame_bytes]
+        cursor += frame_bytes
+        if len(chunk) < frame_bytes:
+            chunk = chunk + (b"\x00" * (frame_bytes - len(chunk)))
+        frame = rtc.AudioFrame(
+            data=chunk,
+            sample_rate=sample_rate,
+            num_channels=channels,
+            samples_per_channel=frame_samples_per_channel,
+        )
+        frames.append(frame)
+    return frames
+
+
+def _safe_source_excerpt(obj: object, max_chars: int) -> str:
+    try:
+        src = inspect.getsource(obj)
+    except Exception as e:
+        return f"<unavailable: {_redact_sensitive_text(e)}>"
+    sanitized = src.replace("\r", "")
+    return sanitized[:max_chars]
+
+
+def _log_livekit_tts_source_inspection() -> None:
+    if not LIVEKIT_TTS_SOURCE_INSPECTION:
+        return
+    try:
+        import livekit.agents as lk_agents  # type: ignore
+        import livekit.plugins.hume as lk_hume  # type: ignore
+        from livekit.agents import Agent as LKAgent  # type: ignore
+    except Exception as e:
+        logger.warning("LiveKit TTS source inspection unavailable: reason=%s", _redact_sensitive_text(e))
+        return
+
+    inspect_terms = ("sentence", "tokenizer", "tokenize", "segment", "chunk", "synthesize", "stream", "capabilities")
+    agents_version = getattr(lk_agents, "__version__", "unknown")
+    agents_path = getattr(lk_agents, "__file__", "unknown")
+    hume_module_path = getattr(lk_hume, "__file__", "unknown")
+    default_tts_node = getattr(LKAgent.default, "tts_node", None)
+    tts_node_signature = str(inspect.signature(default_tts_node)) if callable(default_tts_node) else "unavailable"
+    tts_node_file = inspect.getsourcefile(default_tts_node) if callable(default_tts_node) else "unavailable"
+    tts_node_src = _safe_source_excerpt(default_tts_node, 5000) if callable(default_tts_node) else "<unavailable>"
+
+    hume_tts_cls = getattr(lk_hume, "TTS", None)
+    hume_init_sig = "unavailable"
+    hume_src = "<unavailable>"
+    hume_synthesize_sig = "unavailable"
+    hume_synthesize_src = "<unavailable>"
+    hume_stream_sig = "unavailable"
+    hume_stream_src = "<unavailable>"
+    hume_caps = "unavailable"
+    if hume_tts_cls is not None:
+        hume_src = _safe_source_excerpt(hume_tts_cls, 8000)
+        init_fn = getattr(hume_tts_cls, "__init__", None)
+        if callable(init_fn):
+            hume_init_sig = str(inspect.signature(init_fn))
+        synth_fn = getattr(hume_tts_cls, "synthesize", None)
+        if callable(synth_fn):
+            hume_synthesize_sig = str(inspect.signature(synth_fn))
+            hume_synthesize_src = _safe_source_excerpt(synth_fn, 4000)
+        stream_fn = getattr(hume_tts_cls, "stream", None)
+        if callable(stream_fn):
+            hume_stream_sig = str(inspect.signature(stream_fn))
+            hume_stream_src = _safe_source_excerpt(stream_fn, 4000)
+        caps = getattr(hume_tts_cls, "capabilities", None)
+        if caps is not None:
+            hume_caps = _redact_sensitive_text(caps)
+
+    combined = "\n".join([tts_node_src, hume_src, hume_synthesize_src, hume_stream_src]).lower()
+    term_presence = {term: (term in combined) for term in inspect_terms}
+    logger.info(
+        "LiveKit TTS source inspection summary: agents_version=%s agents_module=%s agent_default_tts_node_file=%s agent_default_tts_node_signature=%s hume_module=%s hume_tts_init_signature=%s hume_tts_capabilities=%s term_presence=%s",
+        agents_version,
+        agents_path,
+        tts_node_file or "unknown",
+        tts_node_signature,
+        hume_module_path,
+        hume_init_sig,
+        hume_caps,
+        term_presence,
+    )
+    logger.info("LiveKit Agent.default.tts_node source excerpt (max_5000): %s", tts_node_src)
+    logger.info("LiveKit Hume TTS class source excerpt (max_8000): %s", hume_src)
+    logger.info("LiveKit Hume TTS.synthesize signature=%s source_excerpt(max_4000): %s", hume_synthesize_sig, hume_synthesize_src)
+    logger.info("LiveKit Hume TTS.stream signature=%s source_excerpt(max_4000): %s", hume_stream_sig, hume_stream_src)
+
+
+def _run_db_migrations_on_startup() -> None:
+    logger.info("database_migrations_startup_enabled=%s", RUN_DB_MIGRATIONS_ON_STARTUP)
+    if not RUN_DB_MIGRATIONS_ON_STARTUP:
+        logger.info("database_migration_status=skipped")
+        return
+
+    if not os.getenv("DATABASE_URL"):
+        logger.error("database_migration_status=failed reason=missing_DATABASE_URL")
+        raise RuntimeError("DATABASE_URL is required when RUN_DB_MIGRATIONS_ON_STARTUP=true")
+
+    script_path = os.path.join(os.path.dirname(__file__), "scripts", "apply_migrations.py")
+    if not os.path.exists(script_path):
+        logger.error("database_migration_status=failed reason=migration_runner_missing")
+        raise RuntimeError("Migration runner not found at scripts/apply_migrations.py")
+
+    logger.info("database_migration_status=running")
+    result = subprocess.run(
+        [sys.executable, script_path],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    for line in (result.stdout or "").splitlines():
+        logger.info("migration_runner: %s", line)
+    for line in (result.stderr or "").splitlines():
+        logger.error("migration_runner: %s", line)
+
+    if result.returncode != 0:
+        logger.error("database_migration_status=failed return_code=%s", result.returncode)
+        raise RuntimeError("Database migration failed during startup")
+
+    logger.info("database_migration_status=success")
 
 
 def _resolve_ai_coustics_model(model_name: str):
@@ -514,18 +924,21 @@ def build_room_options() -> room_io.RoomOptions | None:
         )
     )
 
-def _resolve_hume_model_version() -> str | None:
-    hume_model = os.getenv("HUME_MODEL", "octave-2").strip().lower()
+def _resolve_hume_model_version() -> tuple[str, str]:
+    hume_model_raw = (os.getenv("HUME_MODEL", "octave-2") or "octave-2").strip()
+    hume_model = hume_model_raw.lower()
     if not hume_model:
-        return None
+        return "octave-2", "2"
     if hume_model in {"octave-2", "2", "v2"}:
-        return "2"
+        return hume_model_raw, "2"
     if hume_model in {"octave-1", "1", "v1"}:
-        return "1"
-    return hume_model
+        return hume_model_raw, "1"
+    logger.warning("Unsupported HUME_MODEL=%s; falling back to octave-2 (model_version=2)", _redact_sensitive_text(hume_model_raw))
+    return hume_model_raw, "2"
 
 
 def build_tts():
+    global _last_hume_model_version, _last_hume_description_applied
     if TTS_PROVIDER == "deepgram":
         logger.info("Using Deepgram TTS provider")
         return deepgram.TTS(
@@ -560,19 +973,63 @@ def build_tts():
             raise RuntimeError("HUME_VOICE_ID or HUME_VOICE_NAME is required when HUME_INSTANT_MODE=true")
 
         hume_speed = float(os.getenv("HUME_SPEED", "0.9"))
+        hume_tts_debug_http = env_bool("HUME_TTS_DEBUG_HTTP", False)
+        hume_style_context = (os.getenv("HUME_STYLE_CONTEXT") or "").strip()
+        hume_style_context_present = bool(hume_style_context)
+        hume_style_context_length = len(hume_style_context)
+        hume_context_source = "HUME_STYLE_CONTEXT" if hume_style_context_present else "none"
         hume_description = os.getenv("HUME_DESCRIPTION") or (
             "A warm, calm, natural companion voice. Speak with relaxed pacing, soft sentence endings, "
             "and brief natural pauses between thoughts. Do not sound rushed, clipped, or abrupt at the end of sentences."
         )
+        hume_description_present = bool(hume_description)
+        hume_description_length = len(hume_description)
         hume_trailing_silence = float(os.getenv("HUME_TRAILING_SILENCE", "0.25"))
+        hume_model_raw, hume_model_version = _resolve_hume_model_version()
         hume_tts_signature = inspect.signature(hume.TTS)
         hume_tts_kwargs: dict[str, Any] = {
             "voice": voice,
-            "model_version": _resolve_hume_model_version(),
-            "description": hume_description,
+            "model_version": hume_model_version,
             "speed": hume_speed,
             "instant_mode": instant_mode,
         }
+        description_applied = hume_model_version != "2"
+        if description_applied:
+            hume_tts_kwargs["description"] = hume_description
+        else:
+            logger.info(
+                "Hume description skipped: model_version=2 reason=octave2_unsupported description_present=%s description_length=%s",
+                hume_description_present,
+                hume_description_length,
+            )
+        hume_style_context_applied = False
+        hume_style_context_skip_reason = "none"
+        if hume_style_context_present:
+            hume_style_context_skip_reason = "freeform_context_not_supported"
+        logger.info(
+            "Hume style context: hume_style_context_present=%s hume_style_context_length=%s hume_style_context_applied=%s hume_style_context_skip_reason=%s hume_context_source=%s description_applied=%s model_version=%s",
+            hume_style_context_present,
+            hume_style_context_length,
+            hume_style_context_applied,
+            hume_style_context_skip_reason,
+            hume_context_source,
+            description_applied,
+            hume_model_version,
+        )
+        description_skip_reason = "none" if description_applied else "octave2_unsupported"
+        _last_hume_model_version = str(hume_model_version)
+        _last_hume_description_applied = str(description_applied).lower()
+        logger.info(
+            "Hume model/description summary: hume_model_raw=%s model_version=%s description_present=%s description_applied=%s description_skip_reason=%s hume_style_context_present=%s hume_style_context_applied=%s hume_style_context_skip_reason=%s",
+            _redact_sensitive_text(hume_model_raw),
+            hume_model_version,
+            hume_description_present,
+            description_applied,
+            description_skip_reason,
+            hume_style_context_present,
+            hume_style_context_applied,
+            hume_style_context_skip_reason,
+        )
         trailing_silence_applied = False
         trailing_silence_supported = "trailing_silence" in hume_tts_signature.parameters
         if trailing_silence_supported:
@@ -588,11 +1045,115 @@ def build_tts():
         logger.info(
             "Hume TTS config: speed=%s description_present=%s trailing_silence_value=%s trailing_silence_supported=%s trailing_silence_applied=%s",
             hume_speed,
-            bool(hume_description),
+            hume_description_present,
             hume_trailing_silence if trailing_silence_applied else "n/a",
             trailing_silence_supported,
             trailing_silence_applied,
         )
+        voice_kind = "None"
+        voice_provider_effective = "n/a"
+        if hume_voice_id:
+            voice_kind = "VoiceById"
+        elif hume_voice_name:
+            voice_kind = "VoiceByName"
+            voice_provider_effective = hume_voice_provider or "hume"
+        logger.info(
+            "Hume TTS effective config: model_version=%s voice_kind=%s voice_present=%s voice_provider=%s instant_mode=%s speed=%s description_present=%s description_applied=%s description_length=%s trailing_silence_supported=%s trailing_silence_applied=%s trailing_silence_value=%s hume_style_context_present=%s hume_style_context_length=%s hume_style_context_applied=%s debug_http=%s",
+            hume_tts_kwargs.get("model_version"),
+            voice_kind,
+            bool(voice),
+            voice_provider_effective,
+            instant_mode,
+            hume_speed,
+            hume_description_present,
+            description_applied,
+            hume_description_length,
+            trailing_silence_supported,
+            trailing_silence_applied,
+            hume_trailing_silence if trailing_silence_applied else "n/a",
+            hume_style_context_present,
+            hume_style_context_length,
+            hume_style_context_applied,
+            hume_tts_debug_http,
+        )
+
+        if hume_tts_debug_http:
+            trace_config = aiohttp.TraceConfig()
+
+            async def _log_hume_tts_error_detail(
+                response: aiohttp.ClientResponse | None = None,
+                response_url: Any = None,
+                body_read_error: object | None = None,
+            ) -> None:
+                status = getattr(response, "status", "n/a")
+                reason = _redact_sensitive_text(getattr(response, "reason", "n/a"))
+                path = _redact_sensitive_text(getattr(response_url, "path", "n/a"))
+                if body_read_error is not None:
+                    logger.warning(
+                        "Hume TTS HTTP error detail unavailable: status=%s reason=%s body_read_error=%s",
+                        status,
+                        reason,
+                        _redact_sensitive_text(body_read_error),
+                    )
+                    return
+                if response is None:
+                    return
+                body_text = await response.text()
+                redacted_body = _redact_sensitive_text(body_text)[:2000]
+                logger.warning(
+                    "Hume TTS HTTP error detail: status=%s reason=%s path=%s body=%s",
+                    status,
+                    reason,
+                    path,
+                    redacted_body,
+                )
+
+            async def _on_request_start(session, trace_config_ctx, params):
+                global _hume_tts_request_counter
+                _hume_tts_request_counter += 1
+                ctx_hash = _normalized_text_hash_ctx.get()
+                logger.info(
+                    "Hume TTS HTTP request: hume_request_index=%s method=%s path=%s latest_agent_state=%s active_assistant_count=%s current_speech_id=%s instant_mode=%s speed=%s trailing_silence=%s normalized_text_hash=%s debug=true",
+                    _hume_tts_request_counter,
+                    params.method,
+                    _redact_sensitive_text(params.url.path),
+                    _latest_agent_state_for_hume,
+                    _latest_active_assistant_count_for_hume,
+                    _latest_current_speech_id_for_hume,
+                    instant_mode,
+                    hume_speed,
+                    hume_trailing_silence,
+                    ctx_hash if ctx_hash != "n/a" else _latest_normalized_text_hash,
+                )
+
+            async def _on_request_end(session, trace_config_ctx, params):
+                if params.response.status >= 400:
+                    try:
+                        await _log_hume_tts_error_detail(response=params.response, response_url=params.url)
+                    except Exception as body_error:
+                        await _log_hume_tts_error_detail(
+                            response=params.response,
+                            response_url=params.url,
+                            body_read_error=body_error,
+                        )
+
+            async def _on_request_exception(session, trace_config_ctx, params):
+                response = getattr(params, "response", None)
+                if response is not None and getattr(response, "status", 0) >= 400:
+                    try:
+                        await _log_hume_tts_error_detail(response=response, response_url=params.url)
+                    except Exception as body_error:
+                        await _log_hume_tts_error_detail(
+                            response=response,
+                            response_url=params.url,
+                            body_read_error=body_error,
+                        )
+
+            trace_config.on_request_start.append(_on_request_start)
+            trace_config.on_request_end.append(_on_request_end)
+            trace_config.on_request_exception.append(_on_request_exception)
+            hume_tts_kwargs["http_session"] = aiohttp.ClientSession(trace_configs=[trace_config])
+
         return hume.TTS(**hume_tts_kwargs)
 
     if TTS_PROVIDER == "kokoro":
@@ -634,48 +1195,245 @@ class LucyAgent(Agent):
         return normalized
 
     def tts_node(self, text: AsyncIterable[str], model_settings):
-        logger.info("Spoken text normalization enabled=true")
+        global _latest_normalized_text_hash, _last_tts_request_start_at, _last_tts_first_audio_at, _last_tts_text_length, _last_tts_sentence_end_count, _last_tts_path
+        if not SPOKEN_TEXT_NORMALIZATION:
+            logger.info("Spoken text normalization enabled=false")
+            if not TTS_TEXT_DEBUG:
+                return Agent.default.tts_node(self, text, model_settings)
 
-        async def _normalized_text_stream() -> AsyncIterable[str]:
+            async def _passthrough_debug_stream() -> AsyncIterable[str]:
+                chunks: list[str] = []
+                count = 0
+                async for chunk in text:
+                    count += 1
+                    chunks.append(chunk)
+                    yield chunk
+                raw_text = "".join(chunks)
+                preview = _redact_sensitive_text(raw_text)[:200]
+                logger.info(
+                    "TTS text debug: raw_chunk_count=%s raw_total_length=%s raw_preview=%s final_preview=%s",
+                    count,
+                    len(raw_text),
+                    preview,
+                    preview,
+                )
+
+            return Agent.default.tts_node(self, _passthrough_debug_stream(), model_settings)
+
+        logger.info("Spoken text normalization enabled=true mode=buffered_full_segment")
+
+        async def _direct_or_plugin_or_default() -> AsyncIterable[Any]:
+            global _latest_normalized_text_hash
+            chunks: list[str] = []
+            chunk_count = 0
             async for chunk in text:
-                yield self._normalize_spoken_text(chunk)
+                chunk_count += 1
+                chunks.append(chunk)
+            raw_text = "".join(chunks)
+            sanitized = _sanitize_spoken_laughter(raw_text)
+            normalized_text = self._normalize_spoken_text(sanitized)
+            normalized_hash = hashlib.sha256(normalized_text.encode("utf-8")).hexdigest()[:12] if normalized_text else "empty"
+            _latest_normalized_text_hash = normalized_hash
+            _normalized_text_hash_ctx.set(normalized_hash)
+            sentence_end_count = sum(normalized_text.count(mark) for mark in (".", "?", "!", "…"))
+            newline_count = normalized_text.count("\n")
+            _last_tts_text_length = len(normalized_text)
+            _last_tts_sentence_end_count = sentence_end_count
+            _last_tts_request_start_at = time.monotonic()
+            _last_tts_first_audio_at = 0.0
+            logger.info(
+                "TTS normalized yield diagnostics: tts_normalized_yield_count=%s raw_chunk_count=%s raw_total_length=%s normalized_text_length=%s normalized_text_preview=%s normalized_text_hash=%s sentence_end_count=%s newline_count=%s SPOKEN_TEXT_NORMALIZATION=%s TTS_PROVIDER=%s HUME_INSTANT_MODE=%s HUME_SPEED=%s HUME_TRAILING_SILENCE=%s",
+                1, chunk_count, len(raw_text), len(normalized_text), _redact_sensitive_text(normalized_text)[:200], normalized_hash,
+                sentence_end_count, newline_count, SPOKEN_TEXT_NORMALIZATION, TTS_PROVIDER, env_bool("HUME_INSTANT_MODE", True), os.getenv("HUME_SPEED", "0.9"), os.getenv("HUME_TRAILING_SILENCE", "0.25"),
+            )
+            if TTS_TEXT_DEBUG:
+                logger.info("TTS text debug: raw_chunk_count=%s raw_total_length=%s raw_preview=%s final_preview=%s", chunk_count, len(raw_text), _redact_sensitive_text(raw_text)[:200], _redact_sensitive_text(normalized_text)[:200])
 
-        return Agent.default.tts_node(self, _normalized_text_stream(), model_settings)
+            async def _single_text_stream() -> AsyncIterable[str]:
+                if normalized_text:
+                    yield normalized_text
 
+            if TTS_PROVIDER == "hume" and HUME_DIRECT_API_TTS:
+                # experimental Plan B direct path; fallback must reuse preserved normalized_text
+                pass
+            else:
+                logger.info("Direct Hume TTS attempt: hume_direct_api_tts_requested=%s", False)
 
+            if TTS_PROVIDER == "hume" and HUME_FULL_UTTERANCE_TTS:
+                activity = getattr(self, "_activity", None)
+                activity_tts = getattr(activity, "tts", None) if activity is not None else None
+                synthesize_fn = getattr(activity_tts, "synthesize", None)
+                if callable(synthesize_fn) and normalized_text:
+                    start = time.monotonic()
+                    yielded = 0
+                    first_audio = None
+                    try:
+                        sig = inspect.signature(synthesize_fn)
+                        if "conn_options" in sig.parameters:
+                            conn_opts = getattr(getattr(activity, "session", None), "conn_options", None)
+                            tts_conn_options = getattr(conn_opts, "tts_conn_options", None)
+                            chunked_stream = synthesize_fn(normalized_text, conn_options=tts_conn_options)
+                        else:
+                            chunked_stream = synthesize_fn(normalized_text)
+                        logger.info("Hume full-utterance mode: full_utterance_requested=%s full_utterance_supported=%s full_utterance_used=%s path=%s fallback_reason=%s", True, True, True, "livekit_hume_plugin_synthesize_full_text", "none")
+                        _last_tts_path = "livekit_hume_plugin_synthesize_full_text"
+                        async for event in chunked_stream:
+                            frame = getattr(event, "frame", None)
+                            if frame is None:
+                                continue
+                            if first_audio is None:
+                                first_audio = time.monotonic()
+                                _last_tts_first_audio_at = first_audio
+                            yielded += 1
+                            yield frame
+                        logger.info("Hume full-utterance plugin result: hume_full_utterance_plugin_requested=%s hume_full_utterance_plugin_used=%s hume_full_utterance_plugin_fallback_reason=%s path=%s normalized_text_hash=%s text_length=%s sentence_end_count=%s frame_count_yielded=%s time_to_first_audio_seconds=%.3f total_tts_seconds=%.3f", True, True, "none", "livekit_hume_plugin_synthesize_full_text", normalized_hash, len(normalized_text), sentence_end_count, yielded, (first_audio-start) if first_audio else -1.0, time.monotonic()-start)
+                        return
+                    except Exception as e:
+                        if yielded > 0:
+                            logger.warning("Hume full-utterance plugin partial failure: hume_full_utterance_plugin_requested=%s hume_full_utterance_plugin_used=%s hume_full_utterance_plugin_fallback_reason=%s frame_count_yielded=%s", True, True, _redact_sensitive_text(e), yielded)
+                            return
+                        logger.warning("Hume full-utterance plugin fallback: hume_full_utterance_plugin_requested=%s hume_full_utterance_plugin_used=%s hume_full_utterance_plugin_fallback_reason=%s path=%s", True, False, _redact_sensitive_text(e), "default_agent_tts_node_fallback")
+                else:
+                    logger.info("Hume full-utterance mode: full_utterance_requested=%s full_utterance_supported=%s full_utterance_used=%s path=%s fallback_reason=%s", True, False, False, "default_agent_tts_node_fallback", "activity_tts_synthesize_unavailable_or_empty_text")
+            elif TTS_PROVIDER == "hume":
+                logger.info("Hume full-utterance mode: full_utterance_requested=%s full_utterance_supported=%s full_utterance_used=%s path=%s fallback_reason=%s", False, False, False, "default_agent_tts_node_fallback", "not_requested")
 
-def build_vad():
-    if VAD_PROVIDER == "ai_coustics":
-        logger.info("Using ai-coustics VAD provider")
-        return ai_coustics.VAD()
+            async for out in Agent.default.tts_node(self, _single_text_stream(), model_settings):
+                if _last_tts_first_audio_at <= 0:
+                    _last_tts_first_audio_at = time.monotonic()
+                if _last_tts_path == "n/a":
+                    _last_tts_path = "default_agent_tts_node_fallback"
+                yield out
 
-    if VAD_PROVIDER == "silero":
-        logger.info("Using Silero VAD provider")
-        return silero.VAD.load()
+        if TTS_PROVIDER == "hume" and SPOKEN_TEXT_NORMALIZATION and HUME_DIRECT_API_TTS:
+            async def _direct_hume_or_fallback_stream() -> AsyncIterable[rtc.AudioFrame]:
+                global _direct_hume_request_counter
+                # preserve text by reading from the buffered/default helper only once on fallback.
+                # direct path independently reconstructs buffered text from original stream is not possible here,
+                # so use helper fallback unless direct request can be made from preserved normalized hash/text logs.
+                # We attempt direct only when required config is present and then fallback to preserved single-text path.
+                hume_api_key = os.getenv("HUME_API_KEY", "").strip()
+                hume_voice_id = os.getenv("HUME_VOICE_ID", "").strip()
+                if not hume_api_key or not hume_voice_id:
+                    logger.warning("Direct Hume TTS fallback: hume_direct_api_tts_used=%s direct_api_fallback_reason=missing_required_hume_api_key_or_voice_id", False)
+                    async for out in _direct_or_plugin_or_default():
+                        yield out
+                    return
 
-    logger.warning("Unknown VAD_PROVIDER=%s. Falling back to ai-coustics VAD provider", VAD_PROVIDER)
-    return ai_coustics.VAD()
+                # Direct API disabled for empty text by checking the fallback stream diagnostics path.
+                # Use fallback helper for robust behavior if any direct error occurs before frames.
+                _direct_hume_request_counter += 1
+                request_index = _direct_hume_request_counter
+                endpoint_path = "/v0/tts/stream/file"
+                endpoint_url = f"https://api.hume.ai{endpoint_path}"
+                yielded_count = 0
+                start = time.monotonic()
+                first_audio_at = None
+                # Rebuild text from fallback helper by intercepting first normalized text through default path isn't feasible here;
+                # rely on direct path only when FULL_UTTERANCE requested via plugin path.
+                logger.info("Direct Hume TTS attempt: hume_direct_api_tts_requested=%s direct_hume_request_index=%s endpoint_used=%s", True, request_index, endpoint_path)
+                try:
+                    # No safe preserved-text object here; use fallback helper to avoid silence and duplication risk.
+                    raise RuntimeError("direct_path_requires_preserved_normalized_text_buffer")
+                except Exception as e:
+                    if yielded_count > 0:
+                        logger.warning("Direct Hume TTS ended after partial output: hume_direct_api_tts_used=%s direct_api_fallback_reason=%s frame_count_yielded=%s direct_hume_request_index=%s", True, _redact_sensitive_text(e), yielded_count, request_index)
+                        return
+                    logger.warning("Direct Hume TTS fallback: hume_direct_api_tts_used=%s direct_api_fallback_reason=%s endpoint_used=%s direct_hume_request_index=%s", False, _redact_sensitive_text(e), endpoint_path, request_index)
+                    async for out in _direct_or_plugin_or_default():
+                        if first_audio_at is None:
+                            first_audio_at = time.monotonic()
+                        yielded_count += 1
+                        yield out
+                    logger.info(
+                        "Direct Hume TTS fallback completed via plugin/default: hume_direct_api_tts_used=%s frame_count_yielded=%s time_to_first_audio_seconds=%.3f total_tts_seconds=%.3f direct_hume_request_count=%s direct_hume_request_index=%s",
+                        False,
+                        yielded_count,
+                        (first_audio_at - start) if first_audio_at is not None else -1.0,
+                        time.monotonic() - start,
+                        _direct_hume_request_counter,
+                        request_index,
+                    )
 
+            return _direct_hume_or_fallback_stream()
+        return _direct_or_plugin_or_default()
 
-def build_stt():
-    if STT_PROVIDER == "deepgram_flux":
-        logger.info("Using Deepgram Flux STT provider")
-        return deepgram.STTv2(
-            model=os.getenv("DEEPGRAM_STT_MODEL", "flux-general-en"),
-            eager_eot_threshold=float(os.getenv("DEEPGRAM_EAGER_EOT_THRESHOLD", "0.4")),
-            eot_threshold=float(os.getenv("DEEPGRAM_EOT_THRESHOLD", "0.7")),
-            eot_timeout_ms=int(os.getenv("DEEPGRAM_EOT_TIMEOUT_MS", "700")),
-        )
+    def llm_node(self, chat_ctx, tools, model_settings):
+        global _last_llm_start_at, _last_llm_complete_at
+        stream = Agent.default.llm_node(self, chat_ctx, tools, model_settings)
 
-    if STT_PROVIDER == "deepgram_nova3":
-        logger.info("Using Deepgram Nova-3 STT provider")
-        return deepgram.STT(
-            model=os.getenv("DEEPGRAM_STT_MODEL", "nova-3"),
-            language=os.getenv("DEEPGRAM_STT_LANGUAGE", "en"),
-        )
+        async def _llm_stream():
+            assistant_fragments: list[str] = []
+            chunk_count = 0
+            started = False
+            async for chunk in stream:
+                if not started:
+                    _last_llm_start_at = time.monotonic()
+                    started = True
+                chunk_count += 1
+                if PIPELINE_TEXT_DEBUG:
+                    text_delta: object = None
+                    delta = getattr(chunk, "delta", None)
+                    if delta is not None:
+                        delta_content = getattr(delta, "content", None)
+                        if isinstance(delta_content, str):
+                            text_delta = delta_content
+                        elif isinstance(delta_content, list):
+                            parts: list[str] = []
+                            for part in delta_content:
+                                if isinstance(part, str):
+                                    parts.append(part)
+                                else:
+                                    part_text = getattr(part, "text", None)
+                                    if isinstance(part_text, str):
+                                        parts.append(part_text)
+                            if parts:
+                                text_delta = "".join(parts)
+                        if text_delta is None:
+                            delta_text = getattr(delta, "text", None)
+                            if isinstance(delta_text, str):
+                                text_delta = delta_text
+                    if text_delta is None:
+                        chunk_text = getattr(chunk, "text", None)
+                        if isinstance(chunk_text, str):
+                            text_delta = chunk_text
+                    if text_delta is None:
+                        chunk_content = getattr(chunk, "content", None)
+                        if isinstance(chunk_content, str):
+                            text_delta = chunk_content
+                    if text_delta is None and isinstance(chunk, str):
+                        text_delta = chunk
+                    if isinstance(text_delta, str):
+                        assistant_fragments.append(text_delta)
+                yield chunk
+            if PIPELINE_TEXT_DEBUG:
+                combined = "".join(assistant_fragments)
+                logger.info(
+                    "LLM output debug: chunk_count=%s text_length=%s preview=%s",
+                    chunk_count,
+                    len(combined),
+                    _redact_sensitive_text(combined)[:200],
+                )
+            _last_llm_complete_at = time.monotonic()
 
+        return _llm_stream()
 
-        return Agent.default.tts_node(self, _normalized_text_stream(), model_settings)
+    async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
+        if PIPELINE_TEXT_DEBUG:
+            msg_str = _extract_text_for_debug(new_message)
+            messages = getattr(turn_ctx, "messages", None)
+            message_count = "n/a"
+            if messages is not None:
+                try:
+                    message_count = len(messages)
+                except Exception:
+                    message_count = "n/a"
+            logger.info(
+                "User turn debug: new_message_length=%s preview=%s turn_ctx_message_count=%s",
+                len(msg_str),
+                _redact_sensitive_text(msg_str)[:200],
+                message_count,
+            )
 
 
 
@@ -777,7 +1535,48 @@ def _attach_optional_interruption_diagnostics(session: AgentSession) -> None:
 
 
 async def entrypoint(ctx: JobContext):
-    llm = openai.LLM.with_openrouter(model=os.getenv("OPENROUTER_MODEL", "openai/gpt-4o"))
+    job_started_at = time.monotonic()
+    _run_db_migrations_on_startup()
+    _log_livekit_tts_source_inspection()
+    openrouter_model = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o")
+    openrouter_api_key_present = bool(os.getenv("OPENROUTER_API_KEY", "").strip())
+    provider_order_raw = (os.getenv("OPENROUTER_PROVIDER_ORDER") or "").strip()
+    provider_order = [p.strip() for p in provider_order_raw.split(",") if p.strip()]
+    openrouter_allow_fallbacks = env_bool("OPENROUTER_ALLOW_FALLBACKS", True)
+    with_openrouter_sig = inspect.signature(openai.LLM.with_openrouter)
+    openrouter_kwargs: dict[str, Any] = {"model": openrouter_model}
+    provider_routing_applied = False
+    provider_routing_skip_reason = "none"
+    if provider_order:
+        extra_body_payload = {
+            "provider": {
+                "order": provider_order,
+                "allow_fallbacks": openrouter_allow_fallbacks,
+            }
+        }
+        if "extra_body" in with_openrouter_sig.parameters:
+            openrouter_kwargs["extra_body"] = extra_body_payload
+            provider_routing_applied = True
+        else:
+            llm_init_sig = inspect.signature(openai.LLM.__init__)
+            if "extra_body" in llm_init_sig.parameters:
+                openrouter_kwargs["extra_body"] = extra_body_payload
+                provider_routing_applied = True
+            else:
+                provider_routing_skip_reason = "extra_body_unsupported_by_installed_livekit_openai_plugin"
+    else:
+        provider_routing_skip_reason = "provider_order_not_set"
+    logger.info(
+        "LLM provider config: openrouter_api_key_present=%s openrouter_model_present=%s openrouter_model=%s openrouter_provider_order=%s openrouter_allow_fallbacks=%s provider_routing_applied=%s provider_routing_skip_reason=%s",
+        openrouter_api_key_present,
+        bool(openrouter_model),
+        openrouter_model,
+        ",".join(provider_order) if provider_order else "none",
+        openrouter_allow_fallbacks,
+        provider_routing_applied,
+        provider_routing_skip_reason,
+    )
+    llm = openai.LLM.with_openrouter(**openrouter_kwargs)
     # TODO: Re-enable Tavily using LiveKit's supported function-tool pattern.
     logger.warning("Skipping Tavily tools for MVP voice path")
 
@@ -820,12 +1619,13 @@ async def entrypoint(ctx: JobContext):
     )
 
     interruption_options: InterruptionOptions = {
-        "enabled": True,
-        "min_words": 1,
-        "min_duration": 0.6,
+        "enabled": env_bool("LIVEKIT_INTERRUPTION_ENABLED", True),
+        "min_words": int(os.getenv("LIVEKIT_INTERRUPTION_MIN_WORDS", "1")),
+        "min_duration": float(os.getenv("LIVEKIT_INTERRUPTION_MIN_DURATION", "0.6")),
         "resume_false_interruption": env_bool("LIVEKIT_RESUME_FALSE_INTERRUPTION", False),
-        "false_interruption_timeout": 1.8,
+        "false_interruption_timeout": float(os.getenv("LIVEKIT_FALSE_INTERRUPTION_TIMEOUT", "1.8")),
     }
+    logger.info("Resolved interruption config: %s", interruption_options)
     endpointing_mode = os.getenv("LIVEKIT_ENDPOINTING_MODE", "fixed")
     endpointing_min_delay = float(os.getenv("LIVEKIT_ENDPOINTING_MIN_DELAY", "0.4"))
     endpointing_max_delay = float(os.getenv("LIVEKIT_ENDPOINTING_MAX_DELAY", "1.5"))
@@ -835,6 +1635,28 @@ async def entrypoint(ctx: JobContext):
         endpointing_min_delay,
         endpointing_max_delay,
     )
+    mistral_stt_model = os.getenv("MISTRAL_STT_MODEL", "voxtral-mini-transcribe-realtime-2602")
+    mistral_target_streaming_delay_ms = int(os.getenv("MISTRAL_TARGET_STREAMING_DELAY_MS", "160"))
+    mistral_target_delay_supported = "target_streaming_delay_ms" in inspect.signature(mistralai.STT).parameters
+    logger.info("Startup Mistral STT config: model=%s target_streaming_delay_ms=%s applied=%s", mistral_stt_model, mistral_target_streaming_delay_ms, mistral_target_delay_supported)
+    logger.info("MISTRAL_STT_DIAGNOSTICS enabled=%s", MISTRAL_STT_DIAGNOSTICS)
+    logger.info("HUME_FULL_UTTERANCE_TTS enabled=%s", HUME_FULL_UTTERANCE_TTS)
+    logger.info("HUME_DIRECT_API_TTS enabled=%s", HUME_DIRECT_API_TTS)
+    try:
+        from livekit.agents import Agent as _AgentInspect
+
+        tts_node_src = inspect.getsourcefile(_AgentInspect)
+        logger.info(
+            "LiveKit source inspection summary: Agent.default.tts_node source_file=%s note=runtime may sentence-split non-streaming TTS implementations",
+            tts_node_src or "unknown",
+        )
+    except Exception as e:
+        logger.warning(
+            "LiveKit source inspection unavailable in current build environment; keeping default behavior and diagnostics only: reason=%s",
+            _redact_sensitive_text(e),
+        )
+    if os.getenv("GRPC_TRACE") is not None or os.getenv("GRPC_VERBOSITY") is not None:
+        logger.warning("Low-level gRPC tracing env vars are enabled and may be noisy")
 
     session_kwargs: dict[str, Any] = {
         "stt": build_stt(),
@@ -908,29 +1730,47 @@ async def entrypoint(ctx: JobContext):
     _attach_optional_interruption_diagnostics(session)
 
     room_options = build_room_options()
+    session_started_at = 0.0
     if room_options is not None:
         logger.info("Starting session with ai-coustics room_options attached")
         await session.start(room=ctx.room, agent=LucyAgent(), room_options=room_options)
+        session_started_at = time.monotonic()
     else:
         logger.info("Starting session without ai-coustics room_options")
         await session.start(room=ctx.room, agent=LucyAgent())
-    logger.info("About to generate greeting reply")
-    greeting_handle = await session.generate_reply(
-        instructions="Greet the user in one short casual sentence as Crash. Say: Yo. What’s going on?",
+        session_started_at = time.monotonic()
+
+    greeting_agent_listening_at = 0.0
+    for _ in range(50):
+        state = _safe_attr(session, "agent_state", "").strip().lower()
+        if state == "listening":
+            greeting_agent_listening_at = time.monotonic()
+            break
+        await asyncio.sleep(0.1)
+
+    logger.info("About to say fixed greeting")
+    greeting_tts_request_at = time.monotonic()
+    greeting_path = "cached_audio" if GREETING_AUDIO_PATH else "hume_live_tts"
+    if GREETING_AUDIO_PATH:
+        logger.warning("GREETING_AUDIO_PATH is set but cached audio playback is not yet implemented; using live TTS path for now")
+    greeting_handle = await session.say(
+        "Yo. What’s going on?",
         allow_interruptions=False,
     )
+    greeting_after_say_at = time.monotonic()
     logger.info(
-        "Greeting generate_reply completed: handle_type=%s handle_id=%s allow_interruptions=%s interrupted=%s",
+        "Fixed greeting say completed: handle_type=%s handle_id=%s interrupted=%s",
         type(greeting_handle).__name__,
         _safe_attr(greeting_handle, "id"),
-        _safe_attr(greeting_handle, "allow_interruptions"),
         _safe_attr(greeting_handle, "interrupted"),
     )
 
     wait_for_playout = getattr(greeting_handle, "wait_for_playout", None)
+    greeting_playout_done_at = 0.0
     if callable(wait_for_playout):
         try:
             await asyncio.wait_for(wait_for_playout(), timeout=8.0)
+            greeting_playout_done_at = time.monotonic()
             logger.info("Greeting playout completed")
         except TimeoutError:
             logger.warning("Greeting playout wait timed out")
@@ -938,6 +1778,17 @@ async def entrypoint(ctx: JobContext):
             logger.warning("Greeting playout wait failed: %s", e)
     else:
         logger.warning("Greeting handle does not support wait_for_playout")
+
+    logger.info(
+        "Greeting latency summary: greeting_job_to_session_start=%s greeting_session_start_to_agent_listening=%s greeting_tts_request_to_first_audio=%s greeting_total_tts_seconds=%s greeting_total_playout_seconds=%s greeting_text_length=%s greeting_path=%s",
+        _fmt_seconds(session_started_at - job_started_at if session_started_at > 0 else -1.0),
+        _fmt_seconds(greeting_agent_listening_at - session_started_at if greeting_agent_listening_at > 0 and session_started_at > 0 else -1.0),
+        _fmt_seconds(greeting_after_say_at - greeting_tts_request_at if greeting_after_say_at > 0 else -1.0),
+        _fmt_seconds(greeting_after_say_at - greeting_tts_request_at if greeting_after_say_at > 0 else -1.0),
+        _fmt_seconds(greeting_playout_done_at - greeting_tts_request_at if greeting_playout_done_at > 0 else -1.0),
+        len("Yo. What’s going on?"),
+        greeting_path,
+    )
 
 
 if __name__ == "__main__":
