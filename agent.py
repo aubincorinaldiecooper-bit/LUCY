@@ -720,6 +720,17 @@ def env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "on")
 
 
+def env_int_clamped(name: str, default: int, min_value: int, max_value: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw.strip())
+    except Exception:
+        return default
+    return max(min_value, min(max_value, value))
+
+
 
 AI_COUSTICS_ENABLED = env_bool("AI_COUSTICS_ENABLED", True)
 SPOKEN_TEXT_NORMALIZATION = env_bool("SPOKEN_TEXT_NORMALIZATION", False)
@@ -1526,14 +1537,29 @@ async def entrypoint(ctx: JobContext):
     _run_db_migrations_on_startup()
     _log_livekit_tts_source_inspection()
     openrouter_model = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o")
+    openrouter_max_tokens = env_int_clamped("OPENROUTER_MAX_TOKENS", 160, 32, 512)
     openrouter_api_key_present = bool(os.getenv("OPENROUTER_API_KEY", "").strip())
+    with_openrouter_sig = inspect.signature(openai.LLM.with_openrouter)
+    openrouter_kwargs: dict[str, Any] = {"model": openrouter_model}
+    if "max_tokens" in with_openrouter_sig.parameters:
+        openrouter_kwargs["max_tokens"] = openrouter_max_tokens
+    elif "max_completion_tokens" in with_openrouter_sig.parameters:
+        openrouter_kwargs["max_completion_tokens"] = openrouter_max_tokens
+    elif "model_settings" in with_openrouter_sig.parameters:
+        openrouter_kwargs["model_settings"] = {"max_tokens": openrouter_max_tokens}
+    else:
+        logger.warning(
+            "OpenRouter token cap parameter unsupported by installed LiveKit OpenAI plugin signature=%s",
+            _redact_sensitive_text(with_openrouter_sig),
+        )
     logger.info(
-        "LLM provider config: openrouter_api_key_present=%s openrouter_model_present=%s openrouter_model=%s",
+        "LLM provider config: openrouter_api_key_present=%s openrouter_model_present=%s openrouter_model=%s openrouter_max_tokens=%s",
         openrouter_api_key_present,
         bool(openrouter_model),
         openrouter_model,
+        openrouter_max_tokens,
     )
-    llm = openai.LLM.with_openrouter(model=openrouter_model)
+    llm = openai.LLM.with_openrouter(**openrouter_kwargs)
     # TODO: Re-enable Tavily using LiveKit's supported function-tool pattern.
     logger.warning("Skipping Tavily tools for MVP voice path")
 
