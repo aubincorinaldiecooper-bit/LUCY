@@ -159,6 +159,22 @@ def _safe_error_summary(error: object) -> dict[str, str]:
     return summary
 
 
+def _safe_llm_error_details(error: object) -> dict[str, str]:
+    details: dict[str, str] = {"error_type": type(error).__name__}
+    nested = getattr(error, "error", None)
+    if nested is not None:
+        details["nested_error_type"] = type(nested).__name__
+        for field in ("message", "reason", "detail", "status", "status_code", "code", "provider"):
+            value = getattr(nested, field, None)
+            if value is not None:
+                details[field] = _redact_sensitive_text(value)
+    for field in ("message", "reason", "detail", "status", "status_code", "code", "provider"):
+        value = getattr(error, field, None)
+        if value is not None and field not in details:
+            details[field] = _redact_sensitive_text(value)
+    return details
+
+
 def _extract_text_for_debug(obj: object) -> str:
     if obj is None:
         return ""
@@ -651,8 +667,14 @@ def attach_session_diagnostics(session: AgentSession) -> None:
     def _on_error(error: object) -> None:
         safe_summary = _safe_error_summary(error)
         logger.error("Session error event summary: %s", safe_summary)
-
         searchable_safe_text = " ".join(str(v).lower() for v in safe_summary.values())
+        if "llm" in searchable_safe_text:
+            logger.error(
+                "LLM error diagnostic: details=%s openrouter_api_key_present=%s openrouter_model=%s",
+                _safe_llm_error_details(error),
+                bool(os.getenv("OPENROUTER_API_KEY", "").strip()),
+                os.getenv("OPENROUTER_MODEL", "openai/gpt-4o"),
+            )
         if "tts" in searchable_safe_text:
             _clear_active_handles("tts_error")
         if MISTRAL_STT_DIAGNOSTICS:
@@ -1503,7 +1525,15 @@ def _attach_optional_interruption_diagnostics(session: AgentSession) -> None:
 async def entrypoint(ctx: JobContext):
     _run_db_migrations_on_startup()
     _log_livekit_tts_source_inspection()
-    llm = openai.LLM.with_openrouter(model=os.getenv("OPENROUTER_MODEL", "openai/gpt-4o"))
+    openrouter_model = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o")
+    openrouter_api_key_present = bool(os.getenv("OPENROUTER_API_KEY", "").strip())
+    logger.info(
+        "LLM provider config: openrouter_api_key_present=%s openrouter_model_present=%s openrouter_model=%s",
+        openrouter_api_key_present,
+        bool(openrouter_model),
+        openrouter_model,
+    )
+    llm = openai.LLM.with_openrouter(model=openrouter_model)
     # TODO: Re-enable Tavily using LiveKit's supported function-tool pattern.
     logger.warning("Skipping Tavily tools for MVP voice path")
 
