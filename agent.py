@@ -741,6 +741,7 @@ HUME_FULL_UTTERANCE_TTS = env_bool("HUME_FULL_UTTERANCE_TTS", False)
 LIVEKIT_TTS_SOURCE_INSPECTION = env_bool("LIVEKIT_TTS_SOURCE_INSPECTION", False)
 HUME_DIRECT_API_TTS = env_bool("HUME_DIRECT_API_TTS", False)
 RUN_DB_MIGRATIONS_ON_STARTUP = env_bool("RUN_DB_MIGRATIONS_ON_STARTUP", False)
+GREETING_AUDIO_PATH = (os.getenv("GREETING_AUDIO_PATH") or "").strip()
 
 
 def _pcm16_to_audio_frames(pcm_data: bytes, sample_rate: int, channels: int) -> list[rtc.AudioFrame]:
@@ -1534,6 +1535,7 @@ def _attach_optional_interruption_diagnostics(session: AgentSession) -> None:
 
 
 async def entrypoint(ctx: JobContext):
+    job_started_at = time.monotonic()
     _run_db_migrations_on_startup()
     _log_livekit_tts_source_inspection()
     openrouter_model = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o")
@@ -1713,17 +1715,34 @@ async def entrypoint(ctx: JobContext):
     _attach_optional_interruption_diagnostics(session)
 
     room_options = build_room_options()
+    session_started_at = 0.0
     if room_options is not None:
         logger.info("Starting session with ai-coustics room_options attached")
         await session.start(room=ctx.room, agent=LucyAgent(), room_options=room_options)
+        session_started_at = time.monotonic()
     else:
         logger.info("Starting session without ai-coustics room_options")
         await session.start(room=ctx.room, agent=LucyAgent())
+        session_started_at = time.monotonic()
+
+    greeting_agent_listening_at = 0.0
+    for _ in range(50):
+        state = _safe_attr(session, "agent_state", "").strip().lower()
+        if state == "listening":
+            greeting_agent_listening_at = time.monotonic()
+            break
+        await asyncio.sleep(0.1)
+
     logger.info("About to say fixed greeting")
+    greeting_tts_request_at = time.monotonic()
+    greeting_path = "cached_audio" if GREETING_AUDIO_PATH else "hume_live_tts"
+    if GREETING_AUDIO_PATH:
+        logger.warning("GREETING_AUDIO_PATH is set but cached audio playback is not yet implemented; using live TTS path for now")
     greeting_handle = await session.say(
         "Yo. What’s going on?",
         allow_interruptions=False,
     )
+    greeting_after_say_at = time.monotonic()
     logger.info(
         "Fixed greeting say completed: handle_type=%s handle_id=%s interrupted=%s",
         type(greeting_handle).__name__,
@@ -1732,9 +1751,11 @@ async def entrypoint(ctx: JobContext):
     )
 
     wait_for_playout = getattr(greeting_handle, "wait_for_playout", None)
+    greeting_playout_done_at = 0.0
     if callable(wait_for_playout):
         try:
             await asyncio.wait_for(wait_for_playout(), timeout=8.0)
+            greeting_playout_done_at = time.monotonic()
             logger.info("Greeting playout completed")
         except TimeoutError:
             logger.warning("Greeting playout wait timed out")
@@ -1742,6 +1763,17 @@ async def entrypoint(ctx: JobContext):
             logger.warning("Greeting playout wait failed: %s", e)
     else:
         logger.warning("Greeting handle does not support wait_for_playout")
+
+    logger.info(
+        "Greeting latency summary: greeting_job_to_session_start=%s greeting_session_start_to_agent_listening=%s greeting_tts_request_to_first_audio=%s greeting_total_tts_seconds=%s greeting_total_playout_seconds=%s greeting_text_length=%s greeting_path=%s",
+        _fmt_seconds(session_started_at - job_started_at if session_started_at > 0 else -1.0),
+        _fmt_seconds(greeting_agent_listening_at - session_started_at if greeting_agent_listening_at > 0 and session_started_at > 0 else -1.0),
+        _fmt_seconds(greeting_after_say_at - greeting_tts_request_at if greeting_after_say_at > 0 else -1.0),
+        _fmt_seconds(greeting_after_say_at - greeting_tts_request_at if greeting_after_say_at > 0 else -1.0),
+        _fmt_seconds(greeting_playout_done_at - greeting_tts_request_at if greeting_playout_done_at > 0 else -1.0),
+        len("Yo. What’s going on?"),
+        greeting_path,
+    )
 
 
 if __name__ == "__main__":
