@@ -89,6 +89,15 @@ _latest_active_assistant_count_for_hume = 0
 _latest_current_speech_id_for_hume = "n/a"
 _normalized_text_hash_ctx: contextvars.ContextVar[str] = contextvars.ContextVar("normalized_text_hash", default="n/a")
 _direct_hume_request_counter = 0
+_last_llm_start_at = 0.0
+_last_llm_complete_at = 0.0
+_last_tts_request_start_at = 0.0
+_last_tts_first_audio_at = 0.0
+_last_tts_text_length = 0
+_last_tts_sentence_end_count = 0
+_last_tts_path = "n/a"
+_last_hume_model_version = "n/a"
+_last_hume_description_applied = "n/a"
 
 
 def _next_local_speech_id() -> str:
@@ -103,6 +112,12 @@ def _safe_attr(obj: object, name: str, default: str = "n/a") -> str:
     except Exception:
         return default
     return str(value)
+
+
+def _fmt_seconds(seconds: float | None) -> str:
+    if seconds is None or seconds < 0:
+        return "n/a"
+    return f"{seconds:.1f}s"
 
 
 def _redact_sensitive_text(value: object) -> str:
@@ -487,6 +502,32 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                     was_suppressed,
                     len(active_speech_handles),
                 )
+                start_count = hume_request_count_at_speech_start.get(done_id, -1)
+                finish_count = hume_request_count_at_speech_finish.get(done_id, _hume_tts_request_counter)
+                hume_requests_during = finish_count - start_count if start_count >= 0 and finish_count >= 0 else -1
+                user_stopped_to_final_stt = (last_stt_final_at - last_user_listening_at) if (last_stt_final_at > 0 and last_user_listening_at > 0) else -1.0
+                final_stt_to_llm_start = (_last_llm_start_at - last_stt_final_at) if (_last_llm_start_at > 0 and last_stt_final_at > 0) else -1.0
+                final_stt_to_llm_complete = (_last_llm_complete_at - last_stt_final_at) if (_last_llm_complete_at > 0 and last_stt_final_at > 0) else -1.0
+                llm_complete_to_tts_request = (_last_tts_request_start_at - _last_llm_complete_at) if (_last_tts_request_start_at > 0 and _last_llm_complete_at > 0) else -1.0
+                tts_request_to_first_audio = (_last_tts_first_audio_at - _last_tts_request_start_at) if (_last_tts_first_audio_at > 0 and _last_tts_request_start_at > 0) else -1.0
+                final_stt_to_first_audio = (_last_tts_first_audio_at - last_stt_final_at) if (_last_tts_first_audio_at > 0 and last_stt_final_at > 0) else -1.0
+                user_stopped_to_first_audio = (_last_tts_first_audio_at - last_user_listening_at) if (_last_tts_first_audio_at > 0 and last_user_listening_at > 0) else -1.0
+                logger.info(
+                    "Voice latency summary: user_stopped_to_final_stt=%s final_stt_to_llm_start=%s final_stt_to_llm_complete=%s llm_complete_to_tts_request=%s tts_request_to_first_audio=%s final_stt_to_first_audio=%s user_stopped_to_first_audio=%s text_length=%s sentence_end_count=%s hume_requests_during_speech=%s tts_path=%s model_version=%s description_applied=%s",
+                    _fmt_seconds(user_stopped_to_final_stt),
+                    _fmt_seconds(final_stt_to_llm_start),
+                    _fmt_seconds(final_stt_to_llm_complete),
+                    _fmt_seconds(llm_complete_to_tts_request),
+                    _fmt_seconds(tts_request_to_first_audio),
+                    _fmt_seconds(final_stt_to_first_audio),
+                    _fmt_seconds(user_stopped_to_first_audio),
+                    _last_tts_text_length,
+                    _last_tts_sentence_end_count,
+                    hume_requests_during,
+                    _last_tts_path,
+                    _last_hume_model_version,
+                    _last_hume_description_applied,
+                )
 
             add_done_callback(_on_done)
         else:
@@ -826,6 +867,7 @@ def _resolve_hume_model_version() -> tuple[str, str]:
 
 
 def build_tts():
+    global _last_hume_model_version, _last_hume_description_applied
     if TTS_PROVIDER == "deepgram":
         logger.info("Using Deepgram TTS provider")
         return deepgram.TTS(
@@ -904,6 +946,8 @@ def build_tts():
             hume_model_version,
         )
         description_skip_reason = "none" if description_applied else "octave2_unsupported"
+        _last_hume_model_version = str(hume_model_version)
+        _last_hume_description_applied = str(description_applied).lower()
         logger.info(
             "Hume model/description summary: hume_model_raw=%s model_version=%s description_present=%s description_applied=%s description_skip_reason=%s hume_style_context_present=%s hume_style_context_applied=%s hume_style_context_skip_reason=%s",
             _redact_sensitive_text(hume_model_raw),
@@ -1080,7 +1124,7 @@ class LucyAgent(Agent):
         return normalized
 
     def tts_node(self, text: AsyncIterable[str], model_settings):
-        global _latest_normalized_text_hash
+        global _latest_normalized_text_hash, _last_tts_request_start_at, _last_tts_first_audio_at, _last_tts_text_length, _last_tts_sentence_end_count, _last_tts_path
         if not SPOKEN_TEXT_NORMALIZATION:
             logger.info("Spoken text normalization enabled=false")
             if not TTS_TEXT_DEBUG:
@@ -1122,6 +1166,10 @@ class LucyAgent(Agent):
             _normalized_text_hash_ctx.set(normalized_hash)
             sentence_end_count = sum(normalized_text.count(mark) for mark in (".", "?", "!", "…"))
             newline_count = normalized_text.count("\n")
+            _last_tts_text_length = len(normalized_text)
+            _last_tts_sentence_end_count = sentence_end_count
+            _last_tts_request_start_at = time.monotonic()
+            _last_tts_first_audio_at = 0.0
             logger.info(
                 "TTS normalized yield diagnostics: tts_normalized_yield_count=%s raw_chunk_count=%s raw_total_length=%s normalized_text_length=%s normalized_text_preview=%s normalized_text_hash=%s sentence_end_count=%s newline_count=%s SPOKEN_TEXT_NORMALIZATION=%s TTS_PROVIDER=%s HUME_INSTANT_MODE=%s HUME_SPEED=%s HUME_TRAILING_SILENCE=%s",
                 1, chunk_count, len(raw_text), len(normalized_text), _redact_sensitive_text(normalized_text)[:200], normalized_hash,
@@ -1157,12 +1205,14 @@ class LucyAgent(Agent):
                         else:
                             chunked_stream = synthesize_fn(normalized_text)
                         logger.info("Hume full-utterance mode: full_utterance_requested=%s full_utterance_supported=%s full_utterance_used=%s path=%s fallback_reason=%s", True, True, True, "livekit_hume_plugin_synthesize_full_text", "none")
+                        _last_tts_path = "livekit_hume_plugin_synthesize_full_text"
                         async for event in chunked_stream:
                             frame = getattr(event, "frame", None)
                             if frame is None:
                                 continue
                             if first_audio is None:
                                 first_audio = time.monotonic()
+                                _last_tts_first_audio_at = first_audio
                             yielded += 1
                             yield frame
                         logger.info("Hume full-utterance plugin result: hume_full_utterance_plugin_requested=%s hume_full_utterance_plugin_used=%s hume_full_utterance_plugin_fallback_reason=%s path=%s normalized_text_hash=%s text_length=%s sentence_end_count=%s frame_count_yielded=%s time_to_first_audio_seconds=%.3f total_tts_seconds=%.3f", True, True, "none", "livekit_hume_plugin_synthesize_full_text", normalized_hash, len(normalized_text), sentence_end_count, yielded, (first_audio-start) if first_audio else -1.0, time.monotonic()-start)
@@ -1178,6 +1228,10 @@ class LucyAgent(Agent):
                 logger.info("Hume full-utterance mode: full_utterance_requested=%s full_utterance_supported=%s full_utterance_used=%s path=%s fallback_reason=%s", False, False, False, "default_agent_tts_node_fallback", "not_requested")
 
             async for out in Agent.default.tts_node(self, _single_text_stream(), model_settings):
+                if _last_tts_first_audio_at <= 0:
+                    _last_tts_first_audio_at = time.monotonic()
+                if _last_tts_path == "n/a":
+                    _last_tts_path = "default_agent_tts_node_fallback"
                 yield out
 
         if TTS_PROVIDER == "hume" and SPOKEN_TEXT_NORMALIZATION and HUME_DIRECT_API_TTS:
@@ -1234,12 +1288,17 @@ class LucyAgent(Agent):
         return _direct_or_plugin_or_default()
 
     def llm_node(self, chat_ctx, tools, model_settings):
+        global _last_llm_start_at, _last_llm_complete_at
         stream = Agent.default.llm_node(self, chat_ctx, tools, model_settings)
 
         async def _llm_stream():
             assistant_fragments: list[str] = []
             chunk_count = 0
+            started = False
             async for chunk in stream:
+                if not started:
+                    _last_llm_start_at = time.monotonic()
+                    started = True
                 chunk_count += 1
                 if PIPELINE_TEXT_DEBUG:
                     text_delta: object = None
@@ -1284,6 +1343,7 @@ class LucyAgent(Agent):
                     len(combined),
                     _redact_sensitive_text(combined)[:200],
                 )
+            _last_llm_complete_at = time.monotonic()
 
         return _llm_stream()
 
