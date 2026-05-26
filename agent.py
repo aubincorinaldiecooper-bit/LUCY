@@ -1529,28 +1529,24 @@ async def entrypoint(ctx: JobContext):
     provider_order = [p.strip() for p in provider_order_raw.split(",") if p.strip()]
     openrouter_allow_fallbacks = env_bool("OPENROUTER_ALLOW_FALLBACKS", True)
     with_openrouter_sig = inspect.signature(openai.LLM.with_openrouter)
-    openrouter_kwargs: dict[str, Any] = {"model": openrouter_model}
     provider_routing_applied = False
-    provider_routing_skip_reason = "none"
+    provider_routing_skip_reason = "provider_order_not_set"
+    llm: Any
     if provider_order:
-        extra_body_payload = {
-            "provider": {
-                "order": provider_order,
-                "allow_fallbacks": openrouter_allow_fallbacks,
-            }
-        }
+        extra_body_payload = {"provider": {"order": provider_order, "allow_fallbacks": openrouter_allow_fallbacks}}
         if "extra_body" in with_openrouter_sig.parameters:
-            openrouter_kwargs["extra_body"] = extra_body_payload
-            provider_routing_applied = True
-        else:
-            llm_init_sig = inspect.signature(openai.LLM.__init__)
-            if "extra_body" in llm_init_sig.parameters:
-                openrouter_kwargs["extra_body"] = extra_body_payload
+            try:
+                llm = openai.LLM.with_openrouter(model=openrouter_model, extra_body=extra_body_payload)
                 provider_routing_applied = True
-            else:
-                provider_routing_skip_reason = "extra_body_unsupported_by_installed_livekit_openai_plugin"
+                provider_routing_skip_reason = "none"
+            except TypeError:
+                llm = openai.LLM.with_openrouter(model=openrouter_model)
+                provider_routing_skip_reason = "with_openrouter_rejected_extra_body_at_runtime"
+        else:
+            llm = openai.LLM.with_openrouter(model=openrouter_model)
+            provider_routing_skip_reason = "with_openrouter_missing_extra_body_parameter"
     else:
-        provider_routing_skip_reason = "provider_order_not_set"
+        llm = openai.LLM.with_openrouter(model=openrouter_model)
     logger.info(
         "LLM provider config: openrouter_api_key_present=%s openrouter_model_present=%s openrouter_model=%s openrouter_provider_order=%s openrouter_allow_fallbacks=%s provider_routing_applied=%s provider_routing_skip_reason=%s",
         openrouter_api_key_present,
@@ -1561,7 +1557,6 @@ async def entrypoint(ctx: JobContext):
         provider_routing_applied,
         provider_routing_skip_reason,
     )
-    llm = openai.LLM.with_openrouter(**openrouter_kwargs)
     # TODO: Re-enable Tavily using LiveKit's supported function-tool pattern.
     logger.warning("Skipping Tavily tools for MVP voice path")
 
