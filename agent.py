@@ -9,6 +9,8 @@ import contextvars
 import struct
 import wave
 import io
+import subprocess
+import sys
 from typing import Any, AsyncIterable
 
 import aiohttp
@@ -705,6 +707,7 @@ MISTRAL_STT_DIAGNOSTICS = env_bool("MISTRAL_STT_DIAGNOSTICS", True)
 HUME_FULL_UTTERANCE_TTS = env_bool("HUME_FULL_UTTERANCE_TTS", False)
 LIVEKIT_TTS_SOURCE_INSPECTION = env_bool("LIVEKIT_TTS_SOURCE_INSPECTION", False)
 HUME_DIRECT_API_TTS = env_bool("HUME_DIRECT_API_TTS", False)
+RUN_DB_MIGRATIONS_ON_STARTUP = env_bool("RUN_DB_MIGRATIONS_ON_STARTUP", False)
 
 
 def _pcm16_to_audio_frames(pcm_data: bytes, sample_rate: int, channels: int) -> list[rtc.AudioFrame]:
@@ -799,6 +802,40 @@ def _log_livekit_tts_source_inspection() -> None:
     logger.info("LiveKit Hume TTS class source excerpt (max_8000): %s", hume_src)
     logger.info("LiveKit Hume TTS.synthesize signature=%s source_excerpt(max_4000): %s", hume_synthesize_sig, hume_synthesize_src)
     logger.info("LiveKit Hume TTS.stream signature=%s source_excerpt(max_4000): %s", hume_stream_sig, hume_stream_src)
+
+
+def _run_db_migrations_on_startup() -> None:
+    logger.info("database_migrations_startup_enabled=%s", RUN_DB_MIGRATIONS_ON_STARTUP)
+    if not RUN_DB_MIGRATIONS_ON_STARTUP:
+        logger.info("database_migration_status=skipped")
+        return
+
+    if not os.getenv("DATABASE_URL"):
+        logger.error("database_migration_status=failed reason=missing_DATABASE_URL")
+        raise RuntimeError("DATABASE_URL is required when RUN_DB_MIGRATIONS_ON_STARTUP=true")
+
+    script_path = os.path.join(os.path.dirname(__file__), "scripts", "apply_migrations.py")
+    if not os.path.exists(script_path):
+        logger.error("database_migration_status=failed reason=migration_runner_missing")
+        raise RuntimeError("Migration runner not found at scripts/apply_migrations.py")
+
+    logger.info("database_migration_status=running")
+    result = subprocess.run(
+        [sys.executable, script_path],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    for line in (result.stdout or "").splitlines():
+        logger.info("migration_runner: %s", line)
+    for line in (result.stderr or "").splitlines():
+        logger.error("migration_runner: %s", line)
+
+    if result.returncode != 0:
+        logger.error("database_migration_status=failed return_code=%s", result.returncode)
+        raise RuntimeError("Database migration failed during startup")
+
+    logger.info("database_migration_status=success")
 
 
 def _resolve_ai_coustics_model(model_name: str):
@@ -1464,6 +1501,7 @@ def _attach_optional_interruption_diagnostics(session: AgentSession) -> None:
 
 
 async def entrypoint(ctx: JobContext):
+    _run_db_migrations_on_startup()
     _log_livekit_tts_source_inspection()
     llm = openai.LLM.with_openrouter(model=os.getenv("OPENROUTER_MODEL", "openai/gpt-4o"))
     # TODO: Re-enable Tavily using LiveKit's supported function-tool pattern.
