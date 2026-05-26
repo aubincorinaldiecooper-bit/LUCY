@@ -11,4 +11,5 @@ dependencies = [
   "uvicorn",
   "livekit-api",
   "livekit-plugins-ai-coustics>=0.2.15",
+  "psycopg[binary]",
 ]
