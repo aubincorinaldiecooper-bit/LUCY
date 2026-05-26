@@ -1539,27 +1539,42 @@ async def entrypoint(ctx: JobContext):
     _run_db_migrations_on_startup()
     _log_livekit_tts_source_inspection()
     openrouter_model = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o")
-    openrouter_max_tokens = env_int_clamped("OPENROUTER_MAX_TOKENS", 160, 32, 512)
     openrouter_api_key_present = bool(os.getenv("OPENROUTER_API_KEY", "").strip())
+    provider_order_raw = (os.getenv("OPENROUTER_PROVIDER_ORDER") or "").strip()
+    provider_order = [p.strip() for p in provider_order_raw.split(",") if p.strip()]
+    openrouter_allow_fallbacks = env_bool("OPENROUTER_ALLOW_FALLBACKS", True)
     with_openrouter_sig = inspect.signature(openai.LLM.with_openrouter)
     openrouter_kwargs: dict[str, Any] = {"model": openrouter_model}
-    if "max_tokens" in with_openrouter_sig.parameters:
-        openrouter_kwargs["max_tokens"] = openrouter_max_tokens
-    elif "max_completion_tokens" in with_openrouter_sig.parameters:
-        openrouter_kwargs["max_completion_tokens"] = openrouter_max_tokens
-    elif "model_settings" in with_openrouter_sig.parameters:
-        openrouter_kwargs["model_settings"] = {"max_tokens": openrouter_max_tokens}
+    provider_routing_applied = False
+    provider_routing_skip_reason = "none"
+    if provider_order:
+        extra_body_payload = {
+            "provider": {
+                "order": provider_order,
+                "allow_fallbacks": openrouter_allow_fallbacks,
+            }
+        }
+        if "extra_body" in with_openrouter_sig.parameters:
+            openrouter_kwargs["extra_body"] = extra_body_payload
+            provider_routing_applied = True
+        else:
+            llm_init_sig = inspect.signature(openai.LLM.__init__)
+            if "extra_body" in llm_init_sig.parameters:
+                openrouter_kwargs["extra_body"] = extra_body_payload
+                provider_routing_applied = True
+            else:
+                provider_routing_skip_reason = "extra_body_unsupported_by_installed_livekit_openai_plugin"
     else:
-        logger.warning(
-            "OpenRouter token cap parameter unsupported by installed LiveKit OpenAI plugin signature=%s",
-            _redact_sensitive_text(with_openrouter_sig),
-        )
+        provider_routing_skip_reason = "provider_order_not_set"
     logger.info(
-        "LLM provider config: openrouter_api_key_present=%s openrouter_model_present=%s openrouter_model=%s openrouter_max_tokens=%s",
+        "LLM provider config: openrouter_api_key_present=%s openrouter_model_present=%s openrouter_model=%s openrouter_provider_order=%s openrouter_allow_fallbacks=%s provider_routing_applied=%s provider_routing_skip_reason=%s",
         openrouter_api_key_present,
         bool(openrouter_model),
         openrouter_model,
-        openrouter_max_tokens,
+        ",".join(provider_order) if provider_order else "none",
+        openrouter_allow_fallbacks,
+        provider_routing_applied,
+        provider_routing_skip_reason,
     )
     llm = openai.LLM.with_openrouter(**openrouter_kwargs)
     # TODO: Re-enable Tavily using LiveKit's supported function-tool pattern.
