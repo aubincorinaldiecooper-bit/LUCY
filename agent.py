@@ -22,7 +22,6 @@ from livekit import rtc
 from livekit.plugins import ai_coustics, deepgram, hume, mistralai, openai, silero
 from tavily import TavilyClient
 
-from kokoro_plugin import KokoroTTS
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -1156,21 +1155,7 @@ def build_tts():
 
         return hume.TTS(**hume_tts_kwargs)
 
-    if TTS_PROVIDER == "kokoro":
-        kokoro_endpoint = os.getenv("KOKORO_TTS_ENDPOINT")
-        if not kokoro_endpoint:
-            raise RuntimeError("KOKORO_TTS_ENDPOINT is required for Kokoro TTS")
-
-        logger.info("Using Kokoro TTS provider")
-        return KokoroTTS(
-            base_url=kokoro_endpoint,
-            api_key=os.getenv("KOKORO_API_KEY", "not-needed"),
-            model=os.getenv("KOKORO_TTS_MODEL", "kokoro"),
-            voice=os.getenv("KOKORO_VOICE", "af_bella"),
-            speed=float(os.getenv("KOKORO_SPEED", "1.03")),
-        )
-
-    raise RuntimeError("Unsupported TTS_PROVIDER. Use 'deepgram', 'hume', or 'kokoro'.")
+    raise RuntimeError("Unsupported TTS_PROVIDER. Use 'deepgram' or 'hume'.")
 
 app = FastAPI()
 
