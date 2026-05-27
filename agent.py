@@ -95,10 +95,10 @@ _last_llm_first_token_at: float | None = None
 _last_llm_complete_at = 0.0
 _last_turn_committed_at = 0.0
 _last_tts_request_start_at = 0.0
-_last_tts_first_audio_at = 0.0
+_last_tts_first_audio_at: float | None = None
 _last_tts_text_length = 0
 _last_tts_sentence_end_count = 0
-_last_tts_path = "n/a"
+_last_tts_path: str | None = None
 _last_hume_model_version = "n/a"
 _last_hume_description_applied = "n/a"
 _silero_initialized = False
@@ -536,9 +536,9 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                 turn_committed_to_llm_complete = (_last_llm_complete_at - _last_turn_committed_at) if (_last_llm_complete_at > 0 and _last_turn_committed_at > 0) else -1.0
                 final_stt_to_llm_complete = (_last_llm_complete_at - last_stt_final_at) if (_last_llm_complete_at > 0 and last_stt_final_at > 0) else -1.0
                 llm_complete_to_tts_request = (_last_tts_request_start_at - _last_llm_complete_at) if (_last_tts_request_start_at > 0 and _last_llm_complete_at > 0) else -1.0
-                tts_request_to_first_audio = (_last_tts_first_audio_at - _last_tts_request_start_at) if (_last_tts_first_audio_at > 0 and _last_tts_request_start_at > 0) else -1.0
-                final_stt_to_first_audio = (_last_tts_first_audio_at - last_stt_final_at) if (_last_tts_first_audio_at > 0 and last_stt_final_at > 0) else -1.0
-                user_stopped_to_first_audio = (_last_tts_first_audio_at - last_user_listening_at) if (_last_tts_first_audio_at > 0 and last_user_listening_at > 0) else -1.0
+                tts_request_to_first_audio = (_last_tts_first_audio_at - _last_tts_request_start_at) if (_last_tts_first_audio_at is not None and _last_tts_request_start_at > 0) else -1.0
+                final_stt_to_first_audio = (_last_tts_first_audio_at - last_stt_final_at) if (_last_tts_first_audio_at is not None and last_stt_final_at > 0) else -1.0
+                user_stopped_to_first_audio = (_last_tts_first_audio_at - last_user_listening_at) if (_last_tts_first_audio_at is not None and last_user_listening_at > 0) else -1.0
                 logger.info(
                     "Voice latency summary: user_stopped_to_final_stt=%s final_stt_to_turn_committed=%s turn_committed_to_llm_first_token=%s llm_first_token_to_llm_complete=%s turn_committed_to_llm_complete=%s final_stt_to_llm_complete=%s llm_complete_to_tts_request=%s tts_request_to_first_audio=%s final_stt_to_first_audio=%s user_stopped_to_first_audio=%s llm_stream_status=%s llm_timeout_stage=%s llm_fallback_response_used=%s text_length=%s sentence_end_count=%s hume_requests_during_speech=%s openrouter_model=%s tts_path=%s model_version=%s description_applied=%s",
                     _fmt_seconds(user_stopped_to_final_stt),
@@ -558,7 +558,7 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                     _last_tts_sentence_end_count,
                     hume_requests_during,
                     os.getenv("OPENROUTER_MODEL", "openai/gpt-4o"),
-                    _last_tts_path,
+                    _last_tts_path or "n/a",
                     _last_hume_model_version,
                     _last_hume_description_applied,
                 )
@@ -1226,7 +1226,7 @@ class LucyAgent(Agent):
         logger.info("Spoken text normalization enabled=true mode=buffered_full_segment")
 
         async def _direct_or_plugin_or_default() -> AsyncIterable[Any]:
-            global _latest_normalized_text_hash
+            global _latest_normalized_text_hash, _last_tts_first_audio_at, _last_tts_path
             chunks: list[str] = []
             chunk_count = 0
             async for chunk in text:
@@ -1246,7 +1246,8 @@ class LucyAgent(Agent):
             _last_tts_text_length = len(normalized_text)
             _last_tts_sentence_end_count = sentence_end_count
             _last_tts_request_start_at = time.monotonic()
-            _last_tts_first_audio_at = 0.0
+            _last_tts_first_audio_at = None
+            _last_tts_path = None
             logger.info(
                 "TTS normalized yield diagnostics: tts_normalized_yield_count=%s raw_chunk_count=%s raw_total_length=%s normalized_text_length=%s normalized_text_preview=%s normalized_text_hash=%s sentence_end_count=%s newline_count=%s SPOKEN_TEXT_NORMALIZATION=%s TTS_PROVIDER=%s HUME_INSTANT_MODE=%s HUME_SPEED=%s HUME_TRAILING_SILENCE=%s",
                 1, chunk_count, len(raw_text), len(normalized_text), _redact_sensitive_text(normalized_text)[:200], normalized_hash,
@@ -1304,12 +1305,21 @@ class LucyAgent(Agent):
             elif TTS_PROVIDER == "hume":
                 logger.info("Hume full-utterance mode: full_utterance_requested=%s full_utterance_supported=%s full_utterance_used=%s path=%s fallback_reason=%s", False, False, False, "default_agent_tts_node_fallback", "not_requested")
 
-            async for out in Agent.default.tts_node(self, _single_text_stream(), model_settings):
-                if _last_tts_first_audio_at <= 0:
-                    _last_tts_first_audio_at = time.monotonic()
-                if _last_tts_path == "n/a":
-                    _last_tts_path = "default_agent_tts_node_fallback"
-                yield out
+            try:
+                async for out in Agent.default.tts_node(self, _single_text_stream(), model_settings):
+                    if _last_tts_first_audio_at is None:
+                        _last_tts_first_audio_at = time.monotonic()
+                    if _last_tts_path is None:
+                        _last_tts_path = "default_agent_tts_node_fallback"
+                    yield out
+            except Exception as e:
+                logger.error(
+                    "tts_stream_status=error error_type=%s error=%s tts_path=%s",
+                    type(e).__name__,
+                    _redact_sensitive_text(e),
+                    _last_tts_path or "n/a",
+                )
+                raise
 
         if TTS_PROVIDER == "hume" and SPOKEN_TEXT_NORMALIZATION and HUME_DIRECT_API_TTS:
             async def _direct_hume_or_fallback_stream() -> AsyncIterable[rtc.AudioFrame]:
