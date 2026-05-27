@@ -91,7 +91,9 @@ _latest_current_speech_id_for_hume = "n/a"
 _normalized_text_hash_ctx: contextvars.ContextVar[str] = contextvars.ContextVar("normalized_text_hash", default="n/a")
 _direct_hume_request_counter = 0
 _last_llm_start_at = 0.0
+_last_llm_first_token_at = 0.0
 _last_llm_complete_at = 0.0
+_last_turn_committed_at = 0.0
 _last_tts_request_start_at = 0.0
 _last_tts_first_audio_at = 0.0
 _last_tts_text_length = 0
@@ -99,6 +101,7 @@ _last_tts_sentence_end_count = 0
 _last_tts_path = "n/a"
 _last_hume_model_version = "n/a"
 _last_hume_description_applied = "n/a"
+_silero_initialized = False
 
 
 def _next_local_speech_id() -> str:
@@ -523,16 +526,22 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                 finish_count = hume_request_count_at_speech_finish.get(done_id, _hume_tts_request_counter)
                 hume_requests_during = finish_count - start_count if start_count >= 0 and finish_count >= 0 else -1
                 user_stopped_to_final_stt = (last_stt_final_at - last_user_listening_at) if (last_stt_final_at > 0 and last_user_listening_at > 0) else -1.0
-                final_stt_to_llm_start = (_last_llm_start_at - last_stt_final_at) if (_last_llm_start_at > 0 and last_stt_final_at > 0) else -1.0
+                final_stt_to_turn_committed = (_last_turn_committed_at - last_stt_final_at) if (_last_turn_committed_at > 0 and last_stt_final_at > 0) else -1.0
+                turn_committed_to_llm_first_token = (_last_llm_first_token_at - _last_turn_committed_at) if (_last_llm_first_token_at > 0 and _last_turn_committed_at > 0) else -1.0
+                llm_first_token_to_llm_complete = (_last_llm_complete_at - _last_llm_first_token_at) if (_last_llm_complete_at > 0 and _last_llm_first_token_at > 0) else -1.0
+                turn_committed_to_llm_complete = (_last_llm_complete_at - _last_turn_committed_at) if (_last_llm_complete_at > 0 and _last_turn_committed_at > 0) else -1.0
                 final_stt_to_llm_complete = (_last_llm_complete_at - last_stt_final_at) if (_last_llm_complete_at > 0 and last_stt_final_at > 0) else -1.0
                 llm_complete_to_tts_request = (_last_tts_request_start_at - _last_llm_complete_at) if (_last_tts_request_start_at > 0 and _last_llm_complete_at > 0) else -1.0
                 tts_request_to_first_audio = (_last_tts_first_audio_at - _last_tts_request_start_at) if (_last_tts_first_audio_at > 0 and _last_tts_request_start_at > 0) else -1.0
                 final_stt_to_first_audio = (_last_tts_first_audio_at - last_stt_final_at) if (_last_tts_first_audio_at > 0 and last_stt_final_at > 0) else -1.0
                 user_stopped_to_first_audio = (_last_tts_first_audio_at - last_user_listening_at) if (_last_tts_first_audio_at > 0 and last_user_listening_at > 0) else -1.0
                 logger.info(
-                    "Voice latency summary: user_stopped_to_final_stt=%s final_stt_to_llm_start=%s final_stt_to_llm_complete=%s llm_complete_to_tts_request=%s tts_request_to_first_audio=%s final_stt_to_first_audio=%s user_stopped_to_first_audio=%s text_length=%s sentence_end_count=%s hume_requests_during_speech=%s tts_path=%s model_version=%s description_applied=%s",
+                    "Voice latency summary: user_stopped_to_final_stt=%s final_stt_to_turn_committed=%s turn_committed_to_llm_first_token=%s llm_first_token_to_llm_complete=%s turn_committed_to_llm_complete=%s final_stt_to_llm_complete=%s llm_complete_to_tts_request=%s tts_request_to_first_audio=%s final_stt_to_first_audio=%s user_stopped_to_first_audio=%s text_length=%s sentence_end_count=%s hume_requests_during_speech=%s openrouter_model=%s tts_path=%s model_version=%s description_applied=%s",
                     _fmt_seconds(user_stopped_to_final_stt),
-                    _fmt_seconds(final_stt_to_llm_start),
+                    _fmt_seconds(final_stt_to_turn_committed),
+                    _fmt_seconds(turn_committed_to_llm_first_token),
+                    _fmt_seconds(llm_first_token_to_llm_complete),
+                    _fmt_seconds(turn_committed_to_llm_complete),
                     _fmt_seconds(final_stt_to_llm_complete),
                     _fmt_seconds(llm_complete_to_tts_request),
                     _fmt_seconds(tts_request_to_first_audio),
@@ -541,6 +550,7 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                     _last_tts_text_length,
                     _last_tts_sentence_end_count,
                     hume_requests_during,
+                    os.getenv("OPENROUTER_MODEL", "openai/gpt-4o"),
                     _last_tts_path,
                     _last_hume_model_version,
                     _last_hume_description_applied,
@@ -1344,7 +1354,7 @@ class LucyAgent(Agent):
         return _direct_or_plugin_or_default()
 
     def llm_node(self, chat_ctx, tools, model_settings):
-        global _last_llm_start_at, _last_llm_complete_at
+        global _last_llm_start_at, _last_llm_first_token_at, _last_llm_complete_at
         stream = Agent.default.llm_node(self, chat_ctx, tools, model_settings)
 
         async def _llm_stream():
@@ -1389,6 +1399,8 @@ class LucyAgent(Agent):
                     if text_delta is None and isinstance(chunk, str):
                         text_delta = chunk
                     if isinstance(text_delta, str):
+                        if text_delta.strip() and _last_llm_first_token_at <= 0:
+                            _last_llm_first_token_at = time.monotonic()
                         assistant_fragments.append(text_delta)
                 yield chunk
             if PIPELINE_TEXT_DEBUG:
@@ -1404,6 +1416,11 @@ class LucyAgent(Agent):
         return _llm_stream()
 
     async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
+        global _last_turn_committed_at, _last_llm_start_at, _last_llm_first_token_at, _last_llm_complete_at
+        _last_turn_committed_at = time.monotonic()
+        _last_llm_start_at = 0.0
+        _last_llm_first_token_at = 0.0
+        _last_llm_complete_at = 0.0
         if PIPELINE_TEXT_DEBUG:
             msg_str = _extract_text_for_debug(new_message)
             messages = getattr(turn_ctx, "messages", None)
@@ -1423,12 +1440,14 @@ class LucyAgent(Agent):
 
 
 def build_vad():
+    global _silero_initialized
     if VAD_PROVIDER == "ai_coustics":
         logger.info("Using ai-coustics VAD provider")
         return ai_coustics.VAD()
 
     if VAD_PROVIDER == "silero":
         logger.info("Using Silero VAD provider")
+        _silero_initialized = True
         return silero.VAD.load()
 
     logger.warning("Unknown VAD_PROVIDER=%s. Falling back to ai-coustics VAD provider", VAD_PROVIDER)
@@ -1704,6 +1723,22 @@ async def entrypoint(ctx: JobContext):
     logger.info("Resolved STT type: %s", type(resolved_stt).__name__)
     resolved_vad = session_kwargs.get("vad")
     logger.info("Resolved VAD provider: provider=%s vad_type=%s", VAD_PROVIDER, type(resolved_vad).__name__)
+    silero_imported = "silero" in globals()
+    silero_passed_to_session = "silero" in type(resolved_vad).__module__.lower() or "silero" in type(resolved_vad).__name__.lower()
+    if silero_passed_to_session:
+        silero_reason = "silero_selected_or_fallback_runtime_vad"
+    elif silero_imported:
+        silero_reason = "silero_imported_or_preloaded_by_runtime_not_active_vad"
+    else:
+        silero_reason = "silero_not_imported"
+    logger.info(
+        "VAD runtime diagnostic: active_vad_provider=%s silero_imported=%s silero_initialized=%s silero_passed_to_session=%s silero_runtime_warning_possible_reason=%s",
+        VAD_PROVIDER,
+        silero_imported,
+        _silero_initialized,
+        silero_passed_to_session,
+        silero_reason,
+    )
     logger.info("Resolved turn detection mode: %s", resolved_turn_detection_mode)
 
     attach_session_diagnostics(session)
