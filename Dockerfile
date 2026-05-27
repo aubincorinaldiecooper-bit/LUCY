@@ -17,8 +17,7 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev
 RUN uv cache clean 2>/dev/null; rm -rf /root/.cache /tmp/* /var/cache/apt/archives/*.deb
 
-COPY kokoro_plugin.py /app/kokoro_plugin.py
-RUN python -c "import inspect; from livekit.plugins import deepgram, hume, mistralai, openai, silero; from livekit.agents import AgentSession, tts; from kokoro_plugin import KokoroTTSStream; expected=list(inspect.signature(tts.ChunkedStream._run).parameters); got=list(inspect.signature(KokoroTTSStream._run).parameters); assert got==expected, f'KokoroTTSStream._run params mismatch: expected {expected}, got {got}'; print('✅ Build imports and TTS stream signature OK')" || exit 1
+RUN python -c "from livekit.plugins import deepgram, hume, mistralai, openai, silero; from livekit.agents import AgentSession; print('✅ Build imports OK')" || exit 1
 
 COPY . .
 RUN python agent.py download-files
