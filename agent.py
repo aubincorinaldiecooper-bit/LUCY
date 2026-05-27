@@ -91,7 +91,7 @@ _latest_current_speech_id_for_hume = "n/a"
 _normalized_text_hash_ctx: contextvars.ContextVar[str] = contextvars.ContextVar("normalized_text_hash", default="n/a")
 _direct_hume_request_counter = 0
 _last_llm_start_at = 0.0
-_last_llm_first_token_at = 0.0
+_last_llm_first_token_at: float | None = None
 _last_llm_complete_at = 0.0
 _last_turn_committed_at = 0.0
 _last_tts_request_start_at = 0.0
@@ -102,6 +102,10 @@ _last_tts_path = "n/a"
 _last_hume_model_version = "n/a"
 _last_hume_description_applied = "n/a"
 _silero_initialized = False
+_last_llm_stream_status = "n/a"
+_last_llm_timeout_stage = "n/a"
+_last_llm_fallback_response_used = False
+_pending_llm_fallback_text: str | None = None
 
 
 def _next_local_speech_id() -> str:
@@ -527,8 +531,8 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                 hume_requests_during = finish_count - start_count if start_count >= 0 and finish_count >= 0 else -1
                 user_stopped_to_final_stt = (last_stt_final_at - last_user_listening_at) if (last_stt_final_at > 0 and last_user_listening_at > 0) else -1.0
                 final_stt_to_turn_committed = (_last_turn_committed_at - last_stt_final_at) if (_last_turn_committed_at > 0 and last_stt_final_at > 0) else -1.0
-                turn_committed_to_llm_first_token = (_last_llm_first_token_at - _last_turn_committed_at) if (_last_llm_first_token_at > 0 and _last_turn_committed_at > 0) else -1.0
-                llm_first_token_to_llm_complete = (_last_llm_complete_at - _last_llm_first_token_at) if (_last_llm_complete_at > 0 and _last_llm_first_token_at > 0) else -1.0
+                turn_committed_to_llm_first_token = (_last_llm_first_token_at - _last_turn_committed_at) if (_last_llm_first_token_at is not None and _last_turn_committed_at > 0) else -1.0
+                llm_first_token_to_llm_complete = (_last_llm_complete_at - _last_llm_first_token_at) if (_last_llm_complete_at > 0 and _last_llm_first_token_at is not None) else -1.0
                 turn_committed_to_llm_complete = (_last_llm_complete_at - _last_turn_committed_at) if (_last_llm_complete_at > 0 and _last_turn_committed_at > 0) else -1.0
                 final_stt_to_llm_complete = (_last_llm_complete_at - last_stt_final_at) if (_last_llm_complete_at > 0 and last_stt_final_at > 0) else -1.0
                 llm_complete_to_tts_request = (_last_tts_request_start_at - _last_llm_complete_at) if (_last_tts_request_start_at > 0 and _last_llm_complete_at > 0) else -1.0
@@ -536,7 +540,7 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                 final_stt_to_first_audio = (_last_tts_first_audio_at - last_stt_final_at) if (_last_tts_first_audio_at > 0 and last_stt_final_at > 0) else -1.0
                 user_stopped_to_first_audio = (_last_tts_first_audio_at - last_user_listening_at) if (_last_tts_first_audio_at > 0 and last_user_listening_at > 0) else -1.0
                 logger.info(
-                    "Voice latency summary: user_stopped_to_final_stt=%s final_stt_to_turn_committed=%s turn_committed_to_llm_first_token=%s llm_first_token_to_llm_complete=%s turn_committed_to_llm_complete=%s final_stt_to_llm_complete=%s llm_complete_to_tts_request=%s tts_request_to_first_audio=%s final_stt_to_first_audio=%s user_stopped_to_first_audio=%s text_length=%s sentence_end_count=%s hume_requests_during_speech=%s openrouter_model=%s tts_path=%s model_version=%s description_applied=%s",
+                    "Voice latency summary: user_stopped_to_final_stt=%s final_stt_to_turn_committed=%s turn_committed_to_llm_first_token=%s llm_first_token_to_llm_complete=%s turn_committed_to_llm_complete=%s final_stt_to_llm_complete=%s llm_complete_to_tts_request=%s tts_request_to_first_audio=%s final_stt_to_first_audio=%s user_stopped_to_first_audio=%s llm_stream_status=%s llm_timeout_stage=%s llm_fallback_response_used=%s text_length=%s sentence_end_count=%s hume_requests_during_speech=%s openrouter_model=%s tts_path=%s model_version=%s description_applied=%s",
                     _fmt_seconds(user_stopped_to_final_stt),
                     _fmt_seconds(final_stt_to_turn_committed),
                     _fmt_seconds(turn_committed_to_llm_first_token),
@@ -547,6 +551,9 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                     _fmt_seconds(tts_request_to_first_audio),
                     _fmt_seconds(final_stt_to_first_audio),
                     _fmt_seconds(user_stopped_to_first_audio),
+                    _last_llm_stream_status,
+                    _last_llm_timeout_stage,
+                    _last_llm_fallback_response_used,
                     _last_tts_text_length,
                     _last_tts_sentence_end_count,
                     hume_requests_during,
@@ -751,6 +758,7 @@ LIVEKIT_TTS_SOURCE_INSPECTION = env_bool("LIVEKIT_TTS_SOURCE_INSPECTION", False)
 HUME_DIRECT_API_TTS = env_bool("HUME_DIRECT_API_TTS", False)
 RUN_DB_MIGRATIONS_ON_STARTUP = env_bool("RUN_DB_MIGRATIONS_ON_STARTUP", False)
 GREETING_AUDIO_PATH = (os.getenv("GREETING_AUDIO_PATH") or "").strip()
+LLM_STREAM_TIMEOUT_SECONDS = env_int_clamped("LLM_STREAM_TIMEOUT_SECONDS", 12, 3, 120)
 
 
 def _pcm16_to_audio_frames(pcm_data: bytes, sample_rate: int, channels: int) -> list[rtc.AudioFrame]:
@@ -1190,7 +1198,7 @@ class LucyAgent(Agent):
         return normalized
 
     def tts_node(self, text: AsyncIterable[str], model_settings):
-        global _latest_normalized_text_hash, _last_tts_request_start_at, _last_tts_first_audio_at, _last_tts_text_length, _last_tts_sentence_end_count, _last_tts_path
+        global _latest_normalized_text_hash, _last_tts_request_start_at, _last_tts_first_audio_at, _last_tts_text_length, _last_tts_sentence_end_count, _last_tts_path, _pending_llm_fallback_text
         if not SPOKEN_TEXT_NORMALIZATION:
             logger.info("Spoken text normalization enabled=false")
             if not TTS_TEXT_DEBUG:
@@ -1227,6 +1235,9 @@ class LucyAgent(Agent):
             raw_text = "".join(chunks)
             sanitized = _sanitize_spoken_laughter(raw_text)
             normalized_text = self._normalize_spoken_text(sanitized)
+            if (not normalized_text.strip()) and _pending_llm_fallback_text:
+                normalized_text = _pending_llm_fallback_text
+                _pending_llm_fallback_text = None
             normalized_hash = hashlib.sha256(normalized_text.encode("utf-8")).hexdigest()[:12] if normalized_text else "empty"
             _latest_normalized_text_hash = normalized_hash
             _normalized_text_hash_ctx.set(normalized_hash)
@@ -1354,73 +1365,101 @@ class LucyAgent(Agent):
         return _direct_or_plugin_or_default()
 
     def llm_node(self, chat_ctx, tools, model_settings):
-        global _last_llm_start_at, _last_llm_first_token_at, _last_llm_complete_at
+        global _last_llm_start_at, _last_llm_first_token_at, _last_llm_complete_at, _last_llm_stream_status, _last_llm_timeout_stage, _last_llm_fallback_response_used, _pending_llm_fallback_text
         stream = Agent.default.llm_node(self, chat_ctx, tools, model_settings)
 
         async def _llm_stream():
             assistant_fragments: list[str] = []
             chunk_count = 0
-            started = False
-            async for chunk in stream:
-                if not started:
-                    _last_llm_start_at = time.monotonic()
-                    started = True
+            _last_llm_stream_status = "ok"
+            _last_llm_timeout_stage = "none"
+            _last_llm_fallback_response_used = False
+            _last_llm_start_at = time.monotonic()
+            _last_llm_first_token_at = None
+            start = _last_llm_start_at
+            it = stream.__aiter__()
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(it.__anext__(), timeout=LLM_STREAM_TIMEOUT_SECONDS)
+                except StopAsyncIteration:
+                    _last_llm_complete_at = time.monotonic()
+                    break
+                except asyncio.TimeoutError:
+                    elapsed = time.monotonic() - start
+                    stage = "first_token" if _last_llm_first_token_at is None else "completion"
+                    _last_llm_stream_status = "timeout"
+                    _last_llm_timeout_stage = stage
+                    logger.error("llm_stream_status=timeout llm_timeout_stage=%s elapsed_seconds=%s openrouter_model=%s", stage, _fmt_seconds(elapsed), os.getenv("OPENROUTER_MODEL", "openai/gpt-4o"))
+                    if not assistant_fragments:
+                        _pending_llm_fallback_text = "Sorry, I got stuck for a second. Can you say that again?"
+                        _last_llm_fallback_response_used = True
+                        logger.warning("llm_fallback_response_used=true fallback_reason=timeout")
+                    _last_llm_complete_at = time.monotonic()
+                    break
+                except Exception as e:
+                    _last_llm_stream_status = "error"
+                    _last_llm_timeout_stage = "none"
+                    logger.error("llm_stream_status=error error_type=%s error=%s openrouter_model=%s chunk_count=%s text_length_so_far=%s first_token_seen=%s", type(e).__name__, _redact_sensitive_text(e), os.getenv("OPENROUTER_MODEL", "openai/gpt-4o"), chunk_count, len(''.join(assistant_fragments)), _last_llm_first_token_at is not None)
+                    if not assistant_fragments:
+                        _pending_llm_fallback_text = "Sorry, I got stuck for a second. Can you say that again?"
+                        _last_llm_fallback_response_used = True
+                        logger.warning("llm_fallback_response_used=true fallback_reason=error")
+                    _last_llm_complete_at = time.monotonic()
+                    break
+
                 chunk_count += 1
-                if PIPELINE_TEXT_DEBUG:
-                    text_delta: object = None
-                    delta = getattr(chunk, "delta", None)
-                    if delta is not None:
-                        delta_content = getattr(delta, "content", None)
-                        if isinstance(delta_content, str):
-                            text_delta = delta_content
-                        elif isinstance(delta_content, list):
-                            parts: list[str] = []
-                            for part in delta_content:
-                                if isinstance(part, str):
-                                    parts.append(part)
-                                else:
-                                    part_text = getattr(part, "text", None)
-                                    if isinstance(part_text, str):
-                                        parts.append(part_text)
-                            if parts:
-                                text_delta = "".join(parts)
-                        if text_delta is None:
-                            delta_text = getattr(delta, "text", None)
-                            if isinstance(delta_text, str):
-                                text_delta = delta_text
+                text_delta: object = None
+                delta = getattr(chunk, "delta", None)
+                if delta is not None:
+                    delta_content = getattr(delta, "content", None)
+                    if isinstance(delta_content, str):
+                        text_delta = delta_content
+                    elif isinstance(delta_content, list):
+                        parts = []
+                        for part in delta_content:
+                            if isinstance(part, str):
+                                parts.append(part)
+                            else:
+                                part_text = getattr(part, "text", None)
+                                if isinstance(part_text, str):
+                                    parts.append(part_text)
+                        if parts:
+                            text_delta = "".join(parts)
                     if text_delta is None:
-                        chunk_text = getattr(chunk, "text", None)
-                        if isinstance(chunk_text, str):
-                            text_delta = chunk_text
-                    if text_delta is None:
-                        chunk_content = getattr(chunk, "content", None)
-                        if isinstance(chunk_content, str):
-                            text_delta = chunk_content
-                    if text_delta is None and isinstance(chunk, str):
-                        text_delta = chunk
-                    if isinstance(text_delta, str):
-                        if text_delta.strip() and _last_llm_first_token_at <= 0:
-                            _last_llm_first_token_at = time.monotonic()
-                        assistant_fragments.append(text_delta)
+                        delta_text = getattr(delta, "text", None)
+                        if isinstance(delta_text, str):
+                            text_delta = delta_text
+                if text_delta is None:
+                    chunk_text = getattr(chunk, "text", None)
+                    if isinstance(chunk_text, str):
+                        text_delta = chunk_text
+                if text_delta is None:
+                    chunk_content = getattr(chunk, "content", None)
+                    if isinstance(chunk_content, str):
+                        text_delta = chunk_content
+                if text_delta is None and isinstance(chunk, str):
+                    text_delta = chunk
+                if isinstance(text_delta, str):
+                    if text_delta.strip() and _last_llm_first_token_at is None:
+                        _last_llm_first_token_at = time.monotonic()
+                    assistant_fragments.append(text_delta)
                 yield chunk
+
             if PIPELINE_TEXT_DEBUG:
                 combined = "".join(assistant_fragments)
-                logger.info(
-                    "LLM output debug: chunk_count=%s text_length=%s preview=%s",
-                    chunk_count,
-                    len(combined),
-                    _redact_sensitive_text(combined)[:200],
-                )
-            _last_llm_complete_at = time.monotonic()
+                logger.info("LLM output debug: chunk_count=%s text_length=%s preview=%s", chunk_count, len(combined), _redact_sensitive_text(combined)[:200])
 
         return _llm_stream()
 
     async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
-        global _last_turn_committed_at, _last_llm_start_at, _last_llm_first_token_at, _last_llm_complete_at
+        global _last_turn_committed_at, _last_llm_start_at, _last_llm_first_token_at, _last_llm_complete_at, _last_llm_stream_status, _last_llm_timeout_stage, _last_llm_fallback_response_used
         _last_turn_committed_at = time.monotonic()
         _last_llm_start_at = 0.0
-        _last_llm_first_token_at = 0.0
+        _last_llm_first_token_at = None
         _last_llm_complete_at = 0.0
+        _last_llm_stream_status = "n/a"
+        _last_llm_timeout_stage = "n/a"
+        _last_llm_fallback_response_used = False
         if PIPELINE_TEXT_DEBUG:
             msg_str = _extract_text_for_debug(new_message)
             messages = getattr(turn_ctx, "messages", None)
