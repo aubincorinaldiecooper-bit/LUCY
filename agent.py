@@ -718,9 +718,9 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                     AI_COUSTICS_ENABLED,
                     os.getenv("AI_COUSTICS_MODEL", "QUAIL_L"),
                     os.getenv("AI_COUSTICS_LEVEL", "0.7"),
-                    os.getenv("LIVEKIT_ENDPOINTING_MODE", "fixed"),
-                    os.getenv("LIVEKIT_ENDPOINTING_MIN_DELAY", "0.4"),
-                    os.getenv("LIVEKIT_ENDPOINTING_MAX_DELAY", "1.5"),
+                    os.getenv("LIVEKIT_ENDPOINTING_MODE", "dynamic"),
+                    os.getenv("LIVEKIT_ENDPOINTING_MIN_DELAY", "0.7"),
+                    os.getenv("LIVEKIT_ENDPOINTING_MAX_DELAY", "3.0"),
                 )
 
     @session.on("close")
@@ -1674,9 +1674,9 @@ async def entrypoint(ctx: JobContext):
         "false_interruption_timeout": float(os.getenv("LIVEKIT_FALSE_INTERRUPTION_TIMEOUT", "1.8")),
     }
     logger.info("Resolved interruption config: %s", interruption_options)
-    endpointing_mode = os.getenv("LIVEKIT_ENDPOINTING_MODE", "fixed")
-    endpointing_min_delay = float(os.getenv("LIVEKIT_ENDPOINTING_MIN_DELAY", "0.4"))
-    endpointing_max_delay = float(os.getenv("LIVEKIT_ENDPOINTING_MAX_DELAY", "1.5"))
+    endpointing_mode = os.getenv("LIVEKIT_ENDPOINTING_MODE", "dynamic")
+    endpointing_min_delay = float(os.getenv("LIVEKIT_ENDPOINTING_MIN_DELAY", "0.7"))
+    endpointing_max_delay = float(os.getenv("LIVEKIT_ENDPOINTING_MAX_DELAY", "3.0"))
     logger.info(
         "Endpointing config: mode=%s min_delay=%s max_delay=%s",
         endpointing_mode,
