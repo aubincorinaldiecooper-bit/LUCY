@@ -262,6 +262,7 @@ def attach_session_diagnostics(session: AgentSession) -> None:
     payload_debug_logged = False
     speech_start_times: dict[str, float] = {}
     suppressed_speech_ids: set[str] = set()
+    stale_speech_ids: set[str] = set()
     overlap_suppress_window_seconds = float(os.getenv("ASSISTANT_OVERLAP_SUPPRESS_WINDOW_SECONDS", "4.0"))
     latest_user_state = "unknown"
     latest_user_state_timestamp = 0.0
@@ -339,23 +340,147 @@ def attach_session_diagnostics(session: AgentSession) -> None:
 
         return lowered.strip()
 
-    def _clear_active_handles(reason: str) -> None:
-        cleared_count = len(active_speech_handles)
-        if cleared_count or speech_start_times or suppressed_speech_ids:
+    def _invoke_cancel_method(target: object, method_name: str, speech_id: str, reason: str) -> tuple[bool, str]:
+        method = getattr(target, method_name, None)
+        if not callable(method):
+            return False, "missing"
+        try:
+            result = method()
+            if inspect.isawaitable(result):
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(result)
+                    return True, "scheduled_awaitable"
+                except RuntimeError:
+                    logger.warning(
+                        "Assistant speech cleanup awaitable could not be scheduled: speech_id=%s method=%s reason=%s",
+                        speech_id,
+                        method_name,
+                        reason,
+                    )
+                    close_awaitable = getattr(result, "close", None)
+                    if callable(close_awaitable):
+                        close_awaitable()
+                    return False, "awaitable_without_running_loop"
+            return True, "called"
+        except Exception as e:
             logger.warning(
-                "Clearing stale active speech handles: reason=%s cleared_count=%s suppressed_count=%s",
+                "Assistant speech cleanup method failed: speech_id=%s method=%s reason=%s error=%s",
+                speech_id,
+                method_name,
+                reason,
+                _redact_sensitive_text(e),
+            )
+            return False, "failed"
+
+    def _cleanup_active_assistant_speeches(reason: str, before_new_speech_id: str | None = None) -> None:
+        nonlocal pending_user_handoff_speech_id
+        global _latest_active_assistant_count_for_hume
+        active_count_before = len(active_speech_handles)
+        active_ids_before = list(active_speech_handles.keys())
+        logger.info(
+            "assistant_speech_cleanup_started cleanup_reason=%s before_new_speech_id=%s active_count_before=%s active_speech_ids=%s stale_speech_ids=%s",
+            reason,
+            before_new_speech_id or "none",
+            active_count_before,
+            active_ids_before,
+            sorted(stale_speech_ids),
+        )
+        if not active_speech_handles:
+            logger.info(
+                "Assistant speech cleanup finished: cleanup_reason=%s active_count_before=%s active_count_after=%s stale_speech_ids=%s new_speech_allowed=%s",
+                reason,
+                active_count_before,
+                0,
+                sorted(stale_speech_ids),
+                True,
+            )
+            return
+
+        for speech_id, handle in list(active_speech_handles.items()):
+            if before_new_speech_id is not None and speech_id == before_new_speech_id:
+                continue
+
+            attempted_method = "none"
+            cleanup_result = "not_attempted"
+            method_targets: list[tuple[str, object]] = [("", handle)]
+            nested_handle = getattr(handle, "speech_handle", None)
+            if nested_handle is not None and nested_handle is not handle:
+                method_targets.append(("speech_handle.", nested_handle))
+
+            for prefix, target in method_targets:
+                for method_name in ("interrupt", "cancel", "stop", "close"):
+                    attempted_method = f"{prefix}{method_name}"
+                    ok, result = _invoke_cancel_method(target, method_name, speech_id, reason)
+                    if ok:
+                        cleanup_result = f"cancel_requested:{attempted_method}:{result}"
+                        break
+                    if result != "missing":
+                        cleanup_result = f"cancel_failed:{attempted_method}:{result}"
+                if cleanup_result.startswith("cancel_requested"):
+                    break
+
+            if not cleanup_result.startswith("cancel_requested"):
+                logger.warning(
+                    "Assistant speech cleanup: no safe cancel method speech_id=%s cleanup_reason=%s attempted_method=%s",
+                    speech_id,
+                    reason,
+                    attempted_method,
+                )
+                cleanup_result = "marked_stale_no_safe_cancel_method"
+
+            stale_speech_ids.add(speech_id)
+            suppressed_speech_ids.add(speech_id)
+            active_speech_handles.pop(speech_id, None)
+            speech_start_times.pop(speech_id, None)
+            hume_request_count_at_speech_finish.setdefault(speech_id, _hume_tts_request_counter)
+            assistant_speech_finished_at.setdefault(speech_id, time.monotonic())
+            if pending_user_handoff_speech_id == speech_id:
+                pending_user_handoff_speech_id = None
+            logger.info(
+                "Assistant speech cleanup item: cleanup_reason=%s speech_id=%s attempted_method=%s cleanup_result=%s active_count_after_item=%s stale_speech_ids=%s",
+                reason,
+                speech_id,
+                attempted_method,
+                cleanup_result,
+                len(active_speech_handles),
+                sorted(stale_speech_ids),
+            )
+
+        _latest_active_assistant_count_for_hume = len(active_speech_handles)
+        new_speech_allowed = len(active_speech_handles) == 0
+        logger.info(
+            "Assistant speech cleanup finished: cleanup_reason=%s before_new_speech_id=%s active_count_before=%s active_count_after=%s stale_speech_ids=%s new_speech_allowed=%s",
+            reason,
+            before_new_speech_id or "none",
+            active_count_before,
+            len(active_speech_handles),
+            sorted(stale_speech_ids),
+            new_speech_allowed,
+        )
+
+    def _clear_active_handles(reason: str) -> None:
+        global _latest_active_assistant_count_for_hume
+        cleared_count = len(active_speech_handles)
+        if cleared_count or speech_start_times or suppressed_speech_ids or stale_speech_ids:
+            logger.warning(
+                "Clearing stale active speech handles: reason=%s cleared_count=%s suppressed_count=%s stale_count=%s",
                 reason,
                 cleared_count,
                 len(suppressed_speech_ids),
+                len(stale_speech_ids),
             )
+        stale_speech_ids.update(active_speech_handles.keys())
         active_speech_handles.clear()
         speech_start_times.clear()
         suppressed_speech_ids.clear()
+        _latest_active_assistant_count_for_hume = 0
 
 
     @session.on("speech_created")
     def _on_speech_created(event_or_handle: object) -> None:
         nonlocal payload_debug_logged
+        global _latest_current_speech_id_for_hume, _latest_active_assistant_count_for_hume
 
         if not payload_debug_logged:
             payload_debug_logged = True
@@ -366,13 +491,17 @@ def attach_session_diagnostics(session: AgentSession) -> None:
         resolved_handle = _resolve_speech_handle(event_or_handle)
         speech_id = _speech_id(resolved_handle)
         now = time.monotonic()
-        speech_start_times[speech_id] = now
         speech_created_at[speech_id] = now
-        assistant_speech_started_at[speech_id] = now
 
-        suppressed = False
-        suppression_attempted = False
-        suppression_result = "not_needed"
+        if speech_id in stale_speech_ids:
+            logger.warning(
+                "Assistant speech recreated with stale id; clearing stale marker before registration: speech_id=%s stale_speech_ids=%s",
+                speech_id,
+                sorted(stale_speech_ids),
+            )
+            stale_speech_ids.discard(speech_id)
+            suppressed_speech_ids.discard(speech_id)
+
         if active_speech_handles:
             active_ids_before_new = list(active_speech_handles.keys())
             current_speech = getattr(session, "current_speech", None)
@@ -383,8 +512,8 @@ def attach_session_diagnostics(session: AgentSession) -> None:
             agent_state_age = (now_for_diag - latest_agent_state_timestamp) if latest_agent_state_timestamp else -1.0
             latest_user_state_normalized = str(latest_user_state).strip().lower()
             latest_agent_state_normalized = str(latest_agent_state).strip().lower()
-            logger.info(
-                "Assistant overlap diagnostic: new_speech_id=%s active_speech_ids_before_new=%s session_current_speech_id=%s session_current_speech_type=%s latest_user_state=%s latest_agent_state=%s seconds_since_user_state_change=%.3f seconds_since_agent_state_change=%.3f user_state_is_speaking=%s agent_state_is_thinking=%s agent_state_is_speaking=%s agent_state_is_listening=%s",
+            logger.warning(
+                "Assistant overlap detected before new speech: new_speech_id=%s active_speech_ids_before_new=%s session_current_speech_id=%s session_current_speech_type=%s latest_user_state=%s latest_agent_state=%s seconds_since_user_state_change=%.3f seconds_since_agent_state_change=%.3f user_state_is_speaking=%s agent_state_is_thinking=%s agent_state_is_speaking=%s agent_state_is_listening=%s",
                 speech_id,
                 active_ids_before_new,
                 current_speech_id,
@@ -398,109 +527,64 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                 latest_agent_state_normalized == "speaking",
                 latest_agent_state_normalized == "listening",
             )
-            previous_id = None
-            previous_started_at = None
-            for active_id in active_speech_handles.keys():
-                if active_id == speech_id:
-                    continue
-                started_at = speech_start_times.get(active_id)
-                if started_at is None:
-                    continue
-                if previous_started_at is None or started_at > previous_started_at:
-                    previous_started_at = started_at
-                    previous_id = active_id
-
-            if previous_id is not None and previous_started_at is not None:
-                age_seconds = now - previous_started_at
-                if age_seconds <= overlap_suppress_window_seconds:
-                    method_used = None
-                    suppression_attempted = True
-                    for method_name in ("cancel", "stop", "close"):
-                        method = getattr(resolved_handle, method_name, None)
-                        if callable(method):
-                            try:
-                                method()
-                                method_used = method_name
-                                break
-                            except Exception as e:
-                                logger.warning(
-                                    "Duplicate speech suppression method failed: speech_id=%s method=%s err=%s",
-                                    speech_id,
-                                    method_name,
-                                    e,
-                                )
-
-                    if method_used is not None:
-                        suppressed = True
-                        suppression_result = f"suppressed:{method_used}"
-                        suppressed_speech_ids.add(speech_id)
-                        logger.warning(
-                            "Suppressing duplicate assistant speech overlap: kept_speech_id=%s suppressed_speech_id=%s active_count=%s method=%s",
-                            previous_id,
-                            speech_id,
-                            len(active_speech_handles),
-                            method_used,
-                        )
-                    else:
-                        logger.warning(
-                            "Possible assistant speech overlap not safely suppressed: previous_speech_id=%s new_speech_id=%s reason=%s active_count=%s",
-                            previous_id,
-                            speech_id,
-                            "no_safe_suppression_method",
-                            len(active_speech_handles),
-                        )
-                        suppression_result = "not_safely_suppressed:no_safe_suppression_method"
-                else:
-                    logger.warning(
-                        "Possible assistant speech overlap not safely suppressed: previous_speech_id=%s new_speech_id=%s reason=%s active_count=%s",
-                        previous_id,
-                        speech_id,
-                        "previous_speech_outside_suppress_window",
-                        len(active_speech_handles),
-                    )
-                    suppression_result = "not_suppressed:previous_speech_outside_suppress_window"
-            else:
-                logger.warning(
-                    "Possible assistant speech overlap not safely suppressed: previous_speech_id=%s new_speech_id=%s reason=%s active_count=%s",
-                    "unknown",
-                    speech_id,
-                    "missing_previous_speech_start_time",
-                    len(active_speech_handles),
-                    )
+            _cleanup_active_assistant_speeches("before_new_assistant_speech", before_new_speech_id=speech_id)
 
         if active_speech_handles:
-            logger.info(
-                "Assistant overlap suppression outcome: new_speech_id=%s suppression_attempted=%s result=%s",
+            logger.error(
+                "Assistant speech active_count would exceed invariant before new speech; forcing stale cleanup: new_speech_id=%s active_speech_ids=%s",
                 speech_id,
-                suppression_attempted,
-                suppression_result,
+                list(active_speech_handles.keys()),
             )
+            stale_speech_ids.update(active_speech_handles.keys())
+            active_speech_handles.clear()
+            speech_start_times.clear()
+            _latest_active_assistant_count_for_hume = 0
 
-        if not suppressed:
+        active_speech_handles[speech_id] = resolved_handle
+        speech_start_times[speech_id] = now
+        assistant_speech_started_at[speech_id] = now
+        hume_request_count_at_speech_start[speech_id] = _hume_tts_request_counter
+        _latest_current_speech_id_for_hume = speech_id
+        _latest_active_assistant_count_for_hume = len(active_speech_handles)
+        if len(active_speech_handles) > 1:
+            logger.error(
+                "Assistant speech active_count invariant violated after registration: new_speech_id=%s active_count=%s active_speech_ids=%s",
+                speech_id,
+                len(active_speech_handles),
+                list(active_speech_handles.keys()),
+            )
+            _cleanup_active_assistant_speeches("post_registration_active_count_gt_one", before_new_speech_id=speech_id)
             active_speech_handles[speech_id] = resolved_handle
+            speech_start_times[speech_id] = now
+            assistant_speech_started_at[speech_id] = now
             hume_request_count_at_speech_start[speech_id] = _hume_tts_request_counter
             _latest_current_speech_id_for_hume = speech_id
             _latest_active_assistant_count_for_hume = len(active_speech_handles)
-            logger.info("Assistant speech started: speech_id=%s active_count=%s", speech_id, len(active_speech_handles))
-            logger.info(
-                "Assistant speech Hume request baseline: speech_id=%s hume_request_count_at_start=%s active_count=%s",
-                speech_id,
-                hume_request_count_at_speech_start[speech_id],
-                len(active_speech_handles),
-            )
+
+        logger.info("Assistant speech started: speech_id=%s active_count=%s", speech_id, len(active_speech_handles))
+        logger.info(
+            "Assistant speech Hume request baseline: speech_id=%s hume_request_count_at_start=%s active_count=%s",
+            speech_id,
+            hume_request_count_at_speech_start[speech_id],
+            len(active_speech_handles),
+        )
 
         add_done_callback = getattr(resolved_handle, "add_done_callback", None)
         if callable(add_done_callback):
             def _on_done(done_event_or_handle: object) -> None:
                 nonlocal pending_user_handoff_speech_id
+                global _latest_active_assistant_count_for_hume
                 done_resolved_handle = _resolve_speech_handle(done_event_or_handle)
                 done_id = _speech_id(done_resolved_handle)
+                was_active = done_id in active_speech_handles
+                was_stale = done_id in stale_speech_ids
                 active_speech_handles.pop(done_id, None)
                 _latest_active_assistant_count_for_hume = len(active_speech_handles)
                 finished_at = time.monotonic()
                 started_at = speech_start_times.pop(done_id, None)
                 was_suppressed = done_id in suppressed_speech_ids
                 suppressed_speech_ids.discard(done_id)
+                stale_speech_ids.discard(done_id)
                 interrupted = _safe_attr(done_resolved_handle, "interrupted", "unknown")
                 speaking_at = agent_speaking_at.get(done_id)
                 listening_at = agent_listening_at.get(done_id)
@@ -511,8 +595,28 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                 )
                 assistant_speech_finished_at[done_id] = finished_at
                 hume_request_count_at_speech_finish[done_id] = _hume_tts_request_counter
-                pending_user_handoff_speech_id = done_id
-                logger.info("Assistant speech finished: speech_id=%s interrupted=%s active_count=%s was_suppressed=%s", done_id, interrupted, len(active_speech_handles), was_suppressed)
+                if was_active and not was_stale:
+                    pending_user_handoff_speech_id = done_id
+                logger.info(
+                    "Assistant speech finished: speech_id=%s interrupted=%s active_count=%s was_suppressed=%s was_stale=%s was_active=%s",
+                    done_id,
+                    interrupted,
+                    len(active_speech_handles),
+                    was_suppressed,
+                    was_stale,
+                    was_active,
+                )
+                interrupted_normalized = str(interrupted).strip().lower()
+                if was_active and active_speech_handles:
+                    logger.error(
+                        "Assistant speech active_count invariant violation after finish: finished_speech_id=%s active_count=%s active_speech_ids=%s",
+                        done_id,
+                        len(active_speech_handles),
+                        list(active_speech_handles.keys()),
+                    )
+                    _cleanup_active_assistant_speeches("assistant_speech_finished_with_other_active")
+                elif was_active and interrupted_normalized in {"true", "1", "yes"} and active_speech_handles:
+                    _cleanup_active_assistant_speeches("assistant_speech_interrupted")
                 start_count = hume_request_count_at_speech_start.get(done_id, -1)
                 finish_count = hume_request_count_at_speech_finish.get(done_id, -1)
                 during_count = finish_count - start_count if start_count >= 0 and finish_count >= 0 else -1
@@ -623,6 +727,8 @@ def attach_session_diagnostics(session: AgentSession) -> None:
         latest_user_state_timestamp = time.monotonic()
         if latest_user_state == "speaking":
             last_user_speaking_at = latest_user_state_timestamp
+            if active_speech_handles:
+                _cleanup_active_assistant_speeches("user_state_speaking")
         if latest_user_state == "listening":
             last_user_listening_at = latest_user_state_timestamp
         logger.info("User state changed: state=%s assistant_active_count=%s", state, len(active_speech_handles))
@@ -649,6 +755,10 @@ def attach_session_diagnostics(session: AgentSession) -> None:
         target = event_item if event_item is not None else item
         role = _safe_attr(target, "role")
         interrupted = _safe_attr(target, "interrupted")
+        if str(role).strip().lower() == "user" and active_speech_handles:
+            _cleanup_active_assistant_speeches("user_turn_committed")
+        if str(interrupted).strip().lower() in {"true", "1", "yes"} and active_speech_handles:
+            _cleanup_active_assistant_speeches("conversation_item_interrupted")
         if PIPELINE_TEXT_DEBUG:
             text_str = _extract_text_for_debug(target)
             logger.info(
