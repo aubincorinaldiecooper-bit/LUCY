@@ -26,6 +26,8 @@ from tavily import TavilyClient
 load_dotenv()
 logger = logging.getLogger(__name__)
 
+OPENROUTER_DEFAULT_MODEL = "openai/gpt-4o-mini"
+
 DEFAULT_SYSTEM_PROMPT = """You are Crash.
 
 You are a calm, casual, voice-first companion for the Crash Out program.
@@ -106,6 +108,12 @@ _last_llm_stream_status = "n/a"
 _last_llm_timeout_stage = "n/a"
 _last_llm_fallback_response_used = False
 _pending_llm_fallback_text: str | None = None
+_last_llm_completed_text = ""
+_last_llm_completed_text_hash = "empty"
+_last_llm_completed_at = 0.0
+_last_tts_node_entered_at = 0.0
+_last_tts_received_text_hash = "empty"
+_last_hume_request_start_at = 0.0
 
 
 def _next_local_speech_id() -> str:
@@ -126,6 +134,10 @@ def _fmt_seconds(seconds: float | None) -> str:
     if seconds is None or seconds < 0:
         return "n/a"
     return f"{seconds:.1f}s"
+
+
+def _text_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12] if text else "empty"
 
 
 def _redact_sensitive_text(value: object) -> str:
@@ -557,7 +569,7 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                     _last_tts_text_length,
                     _last_tts_sentence_end_count,
                     hume_requests_during,
-                    os.getenv("OPENROUTER_MODEL", "openai/gpt-4o"),
+                    os.getenv("OPENROUTER_MODEL", OPENROUTER_DEFAULT_MODEL),
                     _last_tts_path or "n/a",
                     _last_hume_model_version,
                     _last_hume_description_applied,
@@ -689,7 +701,7 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                 "LLM error diagnostic: details=%s openrouter_api_key_present=%s openrouter_model=%s",
                 _safe_llm_error_details(error),
                 bool(os.getenv("OPENROUTER_API_KEY", "").strip()),
-                os.getenv("OPENROUTER_MODEL", "openai/gpt-4o"),
+                os.getenv("OPENROUTER_MODEL", OPENROUTER_DEFAULT_MODEL),
             )
         if "tts" in searchable_safe_text:
             _clear_active_handles("tts_error")
@@ -758,7 +770,20 @@ LIVEKIT_TTS_SOURCE_INSPECTION = env_bool("LIVEKIT_TTS_SOURCE_INSPECTION", False)
 HUME_DIRECT_API_TTS = env_bool("HUME_DIRECT_API_TTS", False)
 RUN_DB_MIGRATIONS_ON_STARTUP = env_bool("RUN_DB_MIGRATIONS_ON_STARTUP", False)
 GREETING_AUDIO_PATH = (os.getenv("GREETING_AUDIO_PATH") or "").strip()
-LLM_STREAM_TIMEOUT_SECONDS = env_int_clamped("LLM_STREAM_TIMEOUT_SECONDS", 12, 3, 120)
+LLM_FIRST_TOKEN_TIMEOUT_SECONDS = env_int_clamped("LLM_FIRST_TOKEN_TIMEOUT_SECONDS", 8, 1, 120)
+LLM_TOTAL_TIMEOUT_SECONDS = env_int_clamped("LLM_TOTAL_TIMEOUT_SECONDS", 20, 2, 300)
+if LLM_TOTAL_TIMEOUT_SECONDS < LLM_FIRST_TOKEN_TIMEOUT_SECONDS:
+    logger.warning(
+        "LLM_TOTAL_TIMEOUT_SECONDS=%s is below LLM_FIRST_TOKEN_TIMEOUT_SECONDS=%s; raising total timeout to first-token timeout",
+        LLM_TOTAL_TIMEOUT_SECONDS,
+        LLM_FIRST_TOKEN_TIMEOUT_SECONDS,
+    )
+    LLM_TOTAL_TIMEOUT_SECONDS = LLM_FIRST_TOKEN_TIMEOUT_SECONDS
+LLM_FALLBACK_RESPONSE = os.getenv(
+    "LLM_FALLBACK_RESPONSE",
+    "Sorry, I blanked for a second. Say that again?",
+).strip() or "Sorry, I blanked for a second. Say that again?"
+LLM_TO_TTS_HANDOFF_GUARD_ENABLED = env_bool("LLM_TO_TTS_HANDOFF_GUARD_ENABLED", False)
 
 
 def _pcm16_to_audio_frames(pcm_data: bytes, sample_rate: int, channels: int) -> list[rtc.AudioFrame]:
@@ -1198,47 +1223,116 @@ class LucyAgent(Agent):
         return normalized
 
     def tts_node(self, text: AsyncIterable[str], model_settings):
-        global _latest_normalized_text_hash, _last_tts_request_start_at, _last_tts_first_audio_at, _last_tts_text_length, _last_tts_sentence_end_count, _last_tts_path, _pending_llm_fallback_text
+        global _latest_normalized_text_hash, _last_tts_request_start_at, _last_tts_first_audio_at, _last_tts_text_length, _last_tts_sentence_end_count, _last_tts_path, _last_tts_node_entered_at, _last_tts_received_text_hash, _last_hume_request_start_at
+        _last_tts_node_entered_at = time.monotonic()
+        logger.info(
+            "TTS node entered: TTS_PROVIDER=%s SPOKEN_TEXT_NORMALIZATION=%s handoff_guard_enabled=%s llm_stream_status=%s",
+            TTS_PROVIDER,
+            SPOKEN_TEXT_NORMALIZATION,
+            LLM_TO_TTS_HANDOFF_GUARD_ENABLED,
+            _last_llm_stream_status,
+        )
+
         if not SPOKEN_TEXT_NORMALIZATION:
             logger.info("Spoken text normalization enabled=false")
-            if not TTS_TEXT_DEBUG:
-                return Agent.default.tts_node(self, text, model_settings)
 
-            async def _passthrough_debug_stream() -> AsyncIterable[str]:
+            async def _logging_passthrough_stream() -> AsyncIterable[str]:
+                global _last_tts_received_text_hash, _last_tts_text_length, _last_tts_sentence_end_count
                 chunks: list[str] = []
                 count = 0
-                async for chunk in text:
-                    count += 1
-                    chunks.append(chunk)
-                    yield chunk
-                raw_text = "".join(chunks)
-                preview = _redact_sensitive_text(raw_text)[:200]
-                logger.info(
-                    "TTS text debug: raw_chunk_count=%s raw_total_length=%s raw_preview=%s final_preview=%s",
-                    count,
-                    len(raw_text),
-                    preview,
-                    preview,
-                )
+                try:
+                    async for chunk in text:
+                        count += 1
+                        if isinstance(chunk, str):
+                            chunks.append(chunk)
+                        yield chunk
+                finally:
+                    raw_text = "".join(chunks)
+                    _last_tts_received_text_hash = _text_hash(raw_text)
+                    _last_tts_text_length = len(raw_text)
+                    _last_tts_sentence_end_count = sum(raw_text.count(mark) for mark in (".", "?", "!", "…"))
+                    logger.info(
+                        "TTS node received text chunk count: raw_chunk_count=%s raw_total_length=%s text_hash=%s handoff_guard_enabled=%s",
+                        count,
+                        len(raw_text),
+                        _last_tts_received_text_hash,
+                        LLM_TO_TTS_HANDOFF_GUARD_ENABLED,
+                    )
+                    if not raw_text.strip():
+                        logger.warning(
+                            "TTS node completed with empty text stream: llm_stream_status=%s fallback_used=%s",
+                            _last_llm_stream_status,
+                            _last_llm_fallback_response_used,
+                        )
+                    if TTS_TEXT_DEBUG:
+                        preview = _redact_sensitive_text(raw_text)[:200]
+                        logger.info(
+                            "TTS text debug: raw_chunk_count=%s raw_total_length=%s raw_preview=%s final_preview=%s",
+                            count,
+                            len(raw_text),
+                            preview,
+                            preview,
+                        )
 
-            return Agent.default.tts_node(self, _passthrough_debug_stream(), model_settings)
+            async def _default_tts_with_hume_logs() -> AsyncIterable[Any]:
+                global _last_hume_request_start_at, _last_tts_path, _last_tts_first_audio_at, _last_tts_request_start_at
+                start = time.monotonic()
+                _last_tts_request_start_at = start
+                _last_tts_first_audio_at = None
+                _last_tts_path = None
+                frame_count = 0
+                if TTS_PROVIDER == "hume":
+                    _last_hume_request_start_at = start
+                    logger.info("Hume TTS HTTP request starting: path=default_agent_tts_node_fallback normalization=false")
+                try:
+                    async for out in Agent.default.tts_node(self, _logging_passthrough_stream(), model_settings):
+                        if _last_tts_first_audio_at is None:
+                            _last_tts_first_audio_at = time.monotonic()
+                        if _last_tts_path is None:
+                            _last_tts_path = "default_agent_tts_node_fallback"
+                        frame_count += 1
+                        yield out
+                    if TTS_PROVIDER == "hume":
+                        logger.info(
+                            "Hume TTS HTTP request completed: path=default_agent_tts_node_fallback frame_count_yielded=%s time_to_first_audio_seconds=%s total_tts_seconds=%.3f",
+                            frame_count,
+                            _fmt_seconds((_last_tts_first_audio_at - start) if _last_tts_first_audio_at is not None else None),
+                            time.monotonic() - start,
+                        )
+                except Exception as e:
+                    if TTS_PROVIDER == "hume":
+                        logger.error(
+                            "Hume TTS HTTP request error: path=default_agent_tts_node_fallback error_type=%s error=%s frame_count_yielded=%s total_tts_seconds=%.3f",
+                            type(e).__name__,
+                            _redact_sensitive_text(e),
+                            frame_count,
+                            time.monotonic() - start,
+                        )
+                    raise
+
+            return _default_tts_with_hume_logs()
 
         logger.info("Spoken text normalization enabled=true mode=buffered_full_segment")
 
         async def _direct_or_plugin_or_default() -> AsyncIterable[Any]:
-            global _latest_normalized_text_hash, _last_tts_first_audio_at, _last_tts_path
+            global _latest_normalized_text_hash, _last_tts_request_start_at, _last_tts_first_audio_at, _last_tts_text_length, _last_tts_sentence_end_count, _last_tts_path, _last_hume_request_start_at, _last_tts_received_text_hash
             chunks: list[str] = []
             chunk_count = 0
             async for chunk in text:
                 chunk_count += 1
-                chunks.append(chunk)
+                chunks.append(chunk if isinstance(chunk, str) else str(chunk))
             raw_text = "".join(chunks)
+            _last_tts_received_text_hash = _text_hash(raw_text)
+            logger.info(
+                "TTS node received text chunk count: raw_chunk_count=%s raw_total_length=%s text_hash=%s handoff_guard_enabled=%s",
+                chunk_count,
+                len(raw_text),
+                _last_tts_received_text_hash,
+                LLM_TO_TTS_HANDOFF_GUARD_ENABLED,
+            )
             sanitized = _sanitize_spoken_laughter(raw_text)
             normalized_text = self._normalize_spoken_text(sanitized)
-            if (not normalized_text.strip()) and _pending_llm_fallback_text:
-                normalized_text = _pending_llm_fallback_text
-                _pending_llm_fallback_text = None
-            normalized_hash = hashlib.sha256(normalized_text.encode("utf-8")).hexdigest()[:12] if normalized_text else "empty"
+            normalized_hash = _text_hash(normalized_text)
             _latest_normalized_text_hash = normalized_hash
             _normalized_text_hash_ctx.set(normalized_hash)
             sentence_end_count = sum(normalized_text.count(mark) for mark in (".", "?", "!", "…"))
@@ -1250,9 +1344,16 @@ class LucyAgent(Agent):
             _last_tts_path = None
             logger.info(
                 "TTS normalized yield diagnostics: tts_normalized_yield_count=%s raw_chunk_count=%s raw_total_length=%s normalized_text_length=%s normalized_text_preview=%s normalized_text_hash=%s sentence_end_count=%s newline_count=%s SPOKEN_TEXT_NORMALIZATION=%s TTS_PROVIDER=%s HUME_INSTANT_MODE=%s HUME_SPEED=%s HUME_TRAILING_SILENCE=%s",
-                1, chunk_count, len(raw_text), len(normalized_text), _redact_sensitive_text(normalized_text)[:200], normalized_hash,
+                1 if normalized_text else 0, chunk_count, len(raw_text), len(normalized_text), _redact_sensitive_text(normalized_text)[:200], normalized_hash,
                 sentence_end_count, newline_count, SPOKEN_TEXT_NORMALIZATION, TTS_PROVIDER, env_bool("HUME_INSTANT_MODE", True), os.getenv("HUME_SPEED", "0.9"), os.getenv("HUME_TRAILING_SILENCE", "0.25"),
             )
+            if not normalized_text.strip():
+                logger.warning(
+                    "TTS normalized text empty: raw_chunk_count=%s llm_stream_status=%s fallback_used=%s",
+                    chunk_count,
+                    _last_llm_stream_status,
+                    _last_llm_fallback_response_used,
+                )
             if TTS_TEXT_DEBUG:
                 logger.info("TTS text debug: raw_chunk_count=%s raw_total_length=%s raw_preview=%s final_preview=%s", chunk_count, len(raw_text), _redact_sensitive_text(raw_text)[:200], _redact_sensitive_text(normalized_text)[:200])
 
@@ -1272,6 +1373,7 @@ class LucyAgent(Agent):
                 synthesize_fn = getattr(activity_tts, "synthesize", None)
                 if callable(synthesize_fn) and normalized_text:
                     start = time.monotonic()
+                    _last_hume_request_start_at = start
                     yielded = 0
                     first_audio = None
                     try:
@@ -1282,6 +1384,7 @@ class LucyAgent(Agent):
                             chunked_stream = synthesize_fn(normalized_text, conn_options=tts_conn_options)
                         else:
                             chunked_stream = synthesize_fn(normalized_text)
+                        logger.info("Hume TTS HTTP request starting: path=livekit_hume_plugin_synthesize_full_text text_hash=%s text_length=%s", normalized_hash, len(normalized_text))
                         logger.info("Hume full-utterance mode: full_utterance_requested=%s full_utterance_supported=%s full_utterance_used=%s path=%s fallback_reason=%s", True, True, True, "livekit_hume_plugin_synthesize_full_text", "none")
                         _last_tts_path = "livekit_hume_plugin_synthesize_full_text"
                         async for event in chunked_stream:
@@ -1293,9 +1396,11 @@ class LucyAgent(Agent):
                                 _last_tts_first_audio_at = first_audio
                             yielded += 1
                             yield frame
+                        logger.info("Hume TTS HTTP request completed: path=livekit_hume_plugin_synthesize_full_text frame_count_yielded=%s time_to_first_audio_seconds=%.3f total_tts_seconds=%.3f", yielded, (first_audio-start) if first_audio else -1.0, time.monotonic()-start)
                         logger.info("Hume full-utterance plugin result: hume_full_utterance_plugin_requested=%s hume_full_utterance_plugin_used=%s hume_full_utterance_plugin_fallback_reason=%s path=%s normalized_text_hash=%s text_length=%s sentence_end_count=%s frame_count_yielded=%s time_to_first_audio_seconds=%.3f total_tts_seconds=%.3f", True, True, "none", "livekit_hume_plugin_synthesize_full_text", normalized_hash, len(normalized_text), sentence_end_count, yielded, (first_audio-start) if first_audio else -1.0, time.monotonic()-start)
                         return
                     except Exception as e:
+                        logger.error("Hume TTS HTTP request error: path=livekit_hume_plugin_synthesize_full_text error_type=%s error=%s frame_count_yielded=%s total_tts_seconds=%.3f", type(e).__name__, _redact_sensitive_text(e), yielded, time.monotonic()-start)
                         if yielded > 0:
                             logger.warning("Hume full-utterance plugin partial failure: hume_full_utterance_plugin_requested=%s hume_full_utterance_plugin_used=%s hume_full_utterance_plugin_fallback_reason=%s frame_count_yielded=%s", True, True, _redact_sensitive_text(e), yielded)
                             return
@@ -1306,13 +1411,34 @@ class LucyAgent(Agent):
                 logger.info("Hume full-utterance mode: full_utterance_requested=%s full_utterance_supported=%s full_utterance_used=%s path=%s fallback_reason=%s", False, False, False, "default_agent_tts_node_fallback", "not_requested")
 
             try:
+                hume_start = time.monotonic()
+                frame_count = 0
+                if TTS_PROVIDER == "hume":
+                    _last_hume_request_start_at = hume_start
+                    logger.info("Hume TTS HTTP request starting: path=default_agent_tts_node_fallback text_hash=%s text_length=%s", normalized_hash, len(normalized_text))
                 async for out in Agent.default.tts_node(self, _single_text_stream(), model_settings):
                     if _last_tts_first_audio_at is None:
                         _last_tts_first_audio_at = time.monotonic()
                     if _last_tts_path is None:
                         _last_tts_path = "default_agent_tts_node_fallback"
+                    frame_count += 1
                     yield out
+                if TTS_PROVIDER == "hume":
+                    logger.info(
+                        "Hume TTS HTTP request completed: path=default_agent_tts_node_fallback frame_count_yielded=%s time_to_first_audio_seconds=%s total_tts_seconds=%.3f",
+                        frame_count,
+                        _fmt_seconds((_last_tts_first_audio_at - hume_start) if _last_tts_first_audio_at is not None else None),
+                        time.monotonic() - hume_start,
+                    )
             except Exception as e:
+                if TTS_PROVIDER == "hume":
+                    logger.error(
+                        "Hume TTS HTTP request error: path=default_agent_tts_node_fallback error_type=%s error=%s tts_path=%s total_tts_seconds=%.3f",
+                        type(e).__name__,
+                        _redact_sensitive_text(e),
+                        _last_tts_path or "n/a",
+                        time.monotonic() - _last_hume_request_start_at if _last_hume_request_start_at else -1.0,
+                    )
                 logger.error(
                     "tts_stream_status=error error_type=%s error=%s tts_path=%s",
                     type(e).__name__,
@@ -1324,10 +1450,6 @@ class LucyAgent(Agent):
         if TTS_PROVIDER == "hume" and SPOKEN_TEXT_NORMALIZATION and HUME_DIRECT_API_TTS:
             async def _direct_hume_or_fallback_stream() -> AsyncIterable[rtc.AudioFrame]:
                 global _direct_hume_request_counter
-                # preserve text by reading from the buffered/default helper only once on fallback.
-                # direct path independently reconstructs buffered text from original stream is not possible here,
-                # so use helper fallback unless direct request can be made from preserved normalized hash/text logs.
-                # We attempt direct only when required config is present and then fallback to preserved single-text path.
                 hume_api_key = os.getenv("HUME_API_KEY", "").strip()
                 hume_voice_id = os.getenv("HUME_VOICE_ID", "").strip()
                 if not hume_api_key or not hume_voice_id:
@@ -1336,20 +1458,14 @@ class LucyAgent(Agent):
                         yield out
                     return
 
-                # Direct API disabled for empty text by checking the fallback stream diagnostics path.
-                # Use fallback helper for robust behavior if any direct error occurs before frames.
                 _direct_hume_request_counter += 1
                 request_index = _direct_hume_request_counter
                 endpoint_path = "/v0/tts/stream/file"
-                endpoint_url = f"https://api.hume.ai{endpoint_path}"
                 yielded_count = 0
                 start = time.monotonic()
                 first_audio_at = None
-                # Rebuild text from fallback helper by intercepting first normalized text through default path isn't feasible here;
-                # rely on direct path only when FULL_UTTERANCE requested via plugin path.
                 logger.info("Direct Hume TTS attempt: hume_direct_api_tts_requested=%s direct_hume_request_index=%s endpoint_used=%s", True, request_index, endpoint_path)
                 try:
-                    # No safe preserved-text object here; use fallback helper to avoid silence and duplication risk.
                     raise RuntimeError("direct_path_requires_preserved_normalized_text_buffer")
                 except Exception as e:
                     if yielded_count > 0:
@@ -1375,49 +1491,36 @@ class LucyAgent(Agent):
         return _direct_or_plugin_or_default()
 
     def llm_node(self, chat_ctx, tools, model_settings):
-        global _last_llm_start_at, _last_llm_first_token_at, _last_llm_complete_at, _last_llm_stream_status, _last_llm_timeout_stage, _last_llm_fallback_response_used, _pending_llm_fallback_text
         stream = Agent.default.llm_node(self, chat_ctx, tools, model_settings)
 
         async def _llm_stream():
+            global _last_llm_start_at, _last_llm_first_token_at, _last_llm_complete_at, _last_llm_stream_status, _last_llm_timeout_stage, _last_llm_fallback_response_used, _pending_llm_fallback_text, _last_llm_completed_text, _last_llm_completed_text_hash, _last_llm_completed_at
             assistant_fragments: list[str] = []
             chunk_count = 0
-            _last_llm_stream_status = "ok"
+            model_name = os.getenv("OPENROUTER_MODEL", OPENROUTER_DEFAULT_MODEL)
+            _last_llm_stream_status = "started"
             _last_llm_timeout_stage = "none"
             _last_llm_fallback_response_used = False
+            _pending_llm_fallback_text = None
             _last_llm_start_at = time.monotonic()
             _last_llm_first_token_at = None
+            _last_llm_complete_at = 0.0
+            _last_llm_completed_text = ""
+            _last_llm_completed_text_hash = "empty"
+            _last_llm_completed_at = 0.0
             start = _last_llm_start_at
+            first_token_deadline = start + LLM_FIRST_TOKEN_TIMEOUT_SECONDS
+            total_deadline = start + LLM_TOTAL_TIMEOUT_SECONDS
             it = stream.__aiter__()
-            while True:
-                try:
-                    chunk = await asyncio.wait_for(it.__anext__(), timeout=LLM_STREAM_TIMEOUT_SECONDS)
-                except StopAsyncIteration:
-                    _last_llm_complete_at = time.monotonic()
-                    break
-                except asyncio.TimeoutError:
-                    elapsed = time.monotonic() - start
-                    stage = "first_token" if _last_llm_first_token_at is None else "completion"
-                    _last_llm_stream_status = "timeout"
-                    _last_llm_timeout_stage = stage
-                    logger.error("llm_stream_status=timeout llm_timeout_stage=%s elapsed_seconds=%s openrouter_model=%s", stage, _fmt_seconds(elapsed), os.getenv("OPENROUTER_MODEL", "openai/gpt-4o"))
-                    if not assistant_fragments:
-                        _pending_llm_fallback_text = "Sorry, I got stuck for a second. Can you say that again?"
-                        _last_llm_fallback_response_used = True
-                        logger.warning("llm_fallback_response_used=true fallback_reason=timeout")
-                    _last_llm_complete_at = time.monotonic()
-                    break
-                except Exception as e:
-                    _last_llm_stream_status = "error"
-                    _last_llm_timeout_stage = "none"
-                    logger.error("llm_stream_status=error error_type=%s error=%s openrouter_model=%s chunk_count=%s text_length_so_far=%s first_token_seen=%s", type(e).__name__, _redact_sensitive_text(e), os.getenv("OPENROUTER_MODEL", "openai/gpt-4o"), chunk_count, len(''.join(assistant_fragments)), _last_llm_first_token_at is not None)
-                    if not assistant_fragments:
-                        _pending_llm_fallback_text = "Sorry, I got stuck for a second. Can you say that again?"
-                        _last_llm_fallback_response_used = True
-                        logger.warning("llm_fallback_response_used=true fallback_reason=error")
-                    _last_llm_complete_at = time.monotonic()
-                    break
+            fallback_yielded = False
+            logger.info(
+                "LLM stream starting: openrouter_model=%s first_token_timeout_seconds=%s total_timeout_seconds=%s",
+                model_name,
+                LLM_FIRST_TOKEN_TIMEOUT_SECONDS,
+                LLM_TOTAL_TIMEOUT_SECONDS,
+            )
 
-                chunk_count += 1
+            def _extract_text_delta(chunk: object) -> str:
                 text_delta: object = None
                 delta = getattr(chunk, "delta", None)
                 if delta is not None:
@@ -1425,7 +1528,7 @@ class LucyAgent(Agent):
                     if isinstance(delta_content, str):
                         text_delta = delta_content
                     elif isinstance(delta_content, list):
-                        parts = []
+                        parts: list[str] = []
                         for part in delta_content:
                             if isinstance(part, str):
                                 parts.append(part)
@@ -1449,20 +1552,211 @@ class LucyAgent(Agent):
                         text_delta = chunk_content
                 if text_delta is None and isinstance(chunk, str):
                     text_delta = chunk
-                if isinstance(text_delta, str):
-                    if text_delta.strip() and _last_llm_first_token_at is None:
-                        _last_llm_first_token_at = time.monotonic()
-                    assistant_fragments.append(text_delta)
-                yield chunk
+                return text_delta if isinstance(text_delta, str) else ""
 
-            if PIPELINE_TEXT_DEBUG:
-                combined = "".join(assistant_fragments)
-                logger.info("LLM output debug: chunk_count=%s text_length=%s preview=%s", chunk_count, len(combined), _redact_sensitive_text(combined)[:200])
+            async def _close_llm_stream(reason: str) -> None:
+                close_fn = getattr(stream, "aclose", None)
+                if not callable(close_fn):
+                    close_fn = getattr(it, "aclose", None)
+                if callable(close_fn):
+                    try:
+                        result = close_fn()
+                        if inspect.isawaitable(result):
+                            await result
+                        logger.info("LLM stream close requested: reason=%s", reason)
+                    except Exception as close_error:
+                        logger.warning(
+                            "LLM stream close failed: reason=%s error_type=%s error=%s",
+                            reason,
+                            type(close_error).__name__,
+                            _redact_sensitive_text(close_error),
+                        )
+
+            async def _yield_fallback(reason: str) -> AsyncIterable[str]:
+                nonlocal fallback_yielded
+                global _pending_llm_fallback_text, _last_llm_fallback_response_used
+                fallback_yielded = True
+                _last_llm_fallback_response_used = True
+                _pending_llm_fallback_text = None
+                logger.warning(
+                    "LLM fallback yielded to TTS: reason=%s fallback_text_length=%s",
+                    reason,
+                    len(LLM_FALLBACK_RESPONSE),
+                )
+                yield LLM_FALLBACK_RESPONSE
+
+            try:
+                while True:
+                    now = time.monotonic()
+                    timeout_stage = "first_token" if _last_llm_first_token_at is None else "completion"
+                    stage_deadline = first_token_deadline if _last_llm_first_token_at is None else total_deadline
+                    timeout_seconds = min(stage_deadline, total_deadline) - now
+                    if timeout_seconds <= 0:
+                        _last_llm_complete_at = time.monotonic()
+                        if _last_llm_first_token_at is None:
+                            _last_llm_stream_status = "first_token_timeout"
+                            _last_llm_timeout_stage = "first_token"
+                            logger.error(
+                                "LLM first-token timeout: elapsed_seconds=%s openrouter_model=%s chunk_count=%s text_length=%s",
+                                _fmt_seconds(_last_llm_complete_at - start),
+                                model_name,
+                                chunk_count,
+                                len("".join(assistant_fragments)),
+                            )
+                            await _close_llm_stream("first_token_timeout")
+                            async for fallback in _yield_fallback("first_token_timeout"):
+                                logger.warning("LLM first-token timeout: fallback yielded to TTS")
+                                yield fallback
+                        else:
+                            _last_llm_stream_status = "total_timeout"
+                            _last_llm_timeout_stage = "completion"
+                            logger.error(
+                                "LLM total timeout: elapsed_seconds=%s openrouter_model=%s chunk_count=%s text_length=%s fallback_yielded=%s",
+                                _fmt_seconds(_last_llm_complete_at - start),
+                                model_name,
+                                chunk_count,
+                                len("".join(assistant_fragments)),
+                                fallback_yielded,
+                            )
+                            await _close_llm_stream("total_timeout")
+                            if not "".join(assistant_fragments).strip():
+                                async for fallback in _yield_fallback("total_timeout_no_text"):
+                                    logger.warning("LLM total timeout before usable text: fallback yielded to TTS")
+                                    yield fallback
+                        break
+
+                    try:
+                        chunk = await asyncio.wait_for(it.__anext__(), timeout=timeout_seconds)
+                    except StopAsyncIteration:
+                        _last_llm_complete_at = time.monotonic()
+                        completed_text = "".join(assistant_fragments)
+                        _last_llm_completed_at = _last_llm_complete_at
+                        _last_llm_completed_text = completed_text
+                        _last_llm_completed_text_hash = _text_hash(completed_text)
+                        if completed_text.strip():
+                            _last_llm_stream_status = "ok"
+                            logger.info(
+                                "LLM stream completed: openrouter_model=%s chunk_count=%s text_length=%s stream_duration_seconds=%s first_token_latency_seconds=%s",
+                                model_name,
+                                chunk_count,
+                                len(completed_text),
+                                _fmt_seconds(_last_llm_complete_at - start),
+                                _fmt_seconds((_last_llm_first_token_at - start) if _last_llm_first_token_at is not None else None),
+                            )
+                        else:
+                            _last_llm_stream_status = "empty_stream"
+                            _last_llm_timeout_stage = "first_token"
+                            logger.warning(
+                                "LLM stream ended empty: chunk_count=%s stream_duration_seconds=%s",
+                                chunk_count,
+                                _fmt_seconds(_last_llm_complete_at - start),
+                            )
+                            async for fallback in _yield_fallback("empty_stream"):
+                                logger.warning("LLM stream ended empty: fallback yielded to TTS")
+                                yield fallback
+                        break
+                    except asyncio.TimeoutError:
+                        _last_llm_complete_at = time.monotonic()
+                        if _last_llm_first_token_at is None:
+                            _last_llm_stream_status = "first_token_timeout"
+                            _last_llm_timeout_stage = "first_token"
+                            logger.error(
+                                "LLM first-token timeout: elapsed_seconds=%s openrouter_model=%s chunk_count=%s text_length=%s",
+                                _fmt_seconds(_last_llm_complete_at - start),
+                                model_name,
+                                chunk_count,
+                                len("".join(assistant_fragments)),
+                            )
+                            await _close_llm_stream("first_token_timeout")
+                            async for fallback in _yield_fallback("first_token_timeout"):
+                                logger.warning("LLM first-token timeout: fallback yielded to TTS")
+                                yield fallback
+                        else:
+                            _last_llm_stream_status = "total_timeout"
+                            _last_llm_timeout_stage = "completion"
+                            logger.error(
+                                "LLM total timeout: elapsed_seconds=%s openrouter_model=%s chunk_count=%s text_length=%s",
+                                _fmt_seconds(_last_llm_complete_at - start),
+                                model_name,
+                                chunk_count,
+                                len("".join(assistant_fragments)),
+                            )
+                            await _close_llm_stream("total_timeout")
+                            if not "".join(assistant_fragments).strip():
+                                async for fallback in _yield_fallback("total_timeout_no_text"):
+                                    logger.warning("LLM total timeout before usable text: fallback yielded to TTS")
+                                    yield fallback
+                        break
+                    except asyncio.CancelledError:
+                        _last_llm_stream_status = "cancelled"
+                        _last_llm_timeout_stage = "none"
+                        _last_llm_complete_at = time.monotonic()
+                        logger.warning(
+                            "LLM stream cancelled/interrupted: openrouter_model=%s chunk_count=%s text_length=%s elapsed_seconds=%s",
+                            model_name,
+                            chunk_count,
+                            len("".join(assistant_fragments)),
+                            _fmt_seconds(_last_llm_complete_at - start),
+                        )
+                        raise
+                    except Exception as e:
+                        _last_llm_complete_at = time.monotonic()
+                        text_length = len("".join(assistant_fragments))
+                        _last_llm_stream_status = "provider_error"
+                        _last_llm_timeout_stage = "none"
+                        logger.error(
+                            "LLM provider error: error_type=%s error=%s error_details=%s openrouter_model=%s chunk_count=%s text_length=%s first_token_seen=%s stream_duration_seconds=%s",
+                            type(e).__name__,
+                            _redact_sensitive_text(e),
+                            _safe_llm_error_details(e),
+                            model_name,
+                            chunk_count,
+                            text_length,
+                            _last_llm_first_token_at is not None,
+                            _fmt_seconds(_last_llm_complete_at - start),
+                        )
+                        await _close_llm_stream("provider_error")
+                        if not "".join(assistant_fragments).strip():
+                            async for fallback in _yield_fallback("provider_error"):
+                                logger.warning("LLM provider error before usable text: fallback yielded to TTS")
+                                yield fallback
+                        break
+
+                    chunk_count += 1
+                    text_delta = _extract_text_delta(chunk)
+                    if text_delta:
+                        assistant_fragments.append(text_delta)
+                        if text_delta.strip() and _last_llm_first_token_at is None:
+                            _last_llm_first_token_at = time.monotonic()
+                            logger.info(
+                                "LLM first token received: openrouter_model=%s first_token_latency_seconds=%s chunk_count=%s",
+                                model_name,
+                                _fmt_seconds(_last_llm_first_token_at - start),
+                                chunk_count,
+                            )
+                    yield chunk
+            finally:
+                if _last_llm_complete_at <= 0.0:
+                    _last_llm_complete_at = time.monotonic()
+                completed_text = "".join(assistant_fragments)
+                _last_llm_completed_text = completed_text
+                _last_llm_completed_text_hash = _text_hash(completed_text)
+                if _last_llm_completed_at <= 0.0 and _last_llm_stream_status in {"ok", "empty_stream", "provider_error", "first_token_timeout", "total_timeout"}:
+                    _last_llm_completed_at = _last_llm_complete_at
+                logger.info(
+                    "LLM stream ended: status=%s first_token_seen=%s chunk_count=%s text_length=%s fallback_used=%s timeout_stage=%s",
+                    _last_llm_stream_status,
+                    _last_llm_first_token_at is not None,
+                    chunk_count,
+                    len(completed_text),
+                    _last_llm_fallback_response_used,
+                    _last_llm_timeout_stage,
+                )
 
         return _llm_stream()
 
     async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
-        global _last_turn_committed_at, _last_llm_start_at, _last_llm_first_token_at, _last_llm_complete_at, _last_llm_stream_status, _last_llm_timeout_stage, _last_llm_fallback_response_used
+        global _last_turn_committed_at, _last_llm_start_at, _last_llm_first_token_at, _last_llm_complete_at, _last_llm_stream_status, _last_llm_timeout_stage, _last_llm_fallback_response_used, _last_llm_completed_text, _last_llm_completed_text_hash, _last_llm_completed_at, _last_tts_received_text_hash
         _last_turn_committed_at = time.monotonic()
         _last_llm_start_at = 0.0
         _last_llm_first_token_at = None
@@ -1470,6 +1764,10 @@ class LucyAgent(Agent):
         _last_llm_stream_status = "n/a"
         _last_llm_timeout_stage = "n/a"
         _last_llm_fallback_response_used = False
+        _last_llm_completed_text = ""
+        _last_llm_completed_text_hash = "empty"
+        _last_llm_completed_at = 0.0
+        _last_tts_received_text_hash = "empty"
         if PIPELINE_TEXT_DEBUG:
             msg_str = _extract_text_for_debug(new_message)
             messages = getattr(turn_ctx, "messages", None)
@@ -1591,37 +1889,49 @@ async def entrypoint(ctx: JobContext):
     job_started_at = time.monotonic()
     _run_db_migrations_on_startup()
     _log_livekit_tts_source_inspection()
-    openrouter_model = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o")
+    openrouter_model = os.getenv("OPENROUTER_MODEL", OPENROUTER_DEFAULT_MODEL)
     openrouter_api_key_present = bool(os.getenv("OPENROUTER_API_KEY", "").strip())
     provider_order_raw = (os.getenv("OPENROUTER_PROVIDER_ORDER") or "").strip()
     provider_order = [p.strip() for p in provider_order_raw.split(",") if p.strip()]
-    openrouter_allow_fallbacks = env_bool("OPENROUTER_ALLOW_FALLBACKS", True)
+    openrouter_allow_fallbacks_requested = env_bool("OPENROUTER_ALLOW_FALLBACKS", True)
     with_openrouter_sig = inspect.signature(openai.LLM.with_openrouter)
     provider_routing_applied = False
     provider_routing_skip_reason = "provider_order_not_set"
     llm: Any
     if provider_order:
-        extra_body_payload = {"provider": {"order": provider_order, "allow_fallbacks": openrouter_allow_fallbacks}}
-        if "extra_body" in with_openrouter_sig.parameters:
+        provider_payload = {"order": provider_order, "allow_fallbacks": openrouter_allow_fallbacks_requested}
+        if "provider" in with_openrouter_sig.parameters:
+            llm = openai.LLM.with_openrouter(model=openrouter_model, provider=provider_payload)
+            provider_routing_applied = True
+            provider_routing_skip_reason = "none"
+        elif "extra_body" in with_openrouter_sig.parameters:
             try:
-                llm = openai.LLM.with_openrouter(model=openrouter_model, extra_body=extra_body_payload)
+                llm = openai.LLM.with_openrouter(model=openrouter_model, extra_body={"provider": provider_payload})
                 provider_routing_applied = True
                 provider_routing_skip_reason = "none"
             except TypeError:
                 llm = openai.LLM.with_openrouter(model=openrouter_model)
                 provider_routing_skip_reason = "with_openrouter_rejected_extra_body_at_runtime"
+                logger.warning(
+                    "OpenRouter provider routing not applied: wrapper rejected extra_body at runtime; provider fallback routing is not active"
+                )
         else:
             llm = openai.LLM.with_openrouter(model=openrouter_model)
-            provider_routing_skip_reason = "with_openrouter_missing_extra_body_parameter"
+            provider_routing_skip_reason = "with_openrouter_missing_provider_or_extra_body_parameter"
+            logger.warning(
+                "OpenRouter provider routing not applied: current LiveKit OpenRouter wrapper exposes neither provider nor extra_body; provider fallback routing is not active"
+            )
     else:
         llm = openai.LLM.with_openrouter(model=openrouter_model)
+    openrouter_allow_fallbacks_effective = openrouter_allow_fallbacks_requested if provider_routing_applied else False
     logger.info(
-        "LLM provider config: openrouter_api_key_present=%s openrouter_model_present=%s openrouter_model=%s openrouter_provider_order=%s openrouter_allow_fallbacks=%s provider_routing_applied=%s provider_routing_skip_reason=%s",
+        "LLM provider config: openrouter_api_key_present=%s openrouter_model_present=%s openrouter_model=%s openrouter_provider_order=%s openrouter_allow_fallbacks_requested=%s openrouter_allow_fallbacks_effective=%s provider_routing_applied=%s provider_routing_skip_reason=%s",
         openrouter_api_key_present,
         bool(openrouter_model),
         openrouter_model,
         ",".join(provider_order) if provider_order else "none",
-        openrouter_allow_fallbacks,
+        openrouter_allow_fallbacks_requested,
+        openrouter_allow_fallbacks_effective,
         provider_routing_applied,
         provider_routing_skip_reason,
     )
