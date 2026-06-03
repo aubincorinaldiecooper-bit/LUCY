@@ -373,15 +373,15 @@ def attach_session_diagnostics(session: AgentSession) -> None:
             )
             return False, "failed"
 
-    def _cleanup_active_assistant_speeches(reason: str, before_new_speech_id: str | None = None) -> None:
+    def _cleanup_active_assistant_speeches(current_new_speech_id: str | None, cleanup_reason: str) -> None:
         nonlocal pending_user_handoff_speech_id
         global _latest_active_assistant_count_for_hume
         active_count_before = len(active_speech_handles)
         active_ids_before = list(active_speech_handles.keys())
         logger.info(
-            "assistant_speech_cleanup_started cleanup_reason=%s before_new_speech_id=%s active_count_before=%s active_speech_ids=%s stale_speech_ids=%s",
-            reason,
-            before_new_speech_id or "none",
+            "assistant_speech_cleanup_started cleanup_reason=%s current_new_speech_id=%s active_count_before=%s active_speech_ids=%s stale_speech_ids=%s",
+            cleanup_reason,
+            current_new_speech_id or "none",
             active_count_before,
             active_ids_before,
             sorted(stale_speech_ids),
@@ -389,7 +389,7 @@ def attach_session_diagnostics(session: AgentSession) -> None:
         if not active_speech_handles:
             logger.info(
                 "Assistant speech cleanup finished: cleanup_reason=%s active_count_before=%s active_count_after=%s stale_speech_ids=%s new_speech_allowed=%s",
-                reason,
+                cleanup_reason,
                 active_count_before,
                 0,
                 sorted(stale_speech_ids),
@@ -397,8 +397,22 @@ def attach_session_diagnostics(session: AgentSession) -> None:
             )
             return
 
-        for speech_id, handle in list(active_speech_handles.items()):
-            if before_new_speech_id is not None and speech_id == before_new_speech_id:
+        cleanup_ids = [speech_id for speech_id in active_speech_handles if speech_id != current_new_speech_id]
+        if not cleanup_ids:
+            logger.info(
+                "assistant_speech_cleanup_skipped_current_speech cleanup_reason=%s current_new_speech_id=%s active_count_before=%s active_count_after=%s stale_speech_ids=%s",
+                cleanup_reason,
+                current_new_speech_id or "none",
+                active_count_before,
+                len(active_speech_handles),
+                sorted(stale_speech_ids),
+            )
+            _latest_active_assistant_count_for_hume = len(active_speech_handles)
+            return
+
+        for speech_id in cleanup_ids:
+            handle = active_speech_handles.get(speech_id)
+            if handle is None:
                 continue
 
             attempted_method = "none"
@@ -411,7 +425,7 @@ def attach_session_diagnostics(session: AgentSession) -> None:
             for prefix, target in method_targets:
                 for method_name in ("interrupt", "cancel", "stop", "close"):
                     attempted_method = f"{prefix}{method_name}"
-                    ok, result = _invoke_cancel_method(target, method_name, speech_id, reason)
+                    ok, result = _invoke_cancel_method(target, method_name, speech_id, cleanup_reason)
                     if ok:
                         cleanup_result = f"cancel_requested:{attempted_method}:{result}"
                         break
@@ -424,7 +438,7 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                 logger.warning(
                     "Assistant speech cleanup: no safe cancel method speech_id=%s cleanup_reason=%s attempted_method=%s",
                     speech_id,
-                    reason,
+                    cleanup_reason,
                     attempted_method,
                 )
                 cleanup_result = "marked_stale_no_safe_cancel_method"
@@ -438,9 +452,10 @@ def attach_session_diagnostics(session: AgentSession) -> None:
             if pending_user_handoff_speech_id == speech_id:
                 pending_user_handoff_speech_id = None
             logger.info(
-                "Assistant speech cleanup item: cleanup_reason=%s speech_id=%s attempted_method=%s cleanup_result=%s active_count_after_item=%s stale_speech_ids=%s",
-                reason,
+                "Assistant speech cleanup item: cleanup_reason=%s speech_id=%s current_new_speech_id=%s attempted_method=%s cleanup_result=%s active_count_after_item=%s stale_speech_ids=%s",
+                cleanup_reason,
                 speech_id,
+                current_new_speech_id or "none",
                 attempted_method,
                 cleanup_result,
                 len(active_speech_handles),
@@ -448,11 +463,11 @@ def attach_session_diagnostics(session: AgentSession) -> None:
             )
 
         _latest_active_assistant_count_for_hume = len(active_speech_handles)
-        new_speech_allowed = len(active_speech_handles) == 0
+        new_speech_allowed = current_new_speech_id is None or len(active_speech_handles) <= 1
         logger.info(
-            "Assistant speech cleanup finished: cleanup_reason=%s before_new_speech_id=%s active_count_before=%s active_count_after=%s stale_speech_ids=%s new_speech_allowed=%s",
-            reason,
-            before_new_speech_id or "none",
+            "Assistant speech cleanup finished: cleanup_reason=%s current_new_speech_id=%s active_count_before=%s active_count_after=%s stale_speech_ids=%s new_speech_allowed=%s",
+            cleanup_reason,
+            current_new_speech_id or "none",
             active_count_before,
             len(active_speech_handles),
             sorted(stale_speech_ids),
@@ -502,6 +517,15 @@ def attach_session_diagnostics(session: AgentSession) -> None:
             stale_speech_ids.discard(speech_id)
             suppressed_speech_ids.discard(speech_id)
 
+        if active_speech_handles and set(active_speech_handles.keys()) == {speech_id}:
+            _cleanup_active_assistant_speeches(speech_id, "current_speech_already_active")
+            logger.info(
+                "Assistant speech already active; skipping duplicate registration: speech_id=%s active_count=%s",
+                speech_id,
+                len(active_speech_handles),
+            )
+            return
+
         if active_speech_handles:
             active_ids_before_new = list(active_speech_handles.keys())
             current_speech = getattr(session, "current_speech", None)
@@ -527,18 +551,23 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                 latest_agent_state_normalized == "speaking",
                 latest_agent_state_normalized == "listening",
             )
-            _cleanup_active_assistant_speeches("before_new_assistant_speech", before_new_speech_id=speech_id)
+            _cleanup_active_assistant_speeches(speech_id, "before_new_assistant_speech")
+
+        if active_speech_handles and set(active_speech_handles.keys()) == {speech_id}:
+            logger.info(
+                "Assistant speech already active after cleanup; skipping duplicate registration: speech_id=%s active_count=%s",
+                speech_id,
+                len(active_speech_handles),
+            )
+            return
 
         if active_speech_handles:
             logger.error(
-                "Assistant speech active_count would exceed invariant before new speech; forcing stale cleanup: new_speech_id=%s active_speech_ids=%s",
+                "Assistant speech active_count would exceed invariant before new speech; forcing stale cleanup of older speeches only: new_speech_id=%s active_speech_ids=%s",
                 speech_id,
                 list(active_speech_handles.keys()),
             )
-            stale_speech_ids.update(active_speech_handles.keys())
-            active_speech_handles.clear()
-            speech_start_times.clear()
-            _latest_active_assistant_count_for_hume = 0
+            _cleanup_active_assistant_speeches(speech_id, "force_cleanup_before_new_registration")
 
         active_speech_handles[speech_id] = resolved_handle
         speech_start_times[speech_id] = now
@@ -553,7 +582,7 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                 len(active_speech_handles),
                 list(active_speech_handles.keys()),
             )
-            _cleanup_active_assistant_speeches("post_registration_active_count_gt_one", before_new_speech_id=speech_id)
+            _cleanup_active_assistant_speeches(speech_id, "post_registration_active_count_gt_one")
             active_speech_handles[speech_id] = resolved_handle
             speech_start_times[speech_id] = now
             assistant_speech_started_at[speech_id] = now
@@ -609,14 +638,19 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                 interrupted_normalized = str(interrupted).strip().lower()
                 if was_active and active_speech_handles:
                     logger.error(
-                        "Assistant speech active_count invariant violation after finish: finished_speech_id=%s active_count=%s active_speech_ids=%s",
+                        "Assistant speech active_count invariant violation after finish: finished_speech_id=%s active_count=%s active_speech_ids=%s cleanup_skipped_reason=%s",
+                        done_id,
+                        len(active_speech_handles),
+                        list(active_speech_handles.keys()),
+                        "cleanup_only_allowed_before_new_assistant_speech",
+                    )
+                elif was_active and interrupted_normalized in {"true", "1", "yes"} and active_speech_handles:
+                    logger.warning(
+                        "Assistant speech interrupted while another speech is active; cleanup skipped outside new-speech path: speech_id=%s active_count=%s active_speech_ids=%s",
                         done_id,
                         len(active_speech_handles),
                         list(active_speech_handles.keys()),
                     )
-                    _cleanup_active_assistant_speeches("assistant_speech_finished_with_other_active")
-                elif was_active and interrupted_normalized in {"true", "1", "yes"} and active_speech_handles:
-                    _cleanup_active_assistant_speeches("assistant_speech_interrupted")
                 start_count = hume_request_count_at_speech_start.get(done_id, -1)
                 finish_count = hume_request_count_at_speech_finish.get(done_id, -1)
                 during_count = finish_count - start_count if start_count >= 0 and finish_count >= 0 else -1
