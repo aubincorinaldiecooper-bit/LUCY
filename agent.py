@@ -399,9 +399,16 @@ def attach_session_diagnostics(session: AgentSession) -> None:
             )
             return False, "failed"
 
-    def _cleanup_active_assistant_speeches(current_new_speech_id: str | None, cleanup_reason: str) -> None:
+    def _cleanup_active_assistant_speeches(current_new_speech_id: str | None, cleanup_reason: str | None = None) -> None:
         nonlocal pending_user_handoff_speech_id
         global _latest_active_assistant_count_for_hume
+        if cleanup_reason is None:
+            logger.warning(
+                "Deprecated one-argument assistant speech cleanup call ignored: current_new_speech_id=%s active_count=%s",
+                current_new_speech_id or "none",
+                len(active_speech_handles),
+            )
+            return
         active_count_before = len(active_speech_handles)
         active_ids_before = list(active_speech_handles.keys())
         logger.info(
