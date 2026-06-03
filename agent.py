@@ -255,6 +255,32 @@ def _sanitize_spoken_laughter(text: str) -> str:
     return re.sub(pattern, "", text, flags=re.IGNORECASE).strip()
 
 
+def _deployment_git_commit_sha() -> str:
+    for env_name in (
+        "RAILWAY_GIT_COMMIT_SHA",
+        "RAILWAY_GIT_COMMIT",
+        "GIT_COMMIT_SHA",
+        "GIT_SHA",
+        "SOURCE_COMMIT",
+        "VERCEL_GIT_COMMIT_SHA",
+    ):
+        value = os.getenv(env_name, "").strip()
+        if value:
+            return value
+
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short=12", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        return result.stdout.strip() or "n/a"
+    except Exception:
+        return "n/a"
+
+
 def attach_session_diagnostics(session: AgentSession) -> None:
     global _latest_agent_state_for_hume, _latest_active_assistant_count_for_hume, _latest_current_speech_id_for_hume
     active_speech_handles: dict[str, object] = {}
@@ -2031,6 +2057,13 @@ def _attach_optional_interruption_diagnostics(session: AgentSession) -> None:
 
 async def entrypoint(ctx: JobContext):
     job_started_at = time.monotonic()
+    logger.info(
+        "Startup deployment version: git_commit_sha=%s railway_deployment_id=%s railway_service=%s railway_environment=%s",
+        _deployment_git_commit_sha(),
+        os.getenv("RAILWAY_DEPLOYMENT_ID", "n/a"),
+        os.getenv("RAILWAY_SERVICE_NAME", "n/a"),
+        os.getenv("RAILWAY_ENVIRONMENT_NAME", "n/a"),
+    )
     _run_db_migrations_on_startup()
     _log_livekit_tts_source_inspection()
     openrouter_model = os.getenv("OPENROUTER_MODEL", OPENROUTER_DEFAULT_MODEL)
