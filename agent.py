@@ -17,10 +17,10 @@ import aiohttp
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from livekit.agents import Agent, AgentSession, InterruptionOptions, JobContext, TurnHandlingOptions, WorkerOptions, cli, room_io
+from livekit.agents import Agent, AgentSession, InterruptionOptions, JobContext, TurnHandlingOptions, WorkerOptions, cli, function_tool, room_io
 from livekit import rtc
 from livekit.plugins import ai_coustics, deepgram, hume, mistralai, openai, silero
-from tavily import TavilyClient
+from internet_search import SEARCH_DISABLED_MESSAGE, SEARCH_TOOL_DESCRIPTION, format_search_results_for_voice, internet_search, search_disabled_reason, search_enabled, search_max_results, search_provider, search_timeout_seconds
 
 
 load_dotenv()
@@ -1389,6 +1389,53 @@ class LucyAgent(Agent):
     def __init__(self) -> None:
         super().__init__(instructions=SYSTEM_PROMPT)
 
+    @function_tool(name="internet_search", description=SEARCH_TOOL_DESCRIPTION)
+    async def internet_search_tool(self, query: str, max_results: int = 5) -> str:
+        """Search the internet with Exa for current or external information."""
+        provider = search_provider()
+        disabled_reason = search_disabled_reason()
+        try:
+            requested_max_results = max(1, int(max_results or search_max_results()))
+        except Exception:
+            requested_max_results = search_max_results()
+        capped_max_results = min(requested_max_results, search_max_results())
+        logger.info(
+            "search_tool_called search_provider=%s search_query=%s search_disabled_reason=%s search_pre_ack_spoken=%s requested_max_results=%s capped_max_results=%s",
+            provider,
+            _redact_sensitive_text(query),
+            disabled_reason or "none",
+            False,
+            max_results,
+            capped_max_results,
+        )
+        if disabled_reason is not None:
+            logger.warning(
+                "search_disabled_reason=%s search_provider=%s search_query=%s",
+                disabled_reason,
+                provider,
+                _redact_sensitive_text(query),
+            )
+            return (
+                f"{SEARCH_DISABLED_MESSAGE} "
+                "Say: I couldn't get a clean result. What exactly should I search for?"
+            )
+
+        results = await internet_search(query=query, max_results=capped_max_results)
+        if not results:
+            logger.info(
+                "search_result_count=0 search_provider=exa search_query=%s search_result_handoff_spoken=%s",
+                _redact_sensitive_text(query),
+                False,
+            )
+        else:
+            logger.info(
+                "search_result_count=%s search_provider=exa search_query=%s search_result_handoff_spoken=%s",
+                len(results),
+                _redact_sensitive_text(query),
+                False,
+            )
+        return format_search_results_for_voice(results)
+
     def _normalize_spoken_text(self, text: str) -> str:
         normalized = text.strip()
         if not normalized:
@@ -2013,34 +2060,6 @@ def build_stt():
     raise RuntimeError("Unsupported STT_PROVIDER. Use 'deepgram_flux', 'deepgram_nova3', or 'mistral'.")
 
 
-def _tavily() -> TavilyClient:
-    return TavilyClient(api_key=os.getenv("TAVILY_API_KEY", ""))
-
-
-def register_tavily_tools(llm: Any) -> None:
-    tavily = _tavily()
-
-    @llm.tool()
-    def tavily_search(query: str) -> Any:
-        return tavily.search(query=query)
-
-    @llm.tool()
-    def tavily_extract(urls: list[str]) -> Any:
-        return tavily.extract(urls=urls)
-
-    @llm.tool()
-    def tavily_crawl(url: str) -> Any:
-        return tavily.crawl(url=url)
-
-    @llm.tool()
-    def tavily_map(url: str) -> Any:
-        return tavily.map(url=url)
-
-    @llm.tool()
-    def tavily_research(topic: str) -> Any:
-        return tavily.search(query=topic, search_depth="advanced")
-
-
 def _attach_optional_interruption_diagnostics(session: AgentSession) -> None:
     def _register(event_name: str, handler):
         try:
@@ -2120,7 +2139,7 @@ async def entrypoint(ctx: JobContext):
         provider_routing_skip_reason,
     )
     # TODO: Re-enable Tavily using LiveKit's supported function-tool pattern.
-    logger.warning("Skipping Tavily tools for MVP voice path")
+    logger.warning("Skipping Tavily tools for MVP voice path; Exa is the only active search provider when enabled")
 
     livekit_turn_detection_mode_present = "LIVEKIT_TURN_DETECTION_MODE" in os.environ
     livekit_turn_detection_mode_raw = os.getenv("LIVEKIT_TURN_DETECTION_MODE")
@@ -2184,6 +2203,14 @@ async def entrypoint(ctx: JobContext):
     logger.info("MISTRAL_STT_DIAGNOSTICS enabled=%s", MISTRAL_STT_DIAGNOSTICS)
     logger.info("HUME_FULL_UTTERANCE_TTS enabled=%s", HUME_FULL_UTTERANCE_TTS)
     logger.info("HUME_DIRECT_API_TTS enabled=%s", HUME_DIRECT_API_TTS)
+    logger.info(
+        "Search startup config: search_enabled=%s search_provider=%s search_max_results=%s search_timeout_seconds=%s search_disabled_reason=%s",
+        search_enabled(),
+        search_provider(),
+        search_max_results(),
+        search_timeout_seconds(),
+        search_disabled_reason() or "none",
+    )
     try:
         from livekit.agents import Agent as _AgentInspect
 
