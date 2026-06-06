@@ -28,6 +28,7 @@ from internet_search import (
     internet_search,
     search_disabled_reason,
     search_enabled,
+    search_failure_response,
     search_max_results,
     search_provider,
     search_timeout_seconds,
@@ -126,6 +127,64 @@ _last_llm_completed_at = 0.0
 _last_tts_node_entered_at = 0.0
 _last_tts_received_text_hash = "empty"
 _last_hume_request_start_at = 0.0
+_search_tool_called = False
+_search_in_progress = False
+_search_started_at = 0.0
+_search_completed_at = 0.0
+_search_failed = False
+_search_pre_ack_spoken = False
+_search_specific_response_produced = False
+_search_result_handoff_spoken = False
+_last_search_tool_output = ""
+_last_search_tool_output_hash = "empty"
+_last_generic_llm_fallback_used = False
+
+
+def _reset_search_state_for_turn() -> None:
+    global _search_tool_called, _search_in_progress, _search_started_at, _search_completed_at, _search_failed, _search_pre_ack_spoken, _search_specific_response_produced, _search_result_handoff_spoken, _last_search_tool_output, _last_search_tool_output_hash, _last_generic_llm_fallback_used
+    _search_tool_called = False
+    _search_in_progress = False
+    _search_started_at = 0.0
+    _search_completed_at = 0.0
+    _search_failed = False
+    _search_pre_ack_spoken = False
+    _search_specific_response_produced = False
+    _search_result_handoff_spoken = False
+    _last_search_tool_output = ""
+    _last_search_tool_output_hash = "empty"
+    _last_generic_llm_fallback_used = False
+
+
+def _mark_search_wait_started(pre_ack_spoken: bool = False) -> None:
+    global _search_tool_called, _search_in_progress, _search_started_at, _search_completed_at, _search_failed, _search_pre_ack_spoken, _search_specific_response_produced, _search_result_handoff_spoken, _last_search_tool_output, _last_search_tool_output_hash
+    _search_tool_called = True
+    _search_in_progress = True
+    _search_started_at = time.monotonic()
+    _search_completed_at = 0.0
+    _search_failed = False
+    _search_pre_ack_spoken = pre_ack_spoken
+    _search_specific_response_produced = False
+    _search_result_handoff_spoken = False
+    _last_search_tool_output = ""
+    _last_search_tool_output_hash = "empty"
+
+
+def _mark_search_wait_completed(failed: bool, output: str, result_handoff_spoken: bool = False) -> None:
+    global _search_in_progress, _search_completed_at, _search_failed, _search_specific_response_produced, _search_result_handoff_spoken, _last_search_tool_output, _last_search_tool_output_hash
+    _search_in_progress = False
+    _search_completed_at = time.monotonic()
+    _search_failed = failed
+    _search_specific_response_produced = bool(output.strip())
+    _search_result_handoff_spoken = result_handoff_spoken
+    _last_search_tool_output = output
+    _last_search_tool_output_hash = _text_hash(output)
+
+
+def _search_wait_elapsed_seconds() -> float:
+    if _search_started_at <= 0.0:
+        return 0.0
+    end = time.monotonic() if _search_in_progress else (_search_completed_at or time.monotonic())
+    return max(0.0, end - _search_started_at)
 
 
 def _next_local_speech_id() -> str:
@@ -849,6 +908,9 @@ def attach_session_diagnostics(session: AgentSession) -> None:
             )
             return
         logger.info("Conversation item added: role=%s interrupted=%s", role, interrupted)
+        if str(role).strip().lower() == "user":
+            _reset_search_state_for_turn()
+            logger.info("Search state reset for new user turn: search_in_progress=%s search_tool_called=%s", _search_in_progress, _search_tool_called)
 
     @session.on("user_input_transcribed")
     def _on_user_input_transcribed(event: object) -> None:
@@ -1461,7 +1523,7 @@ class LucyAgent(Agent):
         )
         if disabled_reason is not None:
             logger.warning(
-                "search_disabled_reason=%s search_provider=%s search_query_original=%s search_current_date=%s search_current_datetime_iso=%s search_timezone=%s search_freshness_applied=%s",
+                "search_disabled_reason=%s search_provider=%s search_query_original=%s search_current_date=%s search_current_datetime_iso=%s search_timezone=%s search_freshness_applied=%s search_specific_failure_response_used=%s",
                 disabled_reason,
                 provider,
                 _redact_sensitive_text(query),
@@ -1469,12 +1531,20 @@ class LucyAgent(Agent):
                 current_datetime_iso or "unknown",
                 session_timezone or "unknown",
                 freshness_applied,
+                True,
             )
-            return (
-                f"{SEARCH_DISABLED_MESSAGE} "
-                "Say: I couldn't get a clean result. What exactly should I search for?"
-            )
+            output = f"{SEARCH_DISABLED_MESSAGE} Say: {search_failure_response()}"
+            _mark_search_wait_completed(failed=True, output=output, result_handoff_spoken=False)
+            return output
 
+        _mark_search_wait_started(pre_ack_spoken=False)
+        logger.info(
+            "search_wait_started search_in_progress=%s search_started_at=%s search_pre_ack_spoken=%s search_query_original=%s",
+            _search_in_progress,
+            _search_started_at,
+            _search_pre_ack_spoken,
+            _redact_sensitive_text(query),
+        )
         results = await internet_search(
             query=query,
             max_results=capped_max_results,
@@ -1483,18 +1553,26 @@ class LucyAgent(Agent):
             session_timezone=session_timezone,
         )
         if not results:
+            output = f"{SEARCH_DISABLED_MESSAGE} Say: {search_failure_response()}"
+            _mark_search_wait_completed(failed=True, output=output, result_handoff_spoken=False)
             logger.info(
-                "search_result_count=0 search_provider=exa search_query_original=%s search_current_date=%s search_current_datetime_iso=%s search_timezone=%s search_freshness_applied=%s search_result_handoff_spoken=%s",
+                "search_result_count=0 search_provider=exa search_query_original=%s search_current_date=%s search_current_datetime_iso=%s search_timezone=%s search_freshness_applied=%s search_result_handoff_spoken=%s search_wait_completed search_in_progress=%s search_failed=%s search_specific_failure_response_used=%s search_latency_seconds=%.3f",
                 _redact_sensitive_text(query),
                 current_date or "unknown",
                 current_datetime_iso or "unknown",
                 session_timezone or "unknown",
                 freshness_applied,
                 False,
+                _search_in_progress,
+                _search_failed,
+                True,
+                _search_wait_elapsed_seconds(),
             )
         else:
+            output = format_search_results_for_voice(results, current_date=current_date, freshness_applied=freshness_applied)
+            _mark_search_wait_completed(failed=False, output=output, result_handoff_spoken=False)
             logger.info(
-                "search_result_count=%s search_provider=exa search_query_original=%s search_current_date=%s search_current_datetime_iso=%s search_timezone=%s search_freshness_applied=%s search_result_dates=%s search_result_handoff_spoken=%s",
+                "search_result_count=%s search_provider=exa search_query_original=%s search_current_date=%s search_current_datetime_iso=%s search_timezone=%s search_freshness_applied=%s search_result_dates=%s search_result_handoff_spoken=%s search_wait_completed search_in_progress=%s search_failed=%s search_specific_failure_response_used=%s search_latency_seconds=%.3f",
                 len(results),
                 _redact_sensitive_text(query),
                 current_date or "unknown",
@@ -1503,55 +1581,12 @@ class LucyAgent(Agent):
                 freshness_applied,
                 ",".join(result.published_date for result in results if result.published_date) or "none",
                 False,
-            )
-        return format_search_results_for_voice(results, current_date=current_date, freshness_applied=freshness_applied)
-
-    @function_tool(name="internet_search", description=SEARCH_TOOL_DESCRIPTION)
-    async def internet_search_tool(self, query: str, max_results: int = 5) -> str:
-        """Search the internet with Exa for current or external information."""
-        provider = search_provider()
-        disabled_reason = search_disabled_reason()
-        try:
-            requested_max_results = max(1, int(max_results or search_max_results()))
-        except Exception:
-            requested_max_results = search_max_results()
-        capped_max_results = min(requested_max_results, search_max_results())
-        logger.info(
-            "search_tool_called search_provider=%s search_query=%s search_disabled_reason=%s search_pre_ack_spoken=%s requested_max_results=%s capped_max_results=%s",
-            provider,
-            _redact_sensitive_text(query),
-            disabled_reason or "none",
-            False,
-            max_results,
-            capped_max_results,
-        )
-        if disabled_reason is not None:
-            logger.warning(
-                "search_disabled_reason=%s search_provider=%s search_query=%s",
-                disabled_reason,
-                provider,
-                _redact_sensitive_text(query),
-            )
-            return (
-                f"{SEARCH_DISABLED_MESSAGE} "
-                "Say: I couldn't get a clean result. What exactly should I search for?"
-            )
-
-        results = await internet_search(query=query, max_results=capped_max_results)
-        if not results:
-            logger.info(
-                "search_result_count=0 search_provider=exa search_query=%s search_result_handoff_spoken=%s",
-                _redact_sensitive_text(query),
+                _search_in_progress,
+                _search_failed,
                 False,
+                _search_wait_elapsed_seconds(),
             )
-        else:
-            logger.info(
-                "search_result_count=%s search_provider=exa search_query=%s search_result_handoff_spoken=%s",
-                len(results),
-                _redact_sensitive_text(query),
-                False,
-            )
-        return format_search_results_for_voice(results)
+        return output
 
     def _normalize_spoken_text(self, text: str) -> str:
         normalized = text.strip()
@@ -1835,13 +1870,14 @@ class LucyAgent(Agent):
         stream = Agent.default.llm_node(self, chat_ctx, tools, model_settings)
 
         async def _llm_stream():
-            global _last_llm_start_at, _last_llm_first_token_at, _last_llm_complete_at, _last_llm_stream_status, _last_llm_timeout_stage, _last_llm_fallback_response_used, _pending_llm_fallback_text, _last_llm_completed_text, _last_llm_completed_text_hash, _last_llm_completed_at
+            global _last_llm_start_at, _last_llm_first_token_at, _last_llm_complete_at, _last_llm_stream_status, _last_llm_timeout_stage, _last_llm_fallback_response_used, _pending_llm_fallback_text, _last_llm_completed_text, _last_llm_completed_text_hash, _last_llm_completed_at, _last_generic_llm_fallback_used
             assistant_fragments: list[str] = []
             chunk_count = 0
             model_name = os.getenv("OPENROUTER_MODEL", OPENROUTER_DEFAULT_MODEL)
             _last_llm_stream_status = "started"
             _last_llm_timeout_stage = "none"
             _last_llm_fallback_response_used = False
+            _last_generic_llm_fallback_used = False
             _pending_llm_fallback_text = None
             _last_llm_start_at = time.monotonic()
             _last_llm_first_token_at = None
@@ -1915,16 +1951,85 @@ class LucyAgent(Agent):
 
             async def _yield_fallback(reason: str) -> AsyncIterable[str]:
                 nonlocal fallback_yielded
-                global _pending_llm_fallback_text, _last_llm_fallback_response_used
+                global _pending_llm_fallback_text, _last_llm_fallback_response_used, _last_generic_llm_fallback_used
+                if _search_in_progress:
+                    logger.warning(
+                        "llm_fallback_suppressed_reason=search_in_progress reason=%s search_in_progress=%s search_tool_called=%s search_wait_elapsed_seconds=%.3f generic_llm_fallback_used=%s",
+                        reason,
+                        _search_in_progress,
+                        _search_tool_called,
+                        _search_wait_elapsed_seconds(),
+                        False,
+                    )
+                    return
+                if _search_tool_called and _search_specific_response_produced:
+                    logger.warning(
+                        "llm_fallback_suppressed_reason=search_specific_response_available reason=%s search_in_progress=%s search_tool_called=%s search_failed=%s search_specific_failure_response_used=%s generic_llm_fallback_used=%s",
+                        reason,
+                        _search_in_progress,
+                        _search_tool_called,
+                        _search_failed,
+                        _search_failed,
+                        False,
+                    )
+                    return
                 fallback_yielded = True
                 _last_llm_fallback_response_used = True
+                _last_generic_llm_fallback_used = True
                 _pending_llm_fallback_text = None
                 logger.warning(
-                    "LLM fallback yielded to TTS: reason=%s fallback_text_length=%s",
+                    "LLM fallback yielded to TTS: reason=%s fallback_text_length=%s generic_llm_fallback_used=%s search_in_progress=%s search_tool_called=%s",
                     reason,
                     len(LLM_FALLBACK_RESPONSE),
+                    True,
+                    _search_in_progress,
+                    _search_tool_called,
                 )
                 yield LLM_FALLBACK_RESPONSE
+
+            pending_next_chunk_task: asyncio.Task[Any] | None = None
+            search_fallback_suppressed_logged = False
+
+            def _suppress_generic_fallback_for_search(reason: str) -> bool:
+                nonlocal search_fallback_suppressed_logged
+                if _search_in_progress:
+                    if not search_fallback_suppressed_logged:
+                        logger.warning(
+                            "llm_fallback_suppressed_reason=search_in_progress reason=%s search_in_progress=%s search_tool_called=%s search_started_at=%s search_wait_elapsed_seconds=%.3f generic_llm_fallback_used=%s",
+                            reason,
+                            _search_in_progress,
+                            _search_tool_called,
+                            _search_started_at,
+                            _search_wait_elapsed_seconds(),
+                            False,
+                        )
+                        search_fallback_suppressed_logged = True
+                    return True
+                if _search_tool_called and _search_specific_response_produced:
+                    logger.warning(
+                        "llm_fallback_suppressed_reason=search_specific_response_available reason=%s search_in_progress=%s search_tool_called=%s search_failed=%s search_specific_failure_response_used=%s generic_llm_fallback_used=%s",
+                        reason,
+                        _search_in_progress,
+                        _search_tool_called,
+                        _search_failed,
+                        _search_failed,
+                        False,
+                    )
+                    return True
+                return False
+
+            async def _cancel_pending_next_chunk(reason: str) -> None:
+                nonlocal pending_next_chunk_task
+                if pending_next_chunk_task is None or pending_next_chunk_task.done():
+                    return
+                pending_next_chunk_task.cancel()
+                try:
+                    await pending_next_chunk_task
+                except BaseException:
+                    pass
+                finally:
+                    pending_next_chunk_task = None
+                    logger.info("LLM pending chunk task cancelled: reason=%s", reason)
 
             try:
                 while True:
@@ -1933,17 +2038,72 @@ class LucyAgent(Agent):
                     stage_deadline = first_token_deadline if _last_llm_first_token_at is None else total_deadline
                     timeout_seconds = min(stage_deadline, total_deadline) - now
                     if timeout_seconds <= 0:
+                        if _search_in_progress:
+                            _suppress_generic_fallback_for_search(f"{timeout_stage}_timeout")
+                            timeout_seconds = min(max(search_timeout_seconds(), 0.25), 1.0)
+                        else:
+                            _last_llm_complete_at = time.monotonic()
+                            if _last_llm_first_token_at is None:
+                                _last_llm_stream_status = "first_token_timeout"
+                                _last_llm_timeout_stage = "first_token"
+                                logger.error(
+                                    "LLM first-token timeout: elapsed_seconds=%s openrouter_model=%s chunk_count=%s text_length=%s search_in_progress=%s search_tool_called=%s",
+                                    _fmt_seconds(_last_llm_complete_at - start),
+                                    model_name,
+                                    chunk_count,
+                                    len("".join(assistant_fragments)),
+                                    _search_in_progress,
+                                    _search_tool_called,
+                                )
+                                await _cancel_pending_next_chunk("first_token_timeout")
+                                await _close_llm_stream("first_token_timeout")
+                                async for fallback in _yield_fallback("first_token_timeout"):
+                                    logger.warning("LLM first-token timeout: fallback yielded to TTS")
+                                    yield fallback
+                            else:
+                                _last_llm_stream_status = "total_timeout"
+                                _last_llm_timeout_stage = "completion"
+                                logger.error(
+                                    "LLM total timeout: elapsed_seconds=%s openrouter_model=%s chunk_count=%s text_length=%s fallback_yielded=%s search_in_progress=%s search_tool_called=%s",
+                                    _fmt_seconds(_last_llm_complete_at - start),
+                                    model_name,
+                                    chunk_count,
+                                    len("".join(assistant_fragments)),
+                                    fallback_yielded,
+                                    _search_in_progress,
+                                    _search_tool_called,
+                                )
+                                await _cancel_pending_next_chunk("total_timeout")
+                                await _close_llm_stream("total_timeout")
+                                if not "".join(assistant_fragments).strip():
+                                    async for fallback in _yield_fallback("total_timeout_no_text"):
+                                        logger.warning("LLM total timeout before usable text: fallback yielded to TTS")
+                                        yield fallback
+                            break
+
+                    if pending_next_chunk_task is None:
+                        pending_next_chunk_task = asyncio.create_task(it.__anext__())
+
+                    done, _ = await asyncio.wait({pending_next_chunk_task}, timeout=max(timeout_seconds, 0.001))
+                    if not done:
+                        if _search_in_progress:
+                            _suppress_generic_fallback_for_search(f"{timeout_stage}_timeout")
+                            continue
+
                         _last_llm_complete_at = time.monotonic()
                         if _last_llm_first_token_at is None:
                             _last_llm_stream_status = "first_token_timeout"
                             _last_llm_timeout_stage = "first_token"
                             logger.error(
-                                "LLM first-token timeout: elapsed_seconds=%s openrouter_model=%s chunk_count=%s text_length=%s",
+                                "LLM first-token timeout: elapsed_seconds=%s openrouter_model=%s chunk_count=%s text_length=%s search_in_progress=%s search_tool_called=%s",
                                 _fmt_seconds(_last_llm_complete_at - start),
                                 model_name,
                                 chunk_count,
                                 len("".join(assistant_fragments)),
+                                _search_in_progress,
+                                _search_tool_called,
                             )
+                            await _cancel_pending_next_chunk("first_token_timeout")
                             await _close_llm_stream("first_token_timeout")
                             async for fallback in _yield_fallback("first_token_timeout"):
                                 logger.warning("LLM first-token timeout: fallback yielded to TTS")
@@ -1952,13 +2112,15 @@ class LucyAgent(Agent):
                             _last_llm_stream_status = "total_timeout"
                             _last_llm_timeout_stage = "completion"
                             logger.error(
-                                "LLM total timeout: elapsed_seconds=%s openrouter_model=%s chunk_count=%s text_length=%s fallback_yielded=%s",
+                                "LLM total timeout: elapsed_seconds=%s openrouter_model=%s chunk_count=%s text_length=%s search_in_progress=%s search_tool_called=%s",
                                 _fmt_seconds(_last_llm_complete_at - start),
                                 model_name,
                                 chunk_count,
                                 len("".join(assistant_fragments)),
-                                fallback_yielded,
+                                _search_in_progress,
+                                _search_tool_called,
                             )
+                            await _cancel_pending_next_chunk("total_timeout")
                             await _close_llm_stream("total_timeout")
                             if not "".join(assistant_fragments).strip():
                                 async for fallback in _yield_fallback("total_timeout_no_text"):
@@ -1966,8 +2128,10 @@ class LucyAgent(Agent):
                                     yield fallback
                         break
 
+                    task = pending_next_chunk_task
+                    pending_next_chunk_task = None
                     try:
-                        chunk = await asyncio.wait_for(it.__anext__(), timeout=timeout_seconds)
+                        chunk = task.result()
                     except StopAsyncIteration:
                         _last_llm_complete_at = time.monotonic()
                         completed_text = "".join(assistant_fragments)
@@ -1988,45 +2152,15 @@ class LucyAgent(Agent):
                             _last_llm_stream_status = "empty_stream"
                             _last_llm_timeout_stage = "first_token"
                             logger.warning(
-                                "LLM stream ended empty: chunk_count=%s stream_duration_seconds=%s",
+                                "LLM stream ended empty: chunk_count=%s stream_duration_seconds=%s search_in_progress=%s search_tool_called=%s",
                                 chunk_count,
                                 _fmt_seconds(_last_llm_complete_at - start),
+                                _search_in_progress,
+                                _search_tool_called,
                             )
                             async for fallback in _yield_fallback("empty_stream"):
                                 logger.warning("LLM stream ended empty: fallback yielded to TTS")
                                 yield fallback
-                        break
-                    except asyncio.TimeoutError:
-                        _last_llm_complete_at = time.monotonic()
-                        if _last_llm_first_token_at is None:
-                            _last_llm_stream_status = "first_token_timeout"
-                            _last_llm_timeout_stage = "first_token"
-                            logger.error(
-                                "LLM first-token timeout: elapsed_seconds=%s openrouter_model=%s chunk_count=%s text_length=%s",
-                                _fmt_seconds(_last_llm_complete_at - start),
-                                model_name,
-                                chunk_count,
-                                len("".join(assistant_fragments)),
-                            )
-                            await _close_llm_stream("first_token_timeout")
-                            async for fallback in _yield_fallback("first_token_timeout"):
-                                logger.warning("LLM first-token timeout: fallback yielded to TTS")
-                                yield fallback
-                        else:
-                            _last_llm_stream_status = "total_timeout"
-                            _last_llm_timeout_stage = "completion"
-                            logger.error(
-                                "LLM total timeout: elapsed_seconds=%s openrouter_model=%s chunk_count=%s text_length=%s",
-                                _fmt_seconds(_last_llm_complete_at - start),
-                                model_name,
-                                chunk_count,
-                                len("".join(assistant_fragments)),
-                            )
-                            await _close_llm_stream("total_timeout")
-                            if not "".join(assistant_fragments).strip():
-                                async for fallback in _yield_fallback("total_timeout_no_text"):
-                                    logger.warning("LLM total timeout before usable text: fallback yielded to TTS")
-                                    yield fallback
                         break
                     except asyncio.CancelledError:
                         _last_llm_stream_status = "cancelled"
@@ -2046,7 +2180,7 @@ class LucyAgent(Agent):
                         _last_llm_stream_status = "provider_error"
                         _last_llm_timeout_stage = "none"
                         logger.error(
-                            "LLM provider error: error_type=%s error=%s error_details=%s openrouter_model=%s chunk_count=%s text_length=%s first_token_seen=%s stream_duration_seconds=%s",
+                            "LLM provider error: error_type=%s error=%s error_details=%s openrouter_model=%s chunk_count=%s text_length=%s first_token_seen=%s stream_duration_seconds=%s search_in_progress=%s search_tool_called=%s",
                             type(e).__name__,
                             _redact_sensitive_text(e),
                             _safe_llm_error_details(e),
@@ -2055,6 +2189,8 @@ class LucyAgent(Agent):
                             text_length,
                             _last_llm_first_token_at is not None,
                             _fmt_seconds(_last_llm_complete_at - start),
+                            _search_in_progress,
+                            _search_tool_called,
                         )
                         await _close_llm_stream("provider_error")
                         if not "".join(assistant_fragments).strip():
@@ -2085,13 +2221,17 @@ class LucyAgent(Agent):
                 if _last_llm_completed_at <= 0.0 and _last_llm_stream_status in {"ok", "empty_stream", "provider_error", "first_token_timeout", "total_timeout"}:
                     _last_llm_completed_at = _last_llm_complete_at
                 logger.info(
-                    "LLM stream ended: status=%s first_token_seen=%s chunk_count=%s text_length=%s fallback_used=%s timeout_stage=%s",
+                    "LLM stream ended: status=%s first_token_seen=%s chunk_count=%s text_length=%s fallback_used=%s timeout_stage=%s search_in_progress=%s search_tool_called=%s search_failed=%s generic_llm_fallback_used=%s",
                     _last_llm_stream_status,
                     _last_llm_first_token_at is not None,
                     chunk_count,
                     len(completed_text),
                     _last_llm_fallback_response_used,
                     _last_llm_timeout_stage,
+                    _search_in_progress,
+                    _search_tool_called,
+                    _search_failed,
+                    _last_generic_llm_fallback_used,
                 )
 
         return _llm_stream()

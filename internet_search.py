@@ -395,11 +395,13 @@ async def internet_search(
 def format_search_results_for_voice(results: list[SearchResult], current_date: str | None = None, freshness_applied: bool = False) -> str:
     if not results:
         return (
+            f"If you did not already say a lookup bridge before the tool call, say: {search_spoken_bridge()} "
             f"{SEARCH_DISABLED_MESSAGE} "
             f"Say: {search_failure_response()}"
         )
 
     lines = [
+        f"If you did not already say a lookup bridge before the tool call, say: {search_spoken_bridge()}",
         f"Search succeeded. Before summarizing aloud, say: {search_result_handoff()}",
         "Keep the spoken summary to one or two short sentences. Do not read URLs aloud unless asked.",
     ]
