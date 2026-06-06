@@ -806,6 +806,8 @@ def attach_session_diagnostics(session: AgentSession) -> None:
         latest_user_state_timestamp = time.monotonic()
         if latest_user_state == "speaking":
             last_user_speaking_at = latest_user_state_timestamp
+            if active_speech_handles:
+                _cleanup_active_assistant_speeches("user_state_speaking")
         if latest_user_state == "listening":
             last_user_listening_at = latest_user_state_timestamp
         logger.info("User state changed: state=%s assistant_active_count=%s", state, len(active_speech_handles))
@@ -832,6 +834,10 @@ def attach_session_diagnostics(session: AgentSession) -> None:
         target = event_item if event_item is not None else item
         role = _safe_attr(target, "role")
         interrupted = _safe_attr(target, "interrupted")
+        if str(role).strip().lower() == "user" and active_speech_handles:
+            _cleanup_active_assistant_speeches("user_turn_committed")
+        if str(interrupted).strip().lower() in {"true", "1", "yes"} and active_speech_handles:
+            _cleanup_active_assistant_speeches("conversation_item_interrupted")
         if PIPELINE_TEXT_DEBUG:
             text_str = _extract_text_for_debug(target)
             logger.info(
@@ -1499,6 +1505,53 @@ class LucyAgent(Agent):
                 False,
             )
         return format_search_results_for_voice(results, current_date=current_date, freshness_applied=freshness_applied)
+
+    @function_tool(name="internet_search", description=SEARCH_TOOL_DESCRIPTION)
+    async def internet_search_tool(self, query: str, max_results: int = 5) -> str:
+        """Search the internet with Exa for current or external information."""
+        provider = search_provider()
+        disabled_reason = search_disabled_reason()
+        try:
+            requested_max_results = max(1, int(max_results or search_max_results()))
+        except Exception:
+            requested_max_results = search_max_results()
+        capped_max_results = min(requested_max_results, search_max_results())
+        logger.info(
+            "search_tool_called search_provider=%s search_query=%s search_disabled_reason=%s search_pre_ack_spoken=%s requested_max_results=%s capped_max_results=%s",
+            provider,
+            _redact_sensitive_text(query),
+            disabled_reason or "none",
+            False,
+            max_results,
+            capped_max_results,
+        )
+        if disabled_reason is not None:
+            logger.warning(
+                "search_disabled_reason=%s search_provider=%s search_query=%s",
+                disabled_reason,
+                provider,
+                _redact_sensitive_text(query),
+            )
+            return (
+                f"{SEARCH_DISABLED_MESSAGE} "
+                "Say: I couldn't get a clean result. What exactly should I search for?"
+            )
+
+        results = await internet_search(query=query, max_results=capped_max_results)
+        if not results:
+            logger.info(
+                "search_result_count=0 search_provider=exa search_query=%s search_result_handoff_spoken=%s",
+                _redact_sensitive_text(query),
+                False,
+            )
+        else:
+            logger.info(
+                "search_result_count=%s search_provider=exa search_query=%s search_result_handoff_spoken=%s",
+                len(results),
+                _redact_sensitive_text(query),
+                False,
+            )
+        return format_search_results_for_voice(results)
 
     def _normalize_spoken_text(self, text: str) -> str:
         normalized = text.strip()
