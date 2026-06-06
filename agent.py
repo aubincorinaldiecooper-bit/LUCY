@@ -20,7 +20,19 @@ from fastapi.responses import JSONResponse
 from livekit.agents import Agent, AgentSession, InterruptionOptions, JobContext, TurnHandlingOptions, WorkerOptions, cli, function_tool, room_io
 from livekit import rtc
 from livekit.plugins import ai_coustics, deepgram, hume, mistralai, openai, silero
-from internet_search import SEARCH_DISABLED_MESSAGE, SEARCH_TOOL_DESCRIPTION, format_search_results_for_voice, internet_search, search_disabled_reason, search_enabled, search_max_results, search_provider, search_timeout_seconds
+from internet_search import (
+    SEARCH_DISABLED_MESSAGE,
+    SEARCH_TOOL_DESCRIPTION,
+    build_effective_search_query,
+    format_search_results_for_voice,
+    internet_search,
+    search_disabled_reason,
+    search_enabled,
+    search_max_results,
+    search_provider,
+    search_timeout_seconds,
+)
+from runtime_context import RuntimeContext, runtime_context_from_metadata
 
 
 load_dotenv()
@@ -1385,9 +1397,114 @@ async def health() -> JSONResponse:
     return JSONResponse({"status": "ok"})
 
 
+def _metadata_candidates_from_context(ctx: JobContext) -> list[Any]:
+    candidates: list[Any] = []
+    for attr_name in ("job", "room"):
+        obj = _safe_attr(ctx, attr_name)
+        metadata = _safe_attr(obj, "metadata")
+        if metadata:
+            candidates.append(metadata)
+
+    job = _safe_attr(ctx, "job")
+    for attr_name in ("participant", "participant_info"):  # wrapper versions differ
+        participant = _safe_attr(job, attr_name)
+        metadata = _safe_attr(participant, "metadata")
+        if metadata:
+            candidates.append(metadata)
+
+    room = _safe_attr(ctx, "room")
+    remote_participants = _safe_attr(room, "remote_participants")
+    if isinstance(remote_participants, dict):
+        for participant in remote_participants.values():
+            metadata = _safe_attr(participant, "metadata")
+            if metadata:
+                candidates.append(metadata)
+
+    return candidates
+
+
 class LucyAgent(Agent):
-    def __init__(self) -> None:
-        super().__init__(instructions=SYSTEM_PROMPT)
+    def __init__(self, runtime_context: RuntimeContext | None = None) -> None:
+        self.runtime_context = runtime_context
+        instructions = SYSTEM_PROMPT
+        if runtime_context is not None:
+            instructions = f"{SYSTEM_PROMPT}\n\n{runtime_context.system_message}"
+        super().__init__(instructions=instructions)
+
+    @function_tool(name="internet_search", description=SEARCH_TOOL_DESCRIPTION)
+    async def internet_search_tool(self, query: str, max_results: int = 5) -> str:
+        """Search the internet with Exa for current or external information."""
+        provider = search_provider()
+        disabled_reason = search_disabled_reason()
+        runtime_context = self.runtime_context
+        current_date = runtime_context.current_date if runtime_context else None
+        current_datetime_iso = runtime_context.current_datetime_iso if runtime_context else None
+        session_timezone = runtime_context.session_timezone if runtime_context else None
+        _, freshness_applied = build_effective_search_query(query, current_date=current_date)
+        try:
+            requested_max_results = max(1, int(max_results or search_max_results()))
+        except Exception:
+            requested_max_results = search_max_results()
+        capped_max_results = min(requested_max_results, search_max_results())
+        logger.info(
+            "search_tool_called search_provider=%s search_query_original=%s search_current_date=%s search_current_datetime_iso=%s search_timezone=%s search_freshness_applied=%s search_disabled_reason=%s search_pre_ack_spoken=%s requested_max_results=%s capped_max_results=%s",
+            provider,
+            _redact_sensitive_text(query),
+            current_date or "unknown",
+            current_datetime_iso or "unknown",
+            session_timezone or "unknown",
+            freshness_applied,
+            disabled_reason or "none",
+            False,
+            max_results,
+            capped_max_results,
+        )
+        if disabled_reason is not None:
+            logger.warning(
+                "search_disabled_reason=%s search_provider=%s search_query_original=%s search_current_date=%s search_current_datetime_iso=%s search_timezone=%s search_freshness_applied=%s",
+                disabled_reason,
+                provider,
+                _redact_sensitive_text(query),
+                current_date or "unknown",
+                current_datetime_iso or "unknown",
+                session_timezone or "unknown",
+                freshness_applied,
+            )
+            return (
+                f"{SEARCH_DISABLED_MESSAGE} "
+                "Say: I couldn't get a clean result. What exactly should I search for?"
+            )
+
+        results = await internet_search(
+            query=query,
+            max_results=capped_max_results,
+            current_date=current_date,
+            current_datetime_iso=current_datetime_iso,
+            session_timezone=session_timezone,
+        )
+        if not results:
+            logger.info(
+                "search_result_count=0 search_provider=exa search_query_original=%s search_current_date=%s search_current_datetime_iso=%s search_timezone=%s search_freshness_applied=%s search_result_handoff_spoken=%s",
+                _redact_sensitive_text(query),
+                current_date or "unknown",
+                current_datetime_iso or "unknown",
+                session_timezone or "unknown",
+                freshness_applied,
+                False,
+            )
+        else:
+            logger.info(
+                "search_result_count=%s search_provider=exa search_query_original=%s search_current_date=%s search_current_datetime_iso=%s search_timezone=%s search_freshness_applied=%s search_result_dates=%s search_result_handoff_spoken=%s",
+                len(results),
+                _redact_sensitive_text(query),
+                current_date or "unknown",
+                current_datetime_iso or "unknown",
+                session_timezone or "unknown",
+                freshness_applied,
+                ",".join(result.published_date for result in results if result.published_date) or "none",
+                False,
+            )
+        return format_search_results_for_voice(results, current_date=current_date, freshness_applied=freshness_applied)
 
     @function_tool(name="internet_search", description=SEARCH_TOOL_DESCRIPTION)
     async def internet_search_tool(self, query: str, max_results: int = 5) -> str:
@@ -2227,6 +2344,19 @@ async def entrypoint(ctx: JobContext):
     if os.getenv("GRPC_TRACE") is not None or os.getenv("GRPC_VERBOSITY") is not None:
         logger.warning("Low-level gRPC tracing env vars are enabled and may be noisy")
 
+    runtime_context = runtime_context_from_metadata(*_metadata_candidates_from_context(ctx))
+    logger.info(
+        "Runtime context resolved: client_timezone_present=%s client_timezone_value=%s timezone_resolution_source=%s session_timezone=%s runtime_current_date=%s runtime_current_time=%s runtime_datetime_iso=%s runtime_context_injected=%s",
+        runtime_context.client_timezone_present,
+        _redact_sensitive_text(runtime_context.client_timezone_value or "none"),
+        runtime_context.timezone_resolution_source,
+        runtime_context.session_timezone,
+        runtime_context.current_date,
+        runtime_context.current_time,
+        runtime_context.current_datetime_iso,
+        True,
+    )
+
     session_kwargs: dict[str, Any] = {
         "stt": build_stt(),
         "llm": llm,
@@ -2318,11 +2448,11 @@ async def entrypoint(ctx: JobContext):
     session_started_at = 0.0
     if room_options is not None:
         logger.info("Starting session with ai-coustics room_options attached")
-        await session.start(room=ctx.room, agent=LucyAgent(), room_options=room_options)
+        await session.start(room=ctx.room, agent=LucyAgent(runtime_context=runtime_context), room_options=room_options)
         session_started_at = time.monotonic()
     else:
         logger.info("Starting session without ai-coustics room_options")
-        await session.start(room=ctx.room, agent=LucyAgent())
+        await session.start(room=ctx.room, agent=LucyAgent(runtime_context=runtime_context))
         session_started_at = time.monotonic()
 
     greeting_agent_listening_at = 0.0

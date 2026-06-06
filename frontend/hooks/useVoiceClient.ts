@@ -7,6 +7,10 @@ export type VoiceState = "idle" | "initializing" | "connecting" | "connected" | 
 
 type SessionResponse = { room_url: string; token: string };
 
+function getClientTimezone() {
+  return Intl.DateTimeFormat().resolvedOptions().timeZone;
+}
+
 function resolveSessionUrl() {
   const rawApiUrl = process.env.NEXT_PUBLIC_API_URL?.trim().replace(/^['"]|['"]$/g, "");
   if (!rawApiUrl) throw new Error("NEXT_PUBLIC_API_URL is not configured");
@@ -18,7 +22,7 @@ async function createSession(model?: string): Promise<SessionResponse> {
   const response = await fetch(resolveSessionUrl(), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(model ? { model } : {}),
+    body: JSON.stringify({ ...(model ? { model } : {}), client_timezone: getClientTimezone() }),
   });
   if (!response.ok) throw new Error(`Failed to create session (${response.status})`);
   return response.json() as Promise<SessionResponse>;

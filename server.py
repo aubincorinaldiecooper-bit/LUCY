@@ -407,6 +407,7 @@ async def agentmail_webhook(
 
 class SessionRequest(BaseModel):
     model: str | None = None
+    client_timezone: str | None = None
 
 
 @app.get("/health")
@@ -424,10 +425,20 @@ async def create_livekit_session(payload: SessionRequest):
         api_key=os.getenv("LIVEKIT_API_KEY"),
         api_secret=os.getenv("LIVEKIT_API_SECRET"),
     )
-    await lkapi.room.create_room(api.CreateRoomRequest(name=room_name, empty_timeout=600))
+    metadata_payload = {
+        key: value
+        for key, value in {
+            "model": payload.model,
+            "client_timezone": payload.client_timezone,
+        }.items()
+        if value is not None
+    }
+    metadata = json.dumps(metadata_payload)
+    room_request = api.CreateRoomRequest(name=room_name, empty_timeout=600)
+    room_request.metadata = metadata
+    await lkapi.room.create_room(room_request)
 
     grants = api.VideoGrants(room_join=True, room=room_name)
-    metadata = "{}" if payload.model is None else f'{{"model":"{payload.model}"}}'
     token = (
         api.AccessToken(os.getenv("LIVEKIT_API_KEY"), os.getenv("LIVEKIT_API_SECRET"))
         .with_identity(identity)
