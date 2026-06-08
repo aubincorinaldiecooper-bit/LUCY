@@ -115,15 +115,17 @@ def build_llm_context_note(context: TranscriptContext) -> str | None:
     if intent == "numeric_fragment":
         return "The user gave a numeric fragment. Do not assume what it refers to. Ask a short clarification question."
     if intent == "language_request":
-        return "The user likely means a language spoken in Sri Lanka, such as Sinhala or Tamil. Do not say Sri Lankan is a language. Ask whether they mean Sinhala or Tamil."
+        return "The user is asking about language capability. Follow the runtime capability contract: Arche can speak human languages and is currently speaking English. If the requested language is ambiguous, clarify naturally; for Sri Lankan, ask whether they mean Sinhala or Tamil."
     if intent == "voice_change_request":
-        return "The user is reacting to or requesting a different voice. Acknowledge briefly; do not claim the voice changed unless a voice-change tool succeeds."
+        return "The user wants a different voice. Follow the runtime capability contract: Arche can change wording/language/style, but must not claim the actual TTS voice changed unless voice switching succeeded."
     if intent == "tool_request_email":
-        return "The user may want something sent by email. Do not claim an email was sent unless an email tool succeeds. Ask for or confirm missing recipient/content details."
+        return "The user may want something sent by email. Follow the runtime capability contract: do not claim an email was sent unless the email tool succeeds. Ask for missing recipient/confirmation."
     if intent == "tool_request_search":
-        return "The user is asking for lookup/search. If the target is unclear, ask what to search for; otherwise use the existing search tool flow."
+        return "The user is asking for lookup/search. Follow the runtime capability contract: use the existing Exa search tool for current/external facts, avoid guessing, and clarify the search target if unclear."
     if intent == "tool_request_document":
-        return "The user may want a document created. Do not claim a document was created unless a document tool succeeds. Clarify content if needed."
+        return "The user may want a document created. Follow the runtime capability contract: do not claim a document/file was created unless file creation exists in this runtime and succeeds. Offer to draft content if file creation is unavailable."
+    if intent == "date_time_question":
+        return "The user is asking for date or time. Follow the runtime capability contract: answer from runtime context/date-time guard only, do not search, and do not guess from model memory."
     if intent == "frustration_fragment":
         return "The user sounds frustrated or fragmented. Respond calmly and ask one short grounding question instead of assuming the missing context."
     if intent == "profanity_reaction":
@@ -158,7 +160,11 @@ def detect_transcript_context(text: str) -> TranscriptContext:
         clarification = True
         should_replace = False
         confidence = 0.88
-    elif "sri lankan" in lower or "sinhala" in lower or "tamil" in lower and "speak" in lower:
+    elif (
+        "sri lankan" in lower
+        or re.search(r"\b(speak|understand|talk in|use) (other )?(human )?(languages?|german|french|spanish|sinhala|tamil|english)\b", lower)
+        or re.search(r"\bdo you speak (other )?(human )?languages?\b", lower)
+    ):
         intent = "language_request"
         ambiguity = "sri lankan" in lower
         clarification = ambiguity

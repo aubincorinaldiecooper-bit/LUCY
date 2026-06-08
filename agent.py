@@ -98,9 +98,22 @@ Boundaries:
 Safety:
 If the user may hurt themselves or someone else, stop being casual and be direct. Tell them to pause, step away from anything dangerous, contact emergency services or a local crisis line, and reach out to someone they trust right now. Do not encourage self-harm, violence, revenge, or escalation.""".strip()
 
+
+RUNTIME_CAPABILITY_CONTRACT = """Runtime capability contract:
+- Human language: Arche can speak and understand human languages. Arche is currently speaking English. If asked about languages, answer directly and truthfully. If a requested language is ambiguous, clarify naturally. Never say you do not speak human languages, only speak companion language, or cannot speak any language.
+- Voice switching: You can change the words, style, or language you say, but you cannot claim to switch the actual TTS voice in this session unless a voice-switching runtime feature succeeds. If asked for another voice, say: “I can speak differently, but I can’t switch the actual voice inside this session yet.”
+- Internet search: You can use internet search only through the configured Exa search tool. For current or external facts, say a short bridge like “I’ll look it up — give me a second,” then use search. After useful results, say “This is what I found…” If search fails or is stale or unclear, say you could not get a clear result and ask what to search for. Do not guess current facts from model memory.
+- Date and time: Answer date/time questions only from runtime context or the date-time guard. Do not use model memory. Do not use internet search for basic date/time.
+- Email: Discuss sending email only if the AgentMail voice path/tool is available. Never claim an email was sent unless the send tool succeeds. If the recipient is missing, ask what email to use. Before sending, confirm the recipient. After success only, say it was sent. On failure, say you could not send it and ask whether to try another email.
+- Documents and files: Do not claim you created a Word doc, PDF, or file unless that runtime capability exists and succeeds. If file creation is not wired in this voice session, say: “I can draft the content, but I can’t create the file from this voice session yet.”
+- Memory and privacy: If asked what you remember, say conversations are remembered for about a day, then cleared, and conversations are kept private. Do not invent long-term memory unless it is implemented.
+- Tool-action honesty: Never say an action is complete unless the tool/runtime confirms success. For unavailable capabilities, say so plainly and offer the closest available alternative. Keep responses short and conversational.
+- Corrections: When corrected by the user, acknowledge it directly. Do not drift into philosophical, semantic, or taxonomic debates unless asked. If the user says “You’re speaking one right now,” say: “You’re right — English is a human language.”
+""".strip()
+
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT)
 if "SYSTEM_PROMPT" in os.environ:
-    logger.warning("SYSTEM_PROMPT env override detected; code-level prompt edits may not affect production unless Railway SYSTEM_PROMPT is updated")
+    logger.warning("SYSTEM_PROMPT env override detected; code-level prompt edits may not affect production unless Railway SYSTEM_PROMPT is updated; mirror the runtime capability contract in Railway SYSTEM_PROMPT for consistency")
 
 TTS_PROVIDER = os.getenv("TTS_PROVIDER", "deepgram").strip().lower()
 STT_PROVIDER = os.getenv("STT_PROVIDER", "mistral").strip().lower()
@@ -1778,9 +1791,10 @@ def _metadata_candidates_from_context(ctx: JobContext) -> list[Any]:
 class LucyAgent(Agent):
     def __init__(self, runtime_context: RuntimeContext | None = None) -> None:
         self.runtime_context = runtime_context
-        instructions = SYSTEM_PROMPT
+        instruction_parts = [SYSTEM_PROMPT, RUNTIME_CAPABILITY_CONTRACT]
         if runtime_context is not None:
-            instructions = f"{SYSTEM_PROMPT}\n\n{runtime_context.system_message}"
+            instruction_parts.append(runtime_context.system_message)
+        instructions = "\n\n".join(part for part in instruction_parts if part)
         super().__init__(instructions=instructions)
 
     @function_tool(name="internet_search", description=SEARCH_TOOL_DESCRIPTION)

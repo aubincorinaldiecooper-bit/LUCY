@@ -33,19 +33,30 @@ class TranscriptContextDeterministicTests(unittest.TestCase):
         context = self.assert_intent("What language do I want you to... Can you speak Sri Lankan?", "language_request")
         self.assertTrue(context.ambiguity_detected)
 
+    def test_general_human_language_request(self):
+        context = self.assert_intent("Do you speak human languages?", "language_request")
+        self.assertFalse(context.ambiguity_detected)
+        self.assertIn("currently speaking English", context.llm_context_note or "")
+
+    def test_specific_language_request(self):
+        context = self.assert_intent("Can you speak German?", "language_request")
+        self.assertFalse(context.ambiguity_detected)
+
     def test_choice_delegation(self):
         context = self.assert_intent("Anyone pick anyone that works for you.", "choice_delegation")
         self.assertTrue(context.ambiguity_detected)
 
     def test_voice_change_request(self):
-        self.assert_intent("Speak to you in another voice. I don't want to speak to this voice anymore.", "voice_change_request")
+        context = self.assert_intent("Speak to you in another voice. I don't want to speak to this voice anymore.", "voice_change_request")
+        self.assertIn("must not claim the actual TTS voice changed", context.llm_context_note or "")
 
     def test_profanity_reaction(self):
         context = self.assert_intent("Oh, fucking Uber.", "profanity_reaction")
         self.assertTrue(context.ambiguity_detected)
 
     def test_date_time_question(self):
-        self.assert_intent("What time is it right now?", "date_time_question")
+        context = self.assert_intent("What time is it right now?", "date_time_question")
+        self.assertIn("runtime context/date-time guard", context.llm_context_note or "")
 
     def test_email_request(self):
         context = self.assert_intent("Can you send me an email?", "tool_request_email")
@@ -58,6 +69,7 @@ class TranscriptContextDeterministicTests(unittest.TestCase):
     def test_document_request(self):
         context = self.assert_intent("Make a Word doc with that.", "tool_request_document")
         self.assertTrue(context.ambiguity_detected)
+        self.assertIn("do not claim a document/file was created", context.llm_context_note or "")
 
     def test_backchannel(self):
         self.assert_intent("Yeah.", "greeting_or_backchannel")
