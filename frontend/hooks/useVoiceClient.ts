@@ -7,6 +7,10 @@ export type VoiceState = "idle" | "initializing" | "connecting" | "connected" | 
 
 type SessionResponse = { room_url: string; token: string };
 
+function getClientTimezone() {
+  return Intl.DateTimeFormat().resolvedOptions().timeZone;
+}
+
 function resolveSessionUrl() {
   const rawApiUrl = process.env.NEXT_PUBLIC_API_URL?.trim().replace(/^['"]|['"]$/g, "");
   if (!rawApiUrl) throw new Error("NEXT_PUBLIC_API_URL is not configured");
@@ -18,7 +22,7 @@ async function createSession(model?: string): Promise<SessionResponse> {
   const response = await fetch(resolveSessionUrl(), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(model ? { model } : {}),
+    body: JSON.stringify({ ...(model ? { model } : {}), client_timezone: getClientTimezone() }),
   });
   if (!response.ok) throw new Error(`Failed to create session (${response.status})`);
   return response.json() as Promise<SessionResponse>;
@@ -28,6 +32,7 @@ export function useVoiceClient() {
   const [state, setState] = useState<VoiceState>("idle");
   const [isMuted, setIsMuted] = useState(false);
   const roomRef = useRef<Room | null>(null);
+  const connectAttemptRef = useRef(0);
   const remoteAudioElsRef = useRef<Set<HTMLMediaElement>>(new Set());
   const audioContextRef = useRef<AudioContext | null>(null);
   const gainNodeRef = useRef<GainNode | null>(null);
@@ -119,8 +124,14 @@ export function useVoiceClient() {
   }, [cleanupAudioNodeForElement, teardownAudioGainResources]);
 
   const disconnect = useCallback(async () => {
+    connectAttemptRef.current += 1;
     const room = roomRef.current;
-    if (!room) return;
+    if (!room) {
+      clearRemoteAudioElements();
+      setState("idle");
+      setIsMuted(false);
+      return;
+    }
     await room.disconnect();
     clearRemoteAudioElements();
     roomRef.current = null;
@@ -130,9 +141,12 @@ export function useVoiceClient() {
 
   const connect = useCallback(async (model?: string) => {
     if (roomRef.current) return;
+    const attemptId = connectAttemptRef.current + 1;
+    connectAttemptRef.current = attemptId;
     setState("initializing");
     try {
       const session = await createSession(model);
+      if (connectAttemptRef.current !== attemptId) return;
       const room = new Room();
       roomRef.current = room;
       room.on(RoomEvent.Connected, () => setState(isMuted ? "muted" : "connected"));
@@ -166,6 +180,10 @@ export function useVoiceClient() {
       });
       setState("connecting");
       await room.connect(session.room_url, session.token);
+      if (connectAttemptRef.current !== attemptId) {
+        await room.disconnect();
+        return;
+      }
       if (typeof room.startAudio === "function") {
         await room.startAudio().catch((err) => {
           console.warn("Failed to start room audio playback", err);
