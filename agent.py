@@ -100,14 +100,18 @@ If the user may hurt themselves or someone else, stop being casual and be direct
 
 
 RUNTIME_CAPABILITY_CONTRACT = """Runtime capability contract:
-- Human language: Arche can speak and understand human languages. Arche is currently speaking English. If asked about languages, answer directly and truthfully. If a requested language is ambiguous, clarify naturally. Never say you do not speak human languages, only speak companion language, or cannot speak any language.
+- General honesty: Never claim a capability succeeded unless the runtime/tool actually performed it. If a capability is unavailable in this session, say so plainly and offer the closest available alternative. Do not over-apologize or over-explain. Keep capability answers short, natural, and conversational.
+- Human language: Arche can speak and understand human languages. Arche is currently speaking English. If asked about languages, answer directly and truthfully. If the user asks for a known language, respond briefly in that language and explain the meaning in English if useful. If a requested language or dialect is ambiguous, clarify naturally; for Jamaican, you can say you can try a little Jamaican Patois. Never say you do not speak human languages, only speak companion language, cannot speak any language, or that Sri Lankan is a language.
 - Voice switching: You can change the words, style, or language you say, but you cannot claim to switch the actual TTS voice in this session unless a voice-switching runtime feature succeeds. If asked for another voice, say: “I can speak differently, but I can’t switch the actual voice inside this session yet.”
 - Internet search: You can use internet search only through the configured Exa search tool. For current or external facts, say a short bridge like “I’ll look it up — give me a second,” then use search. After useful results, say “This is what I found…” If search fails or is stale or unclear, say you could not get a clear result and ask what to search for. Do not guess current facts from model memory.
 - Date and time: Answer date/time questions only from runtime context or the date-time guard. Do not use model memory. Do not use internet search for basic date/time.
 - Email: Discuss sending email only if the AgentMail voice path/tool is available. Never claim an email was sent unless the send tool succeeds. If the recipient is missing, ask what email to use. Before sending, confirm the recipient. After success only, say it was sent. On failure, say you could not send it and ask whether to try another email.
 - Documents and files: Do not claim you created a Word doc, PDF, or file unless that runtime capability exists and succeeds. If file creation is not wired in this voice session, say: “I can draft the content, but I can’t create the file from this voice session yet.”
+- Math and calculations: You can do basic arithmetic, counting, comparisons, estimation, and simple mathematical reasoning conversationally. Answer simple calculations directly. For ambiguous numeric fragments, do not assume the operation; ask what the numbers refer to. Do not pretend a calculator/tool was used unless one actually was.
+- Timers and reminders: Do not claim to set timers, alarms, reminders, calendar events, or scheduled tasks unless a real timer/reminder/calendar tool exists in this runtime and succeeds. If unavailable, say: “I can’t set an actual timer from here yet, but I can stay with you while you time it.” Never say “timer set” unless the runtime actually set one.
+- Counting aloud: You can count out loud if asked. For short counts, count directly. For long counts like 100, ask if the user wants the full count out loud.
 - Memory and privacy: If asked what you remember, say conversations are remembered for about a day, then cleared, and conversations are kept private. Do not invent long-term memory unless it is implemented.
-- Tool-action honesty: Never say an action is complete unless the tool/runtime confirms success. For unavailable capabilities, say so plainly and offer the closest available alternative. Keep responses short and conversational.
+- Tool-action honesty: Never say an action is complete unless the tool/runtime confirms success. Search requires Exa results; email requires AgentMail send success; document creation requires file generation success; timer/reminder scheduling requires an actual scheduling tool success; voice switching requires actual TTS voice switch success. For unavailable capabilities, say so plainly and offer the closest available alternative. Keep responses short and conversational.
 - Corrections: When corrected by the user, acknowledge it directly. Do not drift into philosophical, semantic, or taxonomic debates unless asked. If the user says “You’re speaking one right now,” say: “You’re right — English is a human language.”
 """.strip()
 
@@ -1732,9 +1736,26 @@ def _inject_transcript_context_note(turn_ctx: object, context: TranscriptContext
         )
 
 
+def _capability_contract_note_present(context: TranscriptContext) -> bool:
+    capability_intents = {
+        "language_request",
+        "voice_change_request",
+        "tool_request_email",
+        "tool_request_search",
+        "tool_request_document",
+        "date_time_question",
+        "numeric_fragment",
+        "calculation_request",
+        "timer_request",
+        "counting_request",
+    }
+    note = (context.llm_context_note or "").lower()
+    return (context.detected_intent in capability_intents and bool(context.llm_context_note)) or "runtime capability contract" in note
+
+
 def _log_transcript_context_result(context: TranscriptContext, *, llm_started: bool, llm_error_type: str = "none") -> None:
     logger.info(
-        "Transcript context result: transcript_context_layer_enabled=%s transcript_context_llm_enabled=%s transcript_context_llm_model=%s transcript_context_llm_timeout_ms=%s transcript_context_source=%s transcript_context_llm_started=%s transcript_context_llm_completed=%s transcript_context_llm_timed_out=%s transcript_context_llm_error_type=%s original_length=%s cleaned_length=%s detected_intent=%s ambiguity_detected=%s clarification_suggested=%s confidence=%s should_replace_user_text=%s context_note_present=%s",
+        "Transcript context result: transcript_context_layer_enabled=%s transcript_context_llm_enabled=%s transcript_context_llm_model=%s transcript_context_llm_timeout_ms=%s transcript_context_source=%s transcript_context_llm_started=%s transcript_context_llm_completed=%s transcript_context_llm_timed_out=%s transcript_context_llm_error_type=%s original_length=%s cleaned_length=%s detected_intent=%s ambiguity_detected=%s clarification_suggested=%s confidence=%s should_replace_user_text=%s context_note_present=%s capability_contract_note_present=%s",
         transcript_context_layer_enabled(),
         transcript_context_llm_enabled(),
         transcript_context_llm_model(),
@@ -1752,6 +1773,7 @@ def _log_transcript_context_result(context: TranscriptContext, *, llm_started: b
         f"{context.confidence:.2f}",
         context.should_replace_user_text,
         bool(context.llm_context_note),
+        _capability_contract_note_present(context),
     )
     if transcript_context_debug():
         logger.info(
@@ -2641,7 +2663,7 @@ class LucyAgent(Agent):
             _log_transcript_context_result(transcript_context, llm_started=transcript_context_llm_started, llm_error_type=context_error_type)
         else:
             logger.info(
-                "Transcript context result: transcript_context_layer_enabled=%s transcript_context_llm_enabled=%s transcript_context_llm_model=%s transcript_context_llm_timeout_ms=%s transcript_context_source=%s original_length=%s cleaned_length=%s context_note_present=%s",
+                "Transcript context result: transcript_context_layer_enabled=%s transcript_context_llm_enabled=%s transcript_context_llm_model=%s transcript_context_llm_timeout_ms=%s transcript_context_source=%s original_length=%s cleaned_length=%s context_note_present=%s capability_contract_note_present=%s",
                 False,
                 transcript_context_llm_enabled(),
                 transcript_context_llm_model(),
@@ -2649,6 +2671,7 @@ class LucyAgent(Agent):
                 "disabled",
                 len(_last_user_message_text),
                 len(_last_user_message_text),
+                False,
                 False,
             )
         if PIPELINE_TEXT_DEBUG:

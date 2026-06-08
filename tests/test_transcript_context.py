@@ -23,6 +23,32 @@ class TranscriptContextDeterministicTests(unittest.TestCase):
         self.assertTrue(context.ambiguity_detected)
         self.assertTrue(context.clarification_suggested)
         self.assertIn("numeric fragment", context.llm_context_note or "")
+        self.assertIn("do not assume", context.llm_context_note or "")
+
+    def test_calculation_request_what_is_plus(self):
+        context = self.assert_intent("What is 1968 plus 746?", "calculation_request")
+        self.assertFalse(context.ambiguity_detected)
+        self.assertIn("answer directly", context.llm_context_note or "")
+
+    def test_calculation_request_add(self):
+        context = self.assert_intent("Add 1968 and 746.", "calculation_request")
+        self.assertFalse(context.ambiguity_detected)
+
+    def test_timer_request(self):
+        context = self.assert_intent("Set a timer for 10 minutes.", "timer_request")
+        self.assertFalse(context.ambiguity_detected)
+        self.assertIn("do not claim a timer/reminder was set", context.llm_context_note or "")
+
+    def test_reminder_request(self):
+        context = self.assert_intent("Remind me in 10 minutes.", "timer_request")
+        self.assertFalse(context.ambiguity_detected)
+
+    def test_counting_request_long(self):
+        context = self.assert_intent("Count to 100.", "counting_request")
+        self.assertIn("long counts", context.llm_context_note or "")
+
+    def test_counting_request_short(self):
+        self.assert_intent("Count to ten.", "counting_request")
 
     def test_sri_lankan_language_request(self):
         context = self.assert_intent("Can you speak Sri Lankan?", "language_request")
@@ -41,6 +67,11 @@ class TranscriptContextDeterministicTests(unittest.TestCase):
     def test_specific_language_request(self):
         context = self.assert_intent("Can you speak German?", "language_request")
         self.assertFalse(context.ambiguity_detected)
+
+    def test_jamaican_language_request(self):
+        context = self.assert_intent("Do you know how to speak Jamaican?", "language_request")
+        self.assertFalse(context.ambiguity_detected)
+        self.assertIn("Jamaican Patois", context.llm_context_note or "")
 
     def test_choice_delegation(self):
         context = self.assert_intent("Anyone pick anyone that works for you.", "choice_delegation")

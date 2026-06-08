@@ -23,6 +23,9 @@ ALLOWED_INTENTS = {
     "greeting_or_backchannel",
     "stop_or_cancel_request",
     "date_time_question",
+    "calculation_request",
+    "timer_request",
+    "counting_request",
     "profanity_reaction",
     "reference_to_prior_context",
     "unknown",
@@ -113,9 +116,9 @@ def _is_backchannel(text: str) -> bool:
 def build_llm_context_note(context: TranscriptContext) -> str | None:
     intent = context.detected_intent
     if intent == "numeric_fragment":
-        return "The user gave a numeric fragment. Do not assume what it refers to. Ask a short clarification question."
+        return "The user gave a numeric fragment. Follow the runtime capability contract: do not assume what it means or invent an operation. Ask a short clarification question."
     if intent == "language_request":
-        return "The user is asking about language capability. Follow the runtime capability contract: Arche can speak human languages and is currently speaking English. If the requested language is ambiguous, clarify naturally; for Sri Lankan, ask whether they mean Sinhala or Tamil."
+        return "The user is asking about language capability. Follow the runtime capability contract: Arche can speak human languages and is currently speaking English. If the requested language is ambiguous, clarify naturally; for Sri Lankan, ask whether they mean Sinhala or Tamil; for Jamaican, offer Jamaican Patois briefly."
     if intent == "voice_change_request":
         return "The user wants a different voice. Follow the runtime capability contract: Arche can change wording/language/style, but must not claim the actual TTS voice changed unless voice switching succeeded."
     if intent == "tool_request_email":
@@ -126,6 +129,12 @@ def build_llm_context_note(context: TranscriptContext) -> str | None:
         return "The user may want a document created. Follow the runtime capability contract: do not claim a document/file was created unless file creation exists in this runtime and succeeds. Offer to draft content if file creation is unavailable."
     if intent == "date_time_question":
         return "The user is asking for date or time. Follow the runtime capability contract: answer from runtime context/date-time guard only, do not search, and do not guess from model memory."
+    if intent == "calculation_request":
+        return "The user is asking for a calculation. Follow the runtime capability contract: answer directly if it is simple. If ambiguous, ask what operation they want. Do not pretend a calculator/tool was used unless one was."
+    if intent == "timer_request":
+        return "The user wants a timer or reminder. Follow the runtime capability contract: do not claim a timer/reminder was set unless a real timer/reminder tool succeeds. If unavailable, say you cannot set an actual timer from here yet."
+    if intent == "counting_request":
+        return "The user asked for counting. Follow the runtime capability contract: for short counts, count directly; for long counts, ask if they want the full count out loud."
     if intent == "frustration_fragment":
         return "The user sounds frustrated or fragmented. Respond calmly and ask one short grounding question instead of assuming the missing context."
     if intent == "profanity_reaction":
@@ -154,6 +163,12 @@ def detect_transcript_context(text: str) -> TranscriptContext:
         ambiguity = True
         clarification = True
         confidence = 0.3
+    elif re.search(r"\b(what is|what's|calculate|add|plus|minus|subtract|times|multiply|multiplied by|divide|divided by|percent of|percentage of)\b", lower) and any(ch.isdigit() for ch in lower):
+        intent = "calculation_request"
+        ambiguity = False
+        clarification = False
+        should_replace = False
+        confidence = 0.9
     elif re.fullmatch(r"[\d\s,.-]+(?:and\s+)?[\d\s,.-]+", lower) and any(ch.isdigit() for ch in lower):
         intent = "numeric_fragment"
         ambiguity = True
@@ -162,7 +177,7 @@ def detect_transcript_context(text: str) -> TranscriptContext:
         confidence = 0.88
     elif (
         "sri lankan" in lower
-        or re.search(r"\b(speak|understand|talk in|use) (other )?(human )?(languages?|german|french|spanish|sinhala|tamil|english)\b", lower)
+        or re.search(r"\b(speak|understand|talk in|use) (other )?(human )?(languages?|german|french|spanish|sinhala|tamil|english|jamaican|patois)\b", lower)
         or re.search(r"\bdo you speak (other )?(human )?languages?\b", lower)
     ):
         intent = "language_request"
@@ -198,6 +213,18 @@ def detect_transcript_context(text: str) -> TranscriptContext:
         intent = "date_time_question"
         confidence = 0.92
         should_replace = False
+    elif re.search(r"\b(set|start) (a )?(timer|alarm)\b|\bremind me\b|\bset (a )?reminder\b|\bcalendar event\b", lower):
+        intent = "timer_request"
+        ambiguity = not any(ch.isdigit() for ch in lower)
+        clarification = ambiguity
+        should_replace = False
+        confidence = 0.88
+    elif re.search(r"\bcount (to|up to|down from)\b", lower):
+        intent = "counting_request"
+        ambiguity = False
+        clarification = False
+        should_replace = False
+        confidence = 0.88
     elif _is_backchannel(lower):
         intent = "greeting_or_backchannel"
         confidence = 0.9
