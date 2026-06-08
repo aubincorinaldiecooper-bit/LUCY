@@ -434,6 +434,15 @@ async def create_livekit_session(payload: SessionRequest):
         if value is not None
     }
     metadata = json.dumps(metadata_payload)
+    metadata_keys = sorted(metadata_payload.keys())
+    logger.info(
+        "LiveKit session metadata prepared: client_timezone_present=%s client_timezone_value=%s metadata_payload_keys=%s room_metadata_includes_client_timezone=%s token_metadata_includes_client_timezone=%s",
+        bool(payload.client_timezone),
+        payload.client_timezone or "none",
+        metadata_keys,
+        "client_timezone" in metadata_payload,
+        "client_timezone" in metadata_payload,
+    )
     room_request = api.CreateRoomRequest(name=room_name, empty_timeout=600)
     room_request.metadata = metadata
     await lkapi.room.create_room(room_request)

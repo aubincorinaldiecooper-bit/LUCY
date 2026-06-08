@@ -33,7 +33,7 @@ from internet_search import (
     search_provider,
     search_timeout_seconds,
 )
-from runtime_context import RuntimeContext, runtime_context_from_metadata
+from runtime_context import RuntimeContext, answer_datetime_intent, detect_datetime_intent, runtime_context_from_metadata
 
 
 load_dotenv()
@@ -133,6 +133,7 @@ _pending_llm_fallback_text: str | None = None
 _last_llm_completed_text = ""
 _last_llm_completed_text_hash = "empty"
 _last_llm_completed_at = 0.0
+_last_user_message_text = ""
 _last_tts_node_entered_at = 0.0
 _last_tts_received_text_hash = "empty"
 _last_hume_request_start_at = 0.0
@@ -1593,6 +1594,66 @@ async def health() -> JSONResponse:
     return JSONResponse({"status": "ok"})
 
 
+
+def _safe_metadata_preview(value: Any) -> str:
+    if value is None:
+        return "none"
+    return _redact_sensitive_text(value)[:500]
+
+
+def _metadata_keys(value: Any) -> list[str]:
+    if isinstance(value, dict):
+        return sorted(str(key) for key in value.keys())
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except Exception:
+            return []
+        if isinstance(parsed, dict):
+            return sorted(str(key) for key in parsed.keys())
+    return []
+
+
+def _metadata_debug_entries_from_context(ctx: JobContext) -> list[tuple[str, Any]]:
+    entries: list[tuple[str, Any]] = []
+    for attr_name in ("job", "room"):
+        obj = _safe_attr(ctx, attr_name)
+        metadata = _safe_attr(obj, "metadata")
+        entries.append((f"{attr_name}.metadata", metadata))
+
+    job = _safe_attr(ctx, "job")
+    for attr_name in ("participant", "participant_info"):
+        participant = _safe_attr(job, attr_name)
+        metadata = _safe_attr(participant, "metadata")
+        entries.append((f"job.{attr_name}.metadata", metadata))
+
+    room = _safe_attr(ctx, "room")
+    remote_participants = _safe_attr(room, "remote_participants")
+    if isinstance(remote_participants, dict):
+        for participant_id, participant in remote_participants.items():
+            metadata = _safe_attr(participant, "metadata")
+            entries.append((f"room.remote_participants.{participant_id}.metadata", metadata))
+    return entries
+
+
+def _extract_latest_user_text_from_chat_ctx(chat_ctx: object) -> str:
+    messages = getattr(chat_ctx, "messages", None)
+    if not messages:
+        return _last_user_message_text
+    try:
+        iterable = list(messages)
+    except Exception:
+        return _last_user_message_text
+    for message in reversed(iterable):
+        role = str(getattr(message, "role", "")).lower()
+        if role and role != "user":
+            continue
+        text = _extract_text_for_debug(message).strip()
+        if text:
+            return text
+    return _last_user_message_text
+
+
 def _metadata_candidates_from_context(ctx: JobContext) -> list[Any]:
     candidates: list[Any] = []
     for attr_name in ("job", "room"):
@@ -2018,6 +2079,50 @@ class LucyAgent(Agent):
         return _direct_or_plugin_or_default()
 
     def llm_node(self, chat_ctx, tools, model_settings):
+        datetime_user_text = _extract_latest_user_text_from_chat_ctx(chat_ctx)
+        datetime_intent = detect_datetime_intent(datetime_user_text)
+        if datetime_intent and self.runtime_context is not None:
+            async def _datetime_guard_stream():
+                global _last_llm_start_at, _last_llm_first_token_at, _last_llm_complete_at, _last_llm_stream_status, _last_llm_timeout_stage, _last_llm_fallback_response_used, _pending_llm_fallback_text, _last_llm_completed_text, _last_llm_completed_text_hash, _last_llm_completed_at, _last_generic_llm_fallback_used
+                answer = answer_datetime_intent(self.runtime_context, datetime_intent)
+                now = time.monotonic()
+                _last_llm_start_at = now
+                _last_llm_first_token_at = now
+                _last_llm_complete_at = now
+                _last_llm_completed_at = now
+                _last_llm_stream_status = "datetime_guard"
+                _last_llm_timeout_stage = "none"
+                _last_llm_fallback_response_used = False
+                _last_generic_llm_fallback_used = False
+                _pending_llm_fallback_text = None
+                _last_llm_completed_text = answer
+                _last_llm_completed_text_hash = _text_hash(answer)
+                logger.info(
+                    "Date/time guard triggered: datetime_guard_triggered=%s datetime_intent=%s datetime_answer_source=runtime_context search_called=%s session_timezone=%s runtime_current_date=%s runtime_current_time=%s text_length=%s",
+                    True,
+                    datetime_intent,
+                    False,
+                    self.runtime_context.session_timezone,
+                    self.runtime_context.current_date,
+                    self.runtime_context.current_time,
+                    len(answer),
+                )
+                yield answer
+                logger.info(
+                    "LLM stream ended: status=%s first_token_seen=%s chunk_count=%s text_length=%s fallback_used=%s timeout_stage=%s search_in_progress=%s search_tool_called=%s search_failed=%s generic_llm_fallback_used=%s",
+                    _last_llm_stream_status,
+                    True,
+                    1,
+                    len(answer),
+                    False,
+                    "none",
+                    _search_in_progress,
+                    _search_tool_called,
+                    _search_failed,
+                    False,
+                )
+            return _datetime_guard_stream()
+
         stream = Agent.default.llm_node(self, chat_ctx, tools, model_settings)
 
         async def _llm_stream():
@@ -2388,7 +2493,7 @@ class LucyAgent(Agent):
         return _llm_stream()
 
     async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
-        global _last_turn_committed_at, _last_llm_start_at, _last_llm_first_token_at, _last_llm_complete_at, _last_llm_stream_status, _last_llm_timeout_stage, _last_llm_fallback_response_used, _last_llm_completed_text, _last_llm_completed_text_hash, _last_llm_completed_at, _last_tts_received_text_hash
+        global _last_turn_committed_at, _last_llm_start_at, _last_llm_first_token_at, _last_llm_complete_at, _last_llm_stream_status, _last_llm_timeout_stage, _last_llm_fallback_response_used, _last_llm_completed_text, _last_llm_completed_text_hash, _last_llm_completed_at, _last_tts_received_text_hash, _last_user_message_text
         _last_turn_committed_at = time.monotonic()
         _last_llm_start_at = 0.0
         _last_llm_first_token_at = None
@@ -2399,9 +2504,10 @@ class LucyAgent(Agent):
         _last_llm_completed_text = ""
         _last_llm_completed_text_hash = "empty"
         _last_llm_completed_at = 0.0
+        _last_user_message_text = _extract_text_for_debug(new_message).strip()
         _last_tts_received_text_hash = "empty"
         if PIPELINE_TEXT_DEBUG:
-            msg_str = _extract_text_for_debug(new_message)
+            msg_str = _last_user_message_text
             messages = getattr(turn_ctx, "messages", None)
             message_count = "n/a"
             if messages is not None:
@@ -2641,10 +2747,21 @@ async def entrypoint(ctx: JobContext):
     if os.getenv("GRPC_TRACE") is not None or os.getenv("GRPC_VERBOSITY") is not None:
         logger.warning("Low-level gRPC tracing env vars are enabled and may be noisy")
 
-    runtime_context = runtime_context_from_metadata(*_metadata_candidates_from_context(ctx))
+    metadata_debug_entries = _metadata_debug_entries_from_context(ctx)
+    for metadata_label, metadata_value in metadata_debug_entries:
+        logger.info(
+            "Runtime metadata candidate: metadata_source=%s metadata_present=%s metadata_keys=%s raw_metadata=%s",
+            metadata_label,
+            bool(metadata_value),
+            _metadata_keys(metadata_value),
+            _safe_metadata_preview(metadata_value),
+        )
+    metadata_candidates = [metadata_value for _, metadata_value in metadata_debug_entries if metadata_value]
+    runtime_context = runtime_context_from_metadata(*metadata_candidates)
     logger.info(
-        "Runtime context resolved: client_timezone_present=%s client_timezone_value=%s timezone_resolution_source=%s session_timezone=%s runtime_current_date=%s runtime_current_time=%s runtime_datetime_iso=%s runtime_context_injected=%s",
+        "Runtime context resolved: client_timezone_present=%s client_timezone_value=%s extracted_client_timezone=%s timezone_resolution_source=%s session_timezone=%s runtime_current_date=%s runtime_current_time=%s runtime_datetime_iso=%s runtime_context_injected=%s",
         runtime_context.client_timezone_present,
+        _redact_sensitive_text(runtime_context.client_timezone_value or "none"),
         _redact_sensitive_text(runtime_context.client_timezone_value or "none"),
         runtime_context.timezone_resolution_source,
         runtime_context.session_timezone,

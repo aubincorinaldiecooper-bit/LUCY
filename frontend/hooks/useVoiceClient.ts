@@ -19,10 +19,18 @@ function resolveSessionUrl() {
 }
 
 async function createSession(model?: string): Promise<SessionResponse> {
+  const client_timezone = getClientTimezone();
+  const payload = { ...(model ? { model } : {}), client_timezone };
+  if (process.env.NODE_ENV === "development") {
+    console.debug("LiveKit session timezone payload", {
+      client_timezone,
+      session_payload_keys: Object.keys(payload),
+    });
+  }
   const response = await fetch(resolveSessionUrl(), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ...(model ? { model } : {}), client_timezone: getClientTimezone() }),
+    body: JSON.stringify(payload),
   });
   if (!response.ok) throw new Error(`Failed to create session (${response.status})`);
   return response.json() as Promise<SessionResponse>;
