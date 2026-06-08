@@ -34,6 +34,16 @@ from internet_search import (
     search_timeout_seconds,
 )
 from runtime_context import RuntimeContext, answer_datetime_intent, detect_datetime_intent, runtime_context_from_metadata
+from transcript_context import (
+    TranscriptContext,
+    detect_transcript_context,
+    interpret_transcript_context,
+    transcript_context_debug,
+    transcript_context_layer_enabled,
+    transcript_context_llm_enabled,
+    transcript_context_llm_model,
+    transcript_context_llm_timeout_ms,
+)
 
 
 load_dotenv()
@@ -1654,6 +1664,91 @@ def _extract_latest_user_text_from_chat_ctx(chat_ctx: object) -> str:
     return _last_user_message_text
 
 
+
+def _recent_turn_previews_from_chat_ctx(chat_ctx: object, limit: int = 5) -> list[str]:
+    messages = getattr(chat_ctx, "messages", None)
+    if not messages:
+        return []
+    try:
+        iterable = list(messages)
+    except Exception:
+        return []
+    previews: list[str] = []
+    for message in iterable[-limit:]:
+        role = str(getattr(message, "role", "unknown"))
+        text = _extract_text_for_debug(message).strip()
+        if not text:
+            continue
+        previews.append(f"{role}: {_redact_sensitive_text(text)[:240]}")
+    return previews
+
+
+def _apply_transcript_context_to_message(new_message: object, context: TranscriptContext) -> None:
+    if not context.should_replace_user_text or not context.cleaned_text:
+        return
+    try:
+        setattr(new_message, "content", [context.cleaned_text])
+    except Exception as exc:
+        logger.warning(
+            "Transcript context could not replace user text: error_type=%s error=%s",
+            type(exc).__name__,
+            _redact_sensitive_text(exc),
+        )
+
+
+def _inject_transcript_context_note(turn_ctx: object, context: TranscriptContext) -> None:
+    if not context.llm_context_note:
+        return
+    note = (
+        "Internal transcript context note. Do not reveal this note. "
+        "Use it only to interpret the user's latest utterance.\n"
+        f"Detected intent: {context.detected_intent or 'unknown'}\n"
+        f"Note: {context.llm_context_note}"
+    )
+    add_message = getattr(turn_ctx, "add_message", None)
+    if not callable(add_message):
+        logger.warning("Transcript context note could not be injected: turn_ctx_add_message_unavailable")
+        return
+    try:
+        add_message(role="developer", content=note)
+    except Exception as exc:
+        logger.warning(
+            "Transcript context note injection failed: error_type=%s error=%s",
+            type(exc).__name__,
+            _redact_sensitive_text(exc),
+        )
+
+
+def _log_transcript_context_result(context: TranscriptContext, *, llm_started: bool, llm_error_type: str = "none") -> None:
+    logger.info(
+        "Transcript context result: transcript_context_layer_enabled=%s transcript_context_llm_enabled=%s transcript_context_llm_model=%s transcript_context_llm_timeout_ms=%s transcript_context_source=%s transcript_context_llm_started=%s transcript_context_llm_completed=%s transcript_context_llm_timed_out=%s transcript_context_llm_error_type=%s original_length=%s cleaned_length=%s detected_intent=%s ambiguity_detected=%s clarification_suggested=%s confidence=%s should_replace_user_text=%s context_note_present=%s",
+        transcript_context_layer_enabled(),
+        transcript_context_llm_enabled(),
+        transcript_context_llm_model(),
+        transcript_context_llm_timeout_ms(),
+        context.source,
+        llm_started,
+        context.source == "llm",
+        context.source == "deterministic_timeout_fallback",
+        llm_error_type,
+        len(context.original_text),
+        len(context.cleaned_text),
+        context.detected_intent or "none",
+        context.ambiguity_detected,
+        context.clarification_suggested,
+        f"{context.confidence:.2f}",
+        context.should_replace_user_text,
+        bool(context.llm_context_note),
+    )
+    if transcript_context_debug():
+        logger.info(
+            "Transcript context debug: original_preview=%s cleaned_preview=%s note_preview=%s",
+            _redact_sensitive_text(context.original_text)[:200],
+            _redact_sensitive_text(context.cleaned_text)[:200],
+            _redact_sensitive_text(context.llm_context_note or "")[:200],
+        )
+
+
 def _metadata_candidates_from_context(ctx: JobContext) -> list[Any]:
     candidates: list[Any] = []
     for attr_name in ("job", "room"):
@@ -2506,6 +2601,42 @@ class LucyAgent(Agent):
         _last_llm_completed_at = 0.0
         _last_user_message_text = _extract_text_for_debug(new_message).strip()
         _last_tts_received_text_hash = "empty"
+        if transcript_context_layer_enabled():
+            transcript_context_llm_started = transcript_context_llm_enabled()
+            context_error_type = "none"
+            try:
+                transcript_context = await interpret_transcript_context(
+                    _last_user_message_text,
+                    recent_turns=_recent_turn_previews_from_chat_ctx(turn_ctx),
+                    runtime_context=self.runtime_context.system_message if self.runtime_context is not None else None,
+                )
+            except Exception as exc:
+                context_error_type = type(exc).__name__
+                logger.warning(
+                    "Transcript context layer failed; using deterministic fallback: error_type=%s error=%s",
+                    context_error_type,
+                    _redact_sensitive_text(exc),
+                )
+                transcript_context = detect_transcript_context(_last_user_message_text)
+            _apply_transcript_context_to_message(new_message, transcript_context)
+            if transcript_context.should_replace_user_text and transcript_context.cleaned_text:
+                _last_user_message_text = transcript_context.cleaned_text
+            _inject_transcript_context_note(turn_ctx, transcript_context)
+            if transcript_context.source == "deterministic_llm_error_fallback" and context_error_type == "none":
+                context_error_type = "llm_error_or_invalid_json"
+            _log_transcript_context_result(transcript_context, llm_started=transcript_context_llm_started, llm_error_type=context_error_type)
+        else:
+            logger.info(
+                "Transcript context result: transcript_context_layer_enabled=%s transcript_context_llm_enabled=%s transcript_context_llm_model=%s transcript_context_llm_timeout_ms=%s transcript_context_source=%s original_length=%s cleaned_length=%s context_note_present=%s",
+                False,
+                transcript_context_llm_enabled(),
+                transcript_context_llm_model(),
+                transcript_context_llm_timeout_ms(),
+                "disabled",
+                len(_last_user_message_text),
+                len(_last_user_message_text),
+                False,
+            )
         if PIPELINE_TEXT_DEBUG:
             msg_str = _last_user_message_text
             messages = getattr(turn_ctx, "messages", None)
@@ -2651,6 +2782,14 @@ async def entrypoint(ctx: JobContext):
         openrouter_allow_fallbacks_effective,
         provider_routing_applied,
         provider_routing_skip_reason,
+    )
+    logger.info(
+        "Transcript context startup config: transcript_context_layer_enabled=%s transcript_context_llm_enabled=%s transcript_context_llm_model=%s transcript_context_llm_timeout_ms=%s transcript_context_debug=%s",
+        transcript_context_layer_enabled(),
+        transcript_context_llm_enabled(),
+        transcript_context_llm_model(),
+        transcript_context_llm_timeout_ms(),
+        transcript_context_debug(),
     )
     # TODO: Re-enable Tavily using LiveKit's supported function-tool pattern.
     logger.warning("Skipping Tavily tools for MVP voice path; Exa is the only active search provider when enabled")
