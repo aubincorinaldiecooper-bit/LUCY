@@ -41,7 +41,7 @@ export function EarlyAccessModal({ isOpen, onClose }: { isOpen: boolean; onClose
                 <X size={14} />
               </button>
             </div>
-            <div className="flex flex-1 flex-col px-6 py-8 sm:px-10 sm:py-9">
+            <div className="flex flex-1 flex-col px-6 py-7 sm:px-10 sm:py-8">
               {submitted ? (
                 <motion.div initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }} className="py-8 text-center">
                   <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-full bg-[#34C759]/10 text-[#34C759]">
@@ -53,21 +53,14 @@ export function EarlyAccessModal({ isOpen, onClose }: { isOpen: boolean; onClose
                 </motion.div>
               ) : (
                 <>
-                  <h3 className="mb-3 text-[30px] font-bold leading-tight text-[#1C1C1E]">Help shape Elsewhere</h3>
-                  <p className="mb-8 text-[18px] leading-relaxed text-[#86868B]">Sharing your email means taking part in the building of Elsewhere at its initial stage.</p>
-                  <form onSubmit={handleSubmit} className="space-y-8">
+                  <h3 className="mb-3 text-[30px] font-bold leading-tight text-[#1C1C1E]">Help build Elsewhere</h3>
+                  <p className="mb-6 text-[18px] leading-relaxed text-[#86868B]">Leave your email if you want early access or want to help shape what this becomes.</p>
+                  <form onSubmit={handleSubmit} className="flex flex-col gap-3 sm:items-end">
                     <Input type="email" placeholder="Email address" value={email} onChange={(event) => setEmail(event.target.value)} required />
-                    <div className="flex items-center justify-between gap-4">
-                      <div className="flex gap-2" aria-hidden="true">
-                        <div className="h-2 w-2 rounded-full bg-[#B86B4D]" />
-                        <div className="h-2 w-2 rounded-full bg-[#E5E5E5]" />
-                        <div className="h-2 w-2 rounded-full bg-[#E5E5E5]" />
-                      </div>
-                      <button type="submit" className="flex h-[56px] items-center gap-2.5 rounded-xl bg-[#B86B4D] px-7 py-4 text-base font-medium text-white shadow-lg shadow-[#B86B4D]/20 transition-all hover:bg-[#A55D42] active:scale-95">
-                        Email Arche
-                        <ArrowRight size={18} strokeWidth={2.5} />
-                      </button>
-                    </div>
+                    <button type="submit" className="flex h-[56px] w-full items-center justify-center gap-2.5 rounded-xl bg-[#B86B4D] px-7 py-4 text-base font-medium text-white shadow-lg shadow-[#B86B4D]/20 transition-all hover:bg-[#A55D42] active:scale-95 sm:w-auto">
+                      Email Arche
+                      <ArrowRight size={18} strokeWidth={2.5} />
+                    </button>
                   </form>
                 </>
               )}
