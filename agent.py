@@ -947,6 +947,10 @@ def attach_session_diagnostics(session: AgentSession) -> None:
         target = event_item if event_item is not None else item
         role = _safe_attr(target, "role")
         interrupted = _safe_attr(target, "interrupted")
+        if str(role).strip().lower() == "user" and active_speech_handles:
+            _cleanup_active_assistant_speeches("user_turn_committed")
+        if str(interrupted).strip().lower() in {"true", "1", "yes"} and active_speech_handles:
+            _cleanup_active_assistant_speeches("conversation_item_interrupted")
         if PIPELINE_TEXT_DEBUG:
             text_str = _extract_text_for_debug(target)
             logger.info(
