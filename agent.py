@@ -116,6 +116,15 @@ _last_tts_sentence_end_count = 0
 _last_tts_path: str | None = None
 _last_hume_model_version = "n/a"
 _last_hume_description_applied = "n/a"
+_last_hume_voice_present = False
+_last_hume_voice_kind = "n/a"
+_last_hume_instant_mode = "n/a"
+_last_hume_speed = "n/a"
+_last_hume_trailing_silence = "n/a"
+_last_hume_style_context_applied = "n/a"
+_last_hume_tts_build_started_at = 0.0
+_last_hume_tts_build_completed_at = 0.0
+_last_hume_tts_debug_http = False
 _silero_initialized = False
 _last_llm_stream_status = "n/a"
 _last_llm_timeout_stage = "n/a"
@@ -127,6 +136,13 @@ _last_llm_completed_at = 0.0
 _last_tts_node_entered_at = 0.0
 _last_tts_received_text_hash = "empty"
 _last_hume_request_start_at = 0.0
+_last_tts_completed_at = 0.0
+_last_tts_raw_chunk_count = 0
+_last_tts_normalized_yield_count = 0
+_last_tts_first_input_at: float | None = None
+_latest_user_state_for_greeting = "unknown"
+_latest_user_state_changed_at = 0.0
+_latest_user_speaking_at = 0.0
 _search_tool_called = False
 _search_in_progress = False
 _search_started_at = 0.0
@@ -793,27 +809,52 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                 tts_request_to_first_audio = (_last_tts_first_audio_at - _last_tts_request_start_at) if (_last_tts_first_audio_at is not None and _last_tts_request_start_at > 0) else -1.0
                 final_stt_to_first_audio = (_last_tts_first_audio_at - last_stt_final_at) if (_last_tts_first_audio_at is not None and last_stt_final_at > 0) else -1.0
                 user_stopped_to_first_audio = (_last_tts_first_audio_at - last_user_listening_at) if (_last_tts_first_audio_at is not None and last_user_listening_at > 0) else -1.0
+                tts_first_audio_to_playout_start = (speaking_at - _last_tts_first_audio_at) if (speaking_at is not None and _last_tts_first_audio_at is not None) else -1.0
+                user_stopped_to_assistant_complete = (finished_at - last_user_listening_at) if last_user_listening_at > 0 else -1.0
                 logger.info(
-                    "Voice latency summary: user_stopped_to_final_stt=%s final_stt_to_turn_committed=%s turn_committed_to_llm_first_token=%s llm_first_token_to_llm_complete=%s turn_committed_to_llm_complete=%s final_stt_to_llm_complete=%s llm_complete_to_tts_request=%s tts_request_to_first_audio=%s final_stt_to_first_audio=%s user_stopped_to_first_audio=%s llm_stream_status=%s llm_timeout_stage=%s llm_fallback_response_used=%s text_length=%s sentence_end_count=%s hume_requests_during_speech=%s openrouter_model=%s tts_path=%s model_version=%s description_applied=%s",
+                    "Voice latency audit: user_speech_started_at=%s user_speech_stopped_at=%s final_stt_received_at=%s user_turn_committed_at=%s llm_request_started_at=%s llm_first_token_at=%s llm_completed_at=%s tts_request_started_at=%s tts_first_audio_at=%s tts_completed_at=%s assistant_playout_started_at=%s assistant_playout_completed_at=%s user_stopped_to_final_stt=%s final_stt_to_turn_committed=%s turn_committed_to_llm_first_token=%s llm_first_token_to_llm_complete=%s llm_complete_to_tts_request=%s tts_request_to_first_audio=%s tts_first_audio_to_playout_start=%s user_stopped_to_first_audio=%s user_stopped_to_assistant_complete=%s endpointing_min_delay=%s endpointing_max_delay=%s mistral_target_streaming_delay_ms=%s spoken_text_normalization_enabled=%s spoken_text_normalization_mode=%s tts_input_buffering_mode=%s raw_chunk_count=%s normalized_yield_count=%s time_from_llm_first_token_to_first_tts_input=%s tts_provider=%s hume_instant_mode=%s hume_model_version=%s hume_speed=%s openrouter_model=%s llm_stream_status=%s llm_timeout_stage=%s llm_fallback_response_used=%s text_length=%s sentence_end_count=%s hume_requests_during_speech=%s tts_path=%s description_applied=%s",
+                    _fmt_seconds(last_user_speaking_at),
+                    _fmt_seconds(last_user_listening_at),
+                    _fmt_seconds(last_stt_final_at),
+                    _fmt_seconds(_last_turn_committed_at),
+                    _fmt_seconds(_last_llm_start_at),
+                    _fmt_seconds(_last_llm_first_token_at),
+                    _fmt_seconds(_last_llm_complete_at),
+                    _fmt_seconds(_last_tts_request_start_at),
+                    _fmt_seconds(_last_tts_first_audio_at),
+                    _fmt_seconds(_last_tts_completed_at),
+                    _fmt_seconds(speaking_at),
+                    _fmt_seconds(finished_at),
                     _fmt_seconds(user_stopped_to_final_stt),
                     _fmt_seconds(final_stt_to_turn_committed),
                     _fmt_seconds(turn_committed_to_llm_first_token),
                     _fmt_seconds(llm_first_token_to_llm_complete),
-                    _fmt_seconds(turn_committed_to_llm_complete),
-                    _fmt_seconds(final_stt_to_llm_complete),
                     _fmt_seconds(llm_complete_to_tts_request),
                     _fmt_seconds(tts_request_to_first_audio),
-                    _fmt_seconds(final_stt_to_first_audio),
+                    _fmt_seconds(tts_first_audio_to_playout_start),
                     _fmt_seconds(user_stopped_to_first_audio),
+                    _fmt_seconds(user_stopped_to_assistant_complete),
+                    os.getenv("LIVEKIT_ENDPOINTING_MIN_DELAY", "0.7"),
+                    os.getenv("LIVEKIT_ENDPOINTING_MAX_DELAY", "3.0"),
+                    os.getenv("MISTRAL_TARGET_STREAMING_DELAY_MS", "160"),
+                    SPOKEN_TEXT_NORMALIZATION,
+                    SPOKEN_TEXT_NORMALIZATION_MODE,
+                    SPOKEN_TEXT_NORMALIZATION_MODE,
+                    _last_tts_raw_chunk_count,
+                    _last_tts_normalized_yield_count,
+                    _fmt_seconds((_last_tts_first_input_at - _last_llm_first_token_at) if (_last_tts_first_input_at is not None and _last_llm_first_token_at is not None) else None),
+                    TTS_PROVIDER,
+                    env_bool("HUME_INSTANT_MODE", True),
+                    _last_hume_model_version,
+                    os.getenv("HUME_SPEED", "0.9"),
+                    os.getenv("OPENROUTER_MODEL", OPENROUTER_DEFAULT_MODEL),
                     _last_llm_stream_status,
                     _last_llm_timeout_stage,
                     _last_llm_fallback_response_used,
                     _last_tts_text_length,
                     _last_tts_sentence_end_count,
                     hume_requests_during,
-                    os.getenv("OPENROUTER_MODEL", OPENROUTER_DEFAULT_MODEL),
                     _last_tts_path or "n/a",
-                    _last_hume_model_version,
                     _last_hume_description_applied,
                 )
 
@@ -861,12 +902,14 @@ def attach_session_diagnostics(session: AgentSession) -> None:
     @session.on("user_state_changed")
     def _on_user_state_changed(state: object) -> None:
         nonlocal latest_user_state, latest_user_state_timestamp, pending_user_handoff_speech_id, last_user_speaking_at, last_user_listening_at
+        global _latest_user_state_for_greeting, _latest_user_state_changed_at, _latest_user_speaking_at
         latest_user_state = _extract_user_new_state(state)
         latest_user_state_timestamp = time.monotonic()
+        _latest_user_state_for_greeting = latest_user_state
+        _latest_user_state_changed_at = latest_user_state_timestamp
         if latest_user_state == "speaking":
             last_user_speaking_at = latest_user_state_timestamp
-            if active_speech_handles:
-                _cleanup_active_assistant_speeches("user_state_speaking")
+            _latest_user_speaking_at = latest_user_state_timestamp
         if latest_user_state == "listening":
             last_user_listening_at = latest_user_state_timestamp
         logger.info("User state changed: state=%s assistant_active_count=%s", state, len(active_speech_handles))
@@ -1020,7 +1063,12 @@ HUME_FULL_UTTERANCE_TTS = env_bool("HUME_FULL_UTTERANCE_TTS", False)
 LIVEKIT_TTS_SOURCE_INSPECTION = env_bool("LIVEKIT_TTS_SOURCE_INSPECTION", False)
 HUME_DIRECT_API_TTS = env_bool("HUME_DIRECT_API_TTS", False)
 RUN_DB_MIGRATIONS_ON_STARTUP = env_bool("RUN_DB_MIGRATIONS_ON_STARTUP", False)
+ENABLE_FIXED_GREETING = env_bool("ENABLE_FIXED_GREETING", True)
+GREETING_TEXT = (os.getenv("GREETING_TEXT") or "Yo. What’s going on?").strip() or "Yo. What’s going on?"
+GREETING_AUDIO_URL = (os.getenv("GREETING_AUDIO_URL") or "").strip()
 GREETING_AUDIO_PATH = (os.getenv("GREETING_AUDIO_PATH") or "").strip()
+GREETING_USE_CACHED_AUDIO = env_bool("GREETING_USE_CACHED_AUDIO", False)
+SPOKEN_TEXT_NORMALIZATION_MODE = os.getenv("SPOKEN_TEXT_NORMALIZATION_MODE", "buffered_full_segment" if SPOKEN_TEXT_NORMALIZATION else "streaming_passthrough").strip() or ("buffered_full_segment" if SPOKEN_TEXT_NORMALIZATION else "streaming_passthrough")
 LLM_FIRST_TOKEN_TIMEOUT_SECONDS = env_int_clamped("LLM_FIRST_TOKEN_TIMEOUT_SECONDS", 8, 1, 120)
 LLM_TOTAL_TIMEOUT_SECONDS = env_int_clamped("LLM_TOTAL_TIMEOUT_SECONDS", 20, 2, 300)
 if LLM_TOTAL_TIMEOUT_SECONDS < LLM_FIRST_TOKEN_TIMEOUT_SECONDS:
@@ -1230,8 +1278,78 @@ def _resolve_hume_model_version() -> tuple[str, str]:
     return hume_model_raw, "2"
 
 
+
+async def _load_cached_greeting_audio_bytes() -> tuple[bytes | None, str, str]:
+    if GREETING_AUDIO_URL:
+        try:
+            timeout = aiohttp.ClientTimeout(total=float(os.getenv("GREETING_AUDIO_FETCH_TIMEOUT_SECONDS", "5")))
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(GREETING_AUDIO_URL) as response:
+                    if response.status >= 400:
+                        return None, "url", f"http_status_{response.status}"
+                    return await response.read(), "url", "none"
+        except Exception as exc:
+            return None, "url", f"fetch_error_{type(exc).__name__}"
+
+    if GREETING_AUDIO_PATH:
+        try:
+            with open(GREETING_AUDIO_PATH, "rb") as audio_file:
+                return audio_file.read(), "path", "none"
+        except Exception as exc:
+            return None, "path", f"path_error_{type(exc).__name__}"
+
+    return None, "none", "cached_audio_missing"
+
+
+def _validate_cached_wav_audio(audio_bytes: bytes) -> None:
+    try:
+        with wave.open(io.BytesIO(audio_bytes), "rb") as wav:
+            sample_width = wav.getsampwidth()
+            if sample_width != 2:
+                raise RuntimeError(f"cached_greeting_audio_unsupported_sample_width:{sample_width}")
+            if wav.getnchannels() <= 0 or wav.getframerate() <= 0 or wav.getnframes() <= 0:
+                raise RuntimeError("cached_greeting_audio_invalid_wav_metadata")
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"cached_greeting_audio_not_wav:{type(exc).__name__}") from exc
+
+
+def _cached_wav_audio_frames(audio_bytes: bytes, first_frame_marker: dict[str, float]) -> AsyncIterable[rtc.AudioFrame]:
+    async def _frames() -> AsyncIterable[rtc.AudioFrame]:
+        try:
+            wav = wave.open(io.BytesIO(audio_bytes), "rb")
+        except Exception as exc:
+            raise RuntimeError(f"cached_greeting_audio_not_wav:{type(exc).__name__}") from exc
+        with wav:
+            sample_rate = wav.getframerate()
+            num_channels = wav.getnchannels()
+            sample_width = wav.getsampwidth()
+            if sample_width != 2:
+                raise RuntimeError(f"cached_greeting_audio_unsupported_sample_width:{sample_width}")
+            chunk_samples = max(1, int(sample_rate * 0.02))
+            while True:
+                data = wav.readframes(chunk_samples)
+                if not data:
+                    break
+                samples_per_channel = len(data) // (sample_width * num_channels)
+                if samples_per_channel <= 0:
+                    continue
+                if "at" not in first_frame_marker:
+                    first_frame_marker["at"] = time.monotonic()
+                yield rtc.AudioFrame(
+                    data=data,
+                    sample_rate=sample_rate,
+                    num_channels=num_channels,
+                    samples_per_channel=samples_per_channel,
+                )
+                await asyncio.sleep(samples_per_channel / sample_rate)
+
+    return _frames()
+
+
 def build_tts():
-    global _last_hume_model_version, _last_hume_description_applied
+    global _last_hume_model_version, _last_hume_description_applied, _last_hume_voice_present, _last_hume_voice_kind, _last_hume_instant_mode, _last_hume_speed, _last_hume_trailing_silence, _last_hume_style_context_applied, _last_hume_tts_build_started_at, _last_hume_tts_build_completed_at, _last_hume_tts_debug_http
     if TTS_PROVIDER == "deepgram":
         logger.info("Using Deepgram TTS provider")
         return deepgram.TTS(
@@ -1239,6 +1357,7 @@ def build_tts():
         )
 
     if TTS_PROVIDER == "hume":
+        _last_hume_tts_build_started_at = time.monotonic()
         logger.info("Using Hume TTS provider")
 
         hume_voice_id = os.getenv("HUME_VOICE_ID")
@@ -1310,8 +1429,6 @@ def build_tts():
             hume_model_version,
         )
         description_skip_reason = "none" if description_applied else "octave2_unsupported"
-        _last_hume_model_version = str(hume_model_version)
-        _last_hume_description_applied = str(description_applied).lower()
         logger.info(
             "Hume model/description summary: hume_model_raw=%s model_version=%s description_present=%s description_applied=%s description_skip_reason=%s hume_style_context_present=%s hume_style_context_applied=%s hume_style_context_skip_reason=%s",
             _redact_sensitive_text(hume_model_raw),
@@ -1350,6 +1467,15 @@ def build_tts():
         elif hume_voice_name:
             voice_kind = "VoiceByName"
             voice_provider_effective = hume_voice_provider or "hume"
+        _last_hume_model_version = str(hume_model_version)
+        _last_hume_description_applied = str(description_applied).lower()
+        _last_hume_voice_present = bool(voice)
+        _last_hume_voice_kind = voice_kind
+        _last_hume_instant_mode = str(instant_mode).lower()
+        _last_hume_speed = str(hume_speed)
+        _last_hume_trailing_silence = str(hume_trailing_silence if trailing_silence_applied else "n/a")
+        _last_hume_style_context_applied = str(hume_style_context_applied).lower()
+        _last_hume_tts_debug_http = hume_tts_debug_http
         logger.info(
             "Hume TTS effective config: model_version=%s voice_kind=%s voice_present=%s voice_provider=%s instant_mode=%s speed=%s description_present=%s description_applied=%s description_length=%s trailing_silence_supported=%s trailing_silence_applied=%s trailing_silence_value=%s hume_style_context_present=%s hume_style_context_length=%s hume_style_context_applied=%s debug_http=%s",
             hume_tts_kwargs.get("model_version"),
@@ -1447,7 +1573,15 @@ def build_tts():
             trace_config.on_request_exception.append(_on_request_exception)
             hume_tts_kwargs["http_session"] = aiohttp.ClientSession(trace_configs=[trace_config])
 
-        return hume.TTS(**hume_tts_kwargs)
+        tts_instance = hume.TTS(**hume_tts_kwargs)
+        _last_hume_tts_build_completed_at = time.monotonic()
+        logger.info(
+            "Hume TTS instance created: build_duration_seconds=%s lazy_http_session_expected=%s debug_http=%s",
+            _fmt_seconds(_last_hume_tts_build_completed_at - _last_hume_tts_build_started_at),
+            not hume_tts_debug_http,
+            hume_tts_debug_http,
+        )
+        return tts_instance
 
     raise RuntimeError("Unsupported TTS_PROVIDER. Use 'deepgram' or 'hume'.")
 
@@ -1599,12 +1733,18 @@ class LucyAgent(Agent):
         return normalized
 
     def tts_node(self, text: AsyncIterable[str], model_settings):
-        global _latest_normalized_text_hash, _last_tts_request_start_at, _last_tts_first_audio_at, _last_tts_text_length, _last_tts_sentence_end_count, _last_tts_path, _last_tts_node_entered_at, _last_tts_received_text_hash, _last_hume_request_start_at
+        global _latest_normalized_text_hash, _last_tts_request_start_at, _last_tts_first_audio_at, _last_tts_text_length, _last_tts_sentence_end_count, _last_tts_path, _last_tts_node_entered_at, _last_tts_received_text_hash, _last_hume_request_start_at, _last_tts_completed_at, _last_tts_raw_chunk_count, _last_tts_normalized_yield_count, _last_tts_first_input_at
         _last_tts_node_entered_at = time.monotonic()
+        _last_tts_completed_at = 0.0
+        _last_tts_raw_chunk_count = 0
+        _last_tts_normalized_yield_count = 0
+        _last_tts_first_input_at = None
         logger.info(
-            "TTS node entered: TTS_PROVIDER=%s SPOKEN_TEXT_NORMALIZATION=%s handoff_guard_enabled=%s llm_stream_status=%s",
+            "TTS node entered: TTS_PROVIDER=%s SPOKEN_TEXT_NORMALIZATION=%s spoken_text_normalization_mode=%s tts_input_buffering_mode=%s handoff_guard_enabled=%s llm_stream_status=%s",
             TTS_PROVIDER,
             SPOKEN_TEXT_NORMALIZATION,
+            SPOKEN_TEXT_NORMALIZATION_MODE,
+            SPOKEN_TEXT_NORMALIZATION_MODE,
             LLM_TO_TTS_HANDOFF_GUARD_ENABLED,
             _last_llm_stream_status,
         )
@@ -1613,12 +1753,14 @@ class LucyAgent(Agent):
             logger.info("Spoken text normalization enabled=false")
 
             async def _logging_passthrough_stream() -> AsyncIterable[str]:
-                global _last_tts_received_text_hash, _last_tts_text_length, _last_tts_sentence_end_count
+                global _last_tts_received_text_hash, _last_tts_text_length, _last_tts_sentence_end_count, _last_tts_raw_chunk_count, _last_tts_normalized_yield_count, _last_tts_first_input_at
                 chunks: list[str] = []
                 count = 0
                 try:
                     async for chunk in text:
                         count += 1
+                        if _last_tts_first_input_at is None:
+                            _last_tts_first_input_at = time.monotonic()
                         if isinstance(chunk, str):
                             chunks.append(chunk)
                         yield chunk
@@ -1627,6 +1769,8 @@ class LucyAgent(Agent):
                     _last_tts_received_text_hash = _text_hash(raw_text)
                     _last_tts_text_length = len(raw_text)
                     _last_tts_sentence_end_count = sum(raw_text.count(mark) for mark in (".", "?", "!", "…"))
+                    _last_tts_raw_chunk_count = count
+                    _last_tts_normalized_yield_count = count
                     logger.info(
                         "TTS node received text chunk count: raw_chunk_count=%s raw_total_length=%s text_hash=%s handoff_guard_enabled=%s",
                         count,
@@ -1651,7 +1795,7 @@ class LucyAgent(Agent):
                         )
 
             async def _default_tts_with_hume_logs() -> AsyncIterable[Any]:
-                global _last_hume_request_start_at, _last_tts_path, _last_tts_first_audio_at, _last_tts_request_start_at
+                global _last_hume_request_start_at, _last_tts_path, _last_tts_first_audio_at, _last_tts_request_start_at, _last_tts_completed_at
                 start = time.monotonic()
                 _last_tts_request_start_at = start
                 _last_tts_first_audio_at = None
@@ -1668,12 +1812,13 @@ class LucyAgent(Agent):
                             _last_tts_path = "default_agent_tts_node_fallback"
                         frame_count += 1
                         yield out
+                    _last_tts_completed_at = time.monotonic()
                     if TTS_PROVIDER == "hume":
                         logger.info(
                             "Hume TTS HTTP request completed: path=default_agent_tts_node_fallback frame_count_yielded=%s time_to_first_audio_seconds=%s total_tts_seconds=%.3f",
                             frame_count,
                             _fmt_seconds((_last_tts_first_audio_at - start) if _last_tts_first_audio_at is not None else None),
-                            time.monotonic() - start,
+                            _last_tts_completed_at - start,
                         )
                 except Exception as e:
                     if TTS_PROVIDER == "hume":
@@ -1691,14 +1836,17 @@ class LucyAgent(Agent):
         logger.info("Spoken text normalization enabled=true mode=buffered_full_segment")
 
         async def _direct_or_plugin_or_default() -> AsyncIterable[Any]:
-            global _latest_normalized_text_hash, _last_tts_request_start_at, _last_tts_first_audio_at, _last_tts_text_length, _last_tts_sentence_end_count, _last_tts_path, _last_hume_request_start_at, _last_tts_received_text_hash
+            global _latest_normalized_text_hash, _last_tts_request_start_at, _last_tts_first_audio_at, _last_tts_text_length, _last_tts_sentence_end_count, _last_tts_path, _last_hume_request_start_at, _last_tts_received_text_hash, _last_tts_completed_at, _last_tts_raw_chunk_count, _last_tts_normalized_yield_count, _last_tts_first_input_at
             chunks: list[str] = []
             chunk_count = 0
             async for chunk in text:
                 chunk_count += 1
+                if _last_tts_first_input_at is None:
+                    _last_tts_first_input_at = time.monotonic()
                 chunks.append(chunk if isinstance(chunk, str) else str(chunk))
             raw_text = "".join(chunks)
             _last_tts_received_text_hash = _text_hash(raw_text)
+            _last_tts_raw_chunk_count = chunk_count
             logger.info(
                 "TTS node received text chunk count: raw_chunk_count=%s raw_total_length=%s text_hash=%s handoff_guard_enabled=%s",
                 chunk_count,
@@ -1715,13 +1863,14 @@ class LucyAgent(Agent):
             newline_count = normalized_text.count("\n")
             _last_tts_text_length = len(normalized_text)
             _last_tts_sentence_end_count = sentence_end_count
+            _last_tts_normalized_yield_count = 1 if normalized_text else 0
             _last_tts_request_start_at = time.monotonic()
             _last_tts_first_audio_at = None
             _last_tts_path = None
             logger.info(
-                "TTS normalized yield diagnostics: tts_normalized_yield_count=%s raw_chunk_count=%s raw_total_length=%s normalized_text_length=%s normalized_text_preview=%s normalized_text_hash=%s sentence_end_count=%s newline_count=%s SPOKEN_TEXT_NORMALIZATION=%s TTS_PROVIDER=%s HUME_INSTANT_MODE=%s HUME_SPEED=%s HUME_TRAILING_SILENCE=%s",
-                1 if normalized_text else 0, chunk_count, len(raw_text), len(normalized_text), _redact_sensitive_text(normalized_text)[:200], normalized_hash,
-                sentence_end_count, newline_count, SPOKEN_TEXT_NORMALIZATION, TTS_PROVIDER, env_bool("HUME_INSTANT_MODE", True), os.getenv("HUME_SPEED", "0.9"), os.getenv("HUME_TRAILING_SILENCE", "0.25"),
+                "TTS normalized yield diagnostics: tts_normalized_yield_count=%s raw_chunk_count=%s raw_total_length=%s normalized_text_length=%s normalized_text_preview=%s normalized_text_hash=%s sentence_end_count=%s newline_count=%s SPOKEN_TEXT_NORMALIZATION=%s spoken_text_normalization_mode=%s tts_input_buffering_mode=%s time_from_llm_first_token_to_first_tts_input=%s TTS_PROVIDER=%s HUME_INSTANT_MODE=%s HUME_SPEED=%s HUME_TRAILING_SILENCE=%s",
+                _last_tts_normalized_yield_count, chunk_count, len(raw_text), len(normalized_text), _redact_sensitive_text(normalized_text)[:200], normalized_hash,
+                sentence_end_count, newline_count, SPOKEN_TEXT_NORMALIZATION, SPOKEN_TEXT_NORMALIZATION_MODE, SPOKEN_TEXT_NORMALIZATION_MODE, _fmt_seconds((_last_tts_first_input_at - _last_llm_first_token_at) if (_last_tts_first_input_at is not None and _last_llm_first_token_at is not None) else None), TTS_PROVIDER, env_bool("HUME_INSTANT_MODE", True), os.getenv("HUME_SPEED", "0.9"), os.getenv("HUME_TRAILING_SILENCE", "0.25"),
             )
             if not normalized_text.strip():
                 logger.warning(
@@ -1772,7 +1921,8 @@ class LucyAgent(Agent):
                                 _last_tts_first_audio_at = first_audio
                             yielded += 1
                             yield frame
-                        logger.info("Hume TTS HTTP request completed: path=livekit_hume_plugin_synthesize_full_text frame_count_yielded=%s time_to_first_audio_seconds=%.3f total_tts_seconds=%.3f", yielded, (first_audio-start) if first_audio else -1.0, time.monotonic()-start)
+                        _last_tts_completed_at = time.monotonic()
+                        logger.info("Hume TTS HTTP request completed: path=livekit_hume_plugin_synthesize_full_text frame_count_yielded=%s time_to_first_audio_seconds=%.3f total_tts_seconds=%.3f", yielded, (first_audio-start) if first_audio else -1.0, _last_tts_completed_at-start)
                         logger.info("Hume full-utterance plugin result: hume_full_utterance_plugin_requested=%s hume_full_utterance_plugin_used=%s hume_full_utterance_plugin_fallback_reason=%s path=%s normalized_text_hash=%s text_length=%s sentence_end_count=%s frame_count_yielded=%s time_to_first_audio_seconds=%.3f total_tts_seconds=%.3f", True, True, "none", "livekit_hume_plugin_synthesize_full_text", normalized_hash, len(normalized_text), sentence_end_count, yielded, (first_audio-start) if first_audio else -1.0, time.monotonic()-start)
                         return
                     except Exception as e:
@@ -1799,12 +1949,13 @@ class LucyAgent(Agent):
                         _last_tts_path = "default_agent_tts_node_fallback"
                     frame_count += 1
                     yield out
+                _last_tts_completed_at = time.monotonic()
                 if TTS_PROVIDER == "hume":
                     logger.info(
                         "Hume TTS HTTP request completed: path=default_agent_tts_node_fallback frame_count_yielded=%s time_to_first_audio_seconds=%s total_tts_seconds=%.3f",
                         frame_count,
                         _fmt_seconds((_last_tts_first_audio_at - hume_start) if _last_tts_first_audio_at is not None else None),
-                        time.monotonic() - hume_start,
+                        _last_tts_completed_at - hume_start,
                     )
             except Exception as e:
                 if TTS_PROVIDER == "hume":
@@ -2461,6 +2612,12 @@ async def entrypoint(ctx: JobContext):
     logger.info("HUME_FULL_UTTERANCE_TTS enabled=%s", HUME_FULL_UTTERANCE_TTS)
     logger.info("HUME_DIRECT_API_TTS enabled=%s", HUME_DIRECT_API_TTS)
     logger.info(
+        "Spoken text normalization latency guidance: spoken_text_normalization_enabled=%s spoken_text_normalization_mode=%s tts_input_buffering_mode=%s lowest_latency_setting=SPOKEN_TEXT_NORMALIZATION=false best_sentence_quality_setting=SPOKEN_TEXT_NORMALIZATION=true,mode=buffered_full_segment",
+        SPOKEN_TEXT_NORMALIZATION,
+        SPOKEN_TEXT_NORMALIZATION_MODE,
+        SPOKEN_TEXT_NORMALIZATION_MODE,
+    )
+    logger.info(
         "Search startup config: search_enabled=%s search_provider=%s search_max_results=%s search_timeout_seconds=%s search_disabled_reason=%s",
         search_enabled(),
         search_provider(),
@@ -2603,21 +2760,178 @@ async def entrypoint(ctx: JobContext):
             break
         await asyncio.sleep(0.1)
 
-    logger.info("About to say fixed greeting")
-    greeting_tts_request_at = time.monotonic()
-    greeting_path = "cached_audio" if GREETING_AUDIO_PATH else "hume_live_tts"
-    if GREETING_AUDIO_PATH:
-        logger.warning("GREETING_AUDIO_PATH is set but cached audio playback is not yet implemented; using live TTS path for now")
-    greeting_handle = await session.say(
-        "Yo. What’s going on?",
-        allow_interruptions=False,
-    )
-    greeting_after_say_at = time.monotonic()
+    greeting_audio_source = "url" if GREETING_AUDIO_URL else ("path" if GREETING_AUDIO_PATH else "none")
     logger.info(
-        "Fixed greeting say completed: handle_type=%s handle_id=%s interrupted=%s",
+        "Fixed greeting config: fixed_greeting_enabled=%s greeting_use_cached_audio=%s greeting_audio_source=%s greeting_text_length=%s live_hume_primary_path=%s",
+        ENABLE_FIXED_GREETING,
+        GREETING_USE_CACHED_AUDIO,
+        greeting_audio_source,
+        len(GREETING_TEXT),
+        not GREETING_USE_CACHED_AUDIO,
+    )
+    if not GREETING_USE_CACHED_AUDIO:
+        logger.info(
+            "Fixed greeting cached audio disabled: greeting_path=hume_live_tts cached_audio_load_attempted=false greeting_audio_source=%s",
+            greeting_audio_source,
+        )
+
+    if not ENABLE_FIXED_GREETING:
+        logger.info(
+            "Fixed greeting skipped: fixed_greeting_enabled=%s greeting_path=skipped fixed_greeting_skipped_reason=disabled greeting_cancelled_due_to_user_speech=%s",
+            False,
+            False,
+        )
+        return
+
+    greeting_cancelled_due_to_user_speech = False
+    if _latest_user_speaking_at > session_started_at or _latest_user_state_for_greeting == "speaking":
+        greeting_cancelled_due_to_user_speech = True
+        logger.warning(
+            "Fixed greeting skipped: greeting_path=skipped fixed_greeting_skipped_reason=user_started_speaking_before_greeting greeting_cancelled_due_to_user_speech=%s latest_user_state=%s latest_user_speaking_at=%s session_started_at=%s",
+            True,
+            _latest_user_state_for_greeting,
+            _latest_user_speaking_at,
+            session_started_at,
+        )
+        return
+
+    logger.info("About to play fixed greeting")
+    greeting_tts_request_at = time.monotonic()
+    greeting_tts_completed_at = 0.0
+    greeting_handle = None
+    greeting_path = "skipped"
+    greeting_fallback_reason = "none"
+    greeting_hume_error = "none"
+    greeting_first_audio_marker: dict[str, float] = {}
+    greeting_hume_request_index_before = _hume_tts_request_counter
+    greeting_hume_request_index_after = _hume_tts_request_counter
+
+    if GREETING_USE_CACHED_AUDIO and greeting_audio_source != "none":
+        audio_bytes, loaded_source, load_error = await _load_cached_greeting_audio_bytes()
+        greeting_audio_source = loaded_source
+        if audio_bytes:
+            if _latest_user_speaking_at > greeting_tts_request_at or _latest_user_state_for_greeting == "speaking":
+                greeting_cancelled_due_to_user_speech = True
+                logger.warning(
+                    "Fixed greeting skipped: greeting_path=skipped fixed_greeting_skipped_reason=user_started_speaking_before_greeting greeting_cancelled_due_to_user_speech=%s latest_user_state=%s latest_user_speaking_at=%s greeting_playout_started_at=%s",
+                    True,
+                    _latest_user_state_for_greeting,
+                    _latest_user_speaking_at,
+                    greeting_tts_request_at,
+                )
+                return
+            try:
+                _validate_cached_wav_audio(audio_bytes)
+                greeting_path = "cached_audio"
+                logger.info(
+                    "Fixed greeting cached audio starting: greeting_path=%s greeting_audio_source=%s greeting_playout_started_at=%s greeting_cancelled_due_to_user_speech=%s",
+                    greeting_path,
+                    greeting_audio_source,
+                    greeting_tts_request_at,
+                    False,
+                )
+                greeting_handle = await session.say(
+                    GREETING_TEXT,
+                    audio=_cached_wav_audio_frames(audio_bytes, greeting_first_audio_marker),
+                    allow_interruptions=False,
+                )
+            except Exception as exc:
+                greeting_path = "hume_live_tts"
+                greeting_fallback_reason = f"cached_audio_error_{type(exc).__name__}"
+                logger.warning(
+                    "Fixed greeting cached audio unavailable; falling back to live TTS: greeting_path=%s fallback_reason=%s greeting_audio_source=%s error=%s",
+                    greeting_path,
+                    greeting_fallback_reason,
+                    greeting_audio_source,
+                    _redact_sensitive_text(exc),
+                )
+        else:
+            greeting_path = "hume_live_tts"
+            greeting_fallback_reason = load_error or "cached_audio_missing"
+            logger.warning(
+                "Fixed greeting cached audio missing; falling back to live TTS: greeting_path=%s fallback_reason=%s greeting_audio_source=%s",
+                greeting_path,
+                greeting_fallback_reason,
+                greeting_audio_source,
+            )
+    elif GREETING_USE_CACHED_AUDIO:
+        greeting_path = "hume_live_tts"
+        greeting_fallback_reason = "cached_audio_missing"
+        logger.warning(
+            "Fixed greeting cached audio requested without source; falling back to live TTS: greeting_path=%s fallback_reason=%s greeting_audio_source=%s",
+            greeting_path,
+            greeting_fallback_reason,
+            greeting_audio_source,
+        )
+
+    if greeting_handle is None:
+        if _latest_user_speaking_at > greeting_tts_request_at or _latest_user_state_for_greeting == "speaking":
+            greeting_cancelled_due_to_user_speech = True
+            logger.warning(
+                "Fixed greeting skipped: greeting_path=skipped fixed_greeting_skipped_reason=user_started_speaking_before_greeting greeting_cancelled_due_to_user_speech=%s latest_user_state=%s latest_user_speaking_at=%s greeting_playout_started_at=%s",
+                True,
+                _latest_user_state_for_greeting,
+                _latest_user_speaking_at,
+                greeting_tts_request_at,
+            )
+            return
+        greeting_path = "hume_live_tts"
+        logger.info(
+            "Fixed greeting live TTS starting: fixed_greeting_enabled=%s greeting_use_cached_audio=%s greeting_path=%s fallback_reason=%s greeting_text_length=%s greeting_tts_request_started_at=%s greeting_cancelled_due_to_user_speech=%s hume_request_index_before=%s hume_model_version=%s hume_instant_mode=%s hume_voice_present=%s hume_voice_kind=%s hume_speed=%s hume_trailing_silence=%s hume_description_applied=%s hume_style_context_applied=%s hume_tts_debug_http=%s hume_tts_build_completed_at=%s hume_tts_build_to_greeting_seconds=%s spoken_text_normalization_enabled=%s spoken_text_normalization_mode=%s",
+            ENABLE_FIXED_GREETING,
+            GREETING_USE_CACHED_AUDIO,
+            greeting_path,
+            greeting_fallback_reason,
+            len(GREETING_TEXT),
+            greeting_tts_request_at,
+            False,
+            greeting_hume_request_index_before,
+            _last_hume_model_version,
+            _last_hume_instant_mode,
+            _last_hume_voice_present,
+            _last_hume_voice_kind,
+            _last_hume_speed,
+            _last_hume_trailing_silence,
+            _last_hume_description_applied,
+            _last_hume_style_context_applied,
+            _last_hume_tts_debug_http,
+            _last_hume_tts_build_completed_at,
+            _fmt_seconds(greeting_tts_request_at - _last_hume_tts_build_completed_at if _last_hume_tts_build_completed_at > 0 else None),
+            SPOKEN_TEXT_NORMALIZATION,
+            SPOKEN_TEXT_NORMALIZATION_MODE,
+        )
+        try:
+            greeting_handle = await session.say(
+                GREETING_TEXT,
+                allow_interruptions=False,
+            )
+        except Exception as exc:
+            greeting_hume_error = f"{type(exc).__name__}:{_redact_sensitive_text(exc)}"
+            logger.error(
+                "Fixed greeting live TTS error: greeting_path=%s hume_error=%s greeting_tts_request_started_at=%s elapsed_seconds=%s hume_request_index_before=%s hume_request_index_after=%s",
+                greeting_path,
+                greeting_hume_error,
+                greeting_tts_request_at,
+                _fmt_seconds(time.monotonic() - greeting_tts_request_at),
+                greeting_hume_request_index_before,
+                _hume_tts_request_counter,
+            )
+            raise
+
+    greeting_after_say_at = time.monotonic()
+    greeting_tts_completed_at = greeting_after_say_at
+    greeting_hume_request_index_after = _hume_tts_request_counter
+    logger.info(
+        "Fixed greeting say completed: handle_type=%s handle_id=%s interrupted=%s greeting_path=%s greeting_tts_request_completed_at=%s greeting_tts_session_say_seconds=%s hume_request_index_before=%s hume_request_index_after=%s hume_request_index=%s",
         type(greeting_handle).__name__,
         _safe_attr(greeting_handle, "id"),
         _safe_attr(greeting_handle, "interrupted"),
+        greeting_path,
+        greeting_tts_completed_at,
+        _fmt_seconds(greeting_tts_completed_at - greeting_tts_request_at),
+        greeting_hume_request_index_before,
+        greeting_hume_request_index_after,
+        greeting_hume_request_index_after if greeting_hume_request_index_after != greeting_hume_request_index_before else "not_observed_without_hume_http_debug",
     )
 
     wait_for_playout = getattr(greeting_handle, "wait_for_playout", None)
@@ -2634,15 +2948,40 @@ async def entrypoint(ctx: JobContext):
     else:
         logger.warning("Greeting handle does not support wait_for_playout")
 
+    greeting_first_audio_at = greeting_first_audio_marker.get("at")
+    if greeting_first_audio_at is None and greeting_path == "hume_live_tts":
+        greeting_first_audio_at = greeting_after_say_at
     logger.info(
-        "Greeting latency summary: greeting_job_to_session_start=%s greeting_session_start_to_agent_listening=%s greeting_tts_request_to_first_audio=%s greeting_total_tts_seconds=%s greeting_total_playout_seconds=%s greeting_text_length=%s greeting_path=%s",
-        _fmt_seconds(session_started_at - job_started_at if session_started_at > 0 else -1.0),
-        _fmt_seconds(greeting_agent_listening_at - session_started_at if greeting_agent_listening_at > 0 and session_started_at > 0 else -1.0),
-        _fmt_seconds(greeting_after_say_at - greeting_tts_request_at if greeting_after_say_at > 0 else -1.0),
+        "Greeting latency summary: fixed_greeting_enabled=%s greeting_use_cached_audio=%s greeting_audio_source=%s greeting_path=%s fallback_reason=%s greeting_tts_request_started_at=%s greeting_tts_request_completed_at=%s greeting_playout_started_at=%s greeting_time_to_first_audio_seconds=%s greeting_first_audio_seconds=%s greeting_first_audio_source=%s greeting_total_tts_seconds=%s greeting_total_playout_seconds=%s greeting_cancelled_due_to_user_speech=%s greeting_job_to_session_start=%s greeting_session_start_to_agent_listening=%s greeting_text_length=%s hume_request_index=%s hume_request_index_before=%s hume_request_index_after=%s hume_model_version=%s hume_instant_mode=%s hume_voice_present=%s hume_voice_kind=%s hume_speed=%s hume_trailing_silence=%s hume_description_applied=%s hume_style_context_applied=%s hume_error=%s",
+        ENABLE_FIXED_GREETING,
+        GREETING_USE_CACHED_AUDIO,
+        greeting_audio_source,
+        greeting_path,
+        greeting_fallback_reason,
+        greeting_tts_request_at,
+        greeting_tts_completed_at,
+        greeting_tts_request_at,
+        _fmt_seconds((greeting_first_audio_at - greeting_tts_request_at) if greeting_first_audio_at is not None else None),
+        _fmt_seconds((greeting_first_audio_at - greeting_tts_request_at) if greeting_first_audio_at is not None else None),
+        "cached_audio_frame_marker" if greeting_first_audio_marker.get("at") is not None else ("session_say_return_estimate" if greeting_path == "hume_live_tts" else "unavailable"),
         _fmt_seconds(greeting_after_say_at - greeting_tts_request_at if greeting_after_say_at > 0 else -1.0),
         _fmt_seconds(greeting_playout_done_at - greeting_tts_request_at if greeting_playout_done_at > 0 else -1.0),
-        len("Yo. What’s going on?"),
-        greeting_path,
+        greeting_cancelled_due_to_user_speech,
+        _fmt_seconds(session_started_at - job_started_at if session_started_at > 0 else -1.0),
+        _fmt_seconds(greeting_agent_listening_at - session_started_at if greeting_agent_listening_at > 0 and session_started_at > 0 else -1.0),
+        len(GREETING_TEXT),
+        greeting_hume_request_index_after if greeting_hume_request_index_after != greeting_hume_request_index_before else "not_observed_without_hume_http_debug",
+        greeting_hume_request_index_before,
+        greeting_hume_request_index_after,
+        _last_hume_model_version,
+        _last_hume_instant_mode,
+        _last_hume_voice_present,
+        _last_hume_voice_kind,
+        _last_hume_speed,
+        _last_hume_trailing_silence,
+        _last_hume_description_applied,
+        _last_hume_style_context_applied,
+        greeting_hume_error,
     )
 
 
