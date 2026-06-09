@@ -1244,6 +1244,7 @@ LLM_FALLBACK_RESPONSE = os.getenv(
     "Sorry, I blanked for a second. Say that again?",
 ).strip() or "Sorry, I blanked for a second. Say that again?"
 LLM_TO_TTS_HANDOFF_GUARD_ENABLED = env_bool("LLM_TO_TTS_HANDOFF_GUARD_ENABLED", False)
+CONTEXT_WINDOW_TURNS = env_int_clamped("CONTEXT_WINDOW_TURNS", 10, 4, 100)
 PREEMPTIVE_GENERATION_ENABLED = env_bool("PREEMPTIVE_GENERATION_ENABLED", False)
 SEARCH_BRIDGE_MIN_DELAY_SECONDS = float(os.getenv("SEARCH_BRIDGE_MIN_DELAY_SECONDS", "0.75") or "0.75")
 
@@ -1833,6 +1834,84 @@ def _recent_turn_previews_from_chat_ctx(chat_ctx: object, limit: int = 5) -> lis
             continue
         previews.append(f"{role}: {_redact_sensitive_text(text)[:240]}")
     return previews
+
+
+def _is_system_or_developer_message(message: object) -> bool:
+    role = str(getattr(message, "role", "")).strip().lower()
+    return role in {"system", "developer"}
+
+
+def _prune_turn_context_messages(turn_ctx: object, turn_id: int | None = None) -> tuple[int, int, int]:
+    messages = getattr(turn_ctx, "messages", None)
+    if messages is None:
+        logger.info(
+            "context_pruned: turn_id=%s total_messages=%s kept_messages=%s dropped_messages=%s context_window_turns=%s",
+            turn_id or _current_turn_id,
+            0,
+            0,
+            0,
+            CONTEXT_WINDOW_TURNS,
+        )
+        return 0, 0, 0
+    try:
+        message_list = list(messages)
+    except Exception:
+        logger.warning(
+            "context_pruned: turn_id=%s total_messages=%s kept_messages=%s dropped_messages=%s context_window_turns=%s reason=messages_not_iterable",
+            turn_id or _current_turn_id,
+            "n/a",
+            "n/a",
+            0,
+            CONTEXT_WINDOW_TURNS,
+        )
+        return 0, 0, 0
+
+    total_messages = len(message_list)
+    max_non_system_messages = CONTEXT_WINDOW_TURNS * 2
+    non_system_messages = [message for message in message_list if not _is_system_or_developer_message(message)]
+    if len(non_system_messages) <= max_non_system_messages:
+        logger.info(
+            "context_pruned: turn_id=%s total_messages=%s kept_messages=%s dropped_messages=0 context_window_turns=%s",
+            turn_id or _current_turn_id,
+            total_messages,
+            total_messages,
+            CONTEXT_WINDOW_TURNS,
+        )
+        return total_messages, total_messages, 0
+
+    recent_non_system_ids = {id(message) for message in non_system_messages[-max_non_system_messages:]}
+    pruned_messages = [
+        message
+        for message in message_list
+        if _is_system_or_developer_message(message) or id(message) in recent_non_system_ids
+    ]
+    dropped_messages = total_messages - len(pruned_messages)
+
+    try:
+        messages[:] = pruned_messages
+    except Exception:
+        try:
+            setattr(turn_ctx, "messages", pruned_messages)
+        except Exception as exc:
+            logger.warning(
+                "context_pruned: turn_id=%s total_messages=%s kept_messages=%s dropped_messages=0 context_window_turns=%s reason=messages_not_mutable error=%s",
+                turn_id or _current_turn_id,
+                total_messages,
+                total_messages,
+                CONTEXT_WINDOW_TURNS,
+                _redact_sensitive_text(exc),
+            )
+            return total_messages, total_messages, 0
+
+    logger.info(
+        "context_pruned: turn_id=%s total_messages=%s kept_messages=%s dropped_messages=%s context_window_turns=%s",
+        turn_id or _current_turn_id,
+        total_messages,
+        len(pruned_messages),
+        dropped_messages,
+        CONTEXT_WINDOW_TURNS,
+    )
+    return total_messages, len(pruned_messages), dropped_messages
 
 
 def _apply_transcript_context_to_message(new_message: object, context: TranscriptContext) -> None:
@@ -2926,6 +3005,7 @@ class LucyAgent(Agent):
                 False,
                 False,
             )
+        _prune_turn_context_messages(turn_ctx, _current_turn_id)
         if PIPELINE_TEXT_DEBUG:
             msg_str = _last_user_message_text
             messages = getattr(turn_ctx, "messages", None)
