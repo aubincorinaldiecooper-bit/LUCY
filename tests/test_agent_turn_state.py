@@ -182,6 +182,124 @@ class AgentTurnStateTests(unittest.TestCase):
         self.assertFalse(agent._is_stale_llm_turn(47))
 
 
+class VoiceLifecycleObservabilityTests(unittest.TestCase):
+    def setUp(self):
+        self.hume_keys = dict(agent._hume_recent_request_keys)
+        self.hume_order = list(agent._hume_recent_request_order)
+
+    def tearDown(self):
+        agent._hume_recent_request_keys.clear()
+        agent._hume_recent_request_keys.update(self.hume_keys)
+        agent._hume_recent_request_order[:] = self.hume_order
+
+    def test_deprecated_cleanup_warning_removed_from_source(self):
+        with open(agent.__file__, "r", encoding="utf-8") as source_file:
+            self.assertNotIn("Deprecated one-argument assistant speech cleanup call ignored", source_file.read())
+
+    def test_stale_speech_ids_are_capped_and_pruned(self):
+        stale_ids = {f"speech_{index}" for index in range(25)}
+        stale_order = [f"speech_{index}" for index in range(25)]
+
+        pruned = agent._cap_recent_ids(stale_ids, stale_order, max_size=20)
+
+        self.assertEqual(pruned, 5)
+        self.assertEqual(len(stale_ids), 20)
+        self.assertNotIn("speech_0", stale_ids)
+        self.assertIn("speech_24", stale_ids)
+        self.assertEqual(len(stale_order), 20)
+
+    def test_latency_audit_drops_impossible_or_inherited_values(self):
+        audit = agent._build_voice_latency_audit(
+            turn_id=9,
+            speech_id="speech_9",
+            user_speech_started_at=20.0,
+            user_speech_stopped_at=19.0,
+            final_stt_received_at=21.0,
+            user_turn_committed_at=22.0,
+            llm_request_started_at=0.0,
+            llm_first_token_at=23.0,
+            llm_completed_at=24.0,
+            tts_request_started_at=18.0,
+            tts_first_audio_at=25.0,
+            tts_completed_at=26.0,
+            assistant_playout_started_at=25.5,
+            assistant_playout_completed_at=27.0,
+        )
+
+        self.assertIsNone(audit["user_speech_stopped_at"])
+        self.assertIsNone(audit["llm_request_started_at"])
+        self.assertIsNone(audit["tts_request_started_at"])
+        self.assertIsNone(audit["user_stopped_to_first_audio"])
+
+    def test_latency_audit_is_fresh_per_speech(self):
+        first = agent._build_voice_latency_audit(
+            turn_id=1,
+            speech_id="speech_1",
+            user_speech_started_at=1.0,
+            user_speech_stopped_at=2.0,
+            final_stt_received_at=3.0,
+            user_turn_committed_at=4.0,
+            llm_request_started_at=5.0,
+            llm_first_token_at=6.0,
+            llm_completed_at=7.0,
+            tts_request_started_at=8.0,
+            tts_first_audio_at=9.0,
+            tts_completed_at=10.0,
+            assistant_playout_started_at=9.5,
+            assistant_playout_completed_at=11.0,
+        )
+        second = agent._build_voice_latency_audit(
+            turn_id=2,
+            speech_id="speech_2",
+            user_speech_started_at=101.0,
+            user_speech_stopped_at=102.0,
+            final_stt_received_at=103.0,
+            user_turn_committed_at=104.0,
+            llm_request_started_at=None,
+            llm_first_token_at=None,
+            llm_completed_at=None,
+            tts_request_started_at=None,
+            tts_first_audio_at=None,
+            tts_completed_at=None,
+            assistant_playout_started_at=None,
+            assistant_playout_completed_at=None,
+        )
+
+        self.assertEqual(first["speech_id"], "speech_1")
+        self.assertEqual(second["speech_id"], "speech_2")
+        self.assertIsNone(second["llm_request_started_at"])
+        self.assertIsNone(second["tts_request_started_at"])
+
+    def test_hume_duplicate_request_detection_for_same_speech_and_hash(self):
+        first = agent._record_hume_request_metadata(
+            path="default_agent_tts_node_fallback",
+            speech_id="speech_1",
+            normalized_text_hash="abc123",
+            feeds_playout=True,
+        )
+        second = agent._record_hume_request_metadata(
+            path="default_agent_tts_node_fallback",
+            speech_id="speech_1",
+            normalized_text_hash="abc123",
+            feeds_playout=True,
+        )
+
+        self.assertFalse(first[1])
+        self.assertTrue(second[1])
+        self.assertEqual(first[0], second[0])
+
+    def test_hume_request_dedupe_key_includes_speech_and_hash(self):
+        key = agent._hume_request_dedupe_key("path", "speech_7", "hash_7")
+        self.assertIn("speech_7", key)
+        self.assertIn("hash_7", key)
+
+    def test_hume_logs_include_latest_agent_state_field(self):
+        with open(agent.__file__, "r", encoding="utf-8") as source_file:
+            source = source_file.read()
+        self.assertIn("latest_agent_state=%s", source)
+        self.assertIn("global _latest_agent_state_for_hume", source)
+
+
 class ContextPruningTests(unittest.TestCase):
     class Message:
         def __init__(self, role: str, content: str):
