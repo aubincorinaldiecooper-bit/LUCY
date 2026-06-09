@@ -182,10 +182,23 @@ _search_result_handoff_spoken = False
 _last_search_tool_output = ""
 _last_search_tool_output_hash = "empty"
 _last_generic_llm_fallback_used = False
+_current_turn_id = 0
+_turn_id_counter = 0
+_search_turn_id = 0
+_llm_turn_id = 0
+_current_turn_transcript_intent = "unknown"
+_current_turn_search_allowed = False
+_current_turn_search_allowed_reason = "not_evaluated"
 
 
-def _reset_search_state_for_turn() -> None:
-    global _search_tool_called, _search_in_progress, _search_started_at, _search_completed_at, _search_failed, _search_pre_ack_spoken, _search_specific_response_produced, _search_result_handoff_spoken, _last_search_tool_output, _last_search_tool_output_hash, _last_generic_llm_fallback_used
+def _next_turn_id() -> int:
+    global _turn_id_counter
+    _turn_id_counter += 1
+    return _turn_id_counter
+
+
+def _reset_search_state_for_turn(turn_id: int | None = None) -> None:
+    global _search_tool_called, _search_in_progress, _search_started_at, _search_completed_at, _search_failed, _search_pre_ack_spoken, _search_specific_response_produced, _search_result_handoff_spoken, _last_search_tool_output, _last_search_tool_output_hash, _last_generic_llm_fallback_used, _search_turn_id
     _search_tool_called = False
     _search_in_progress = False
     _search_started_at = 0.0
@@ -197,10 +210,12 @@ def _reset_search_state_for_turn() -> None:
     _last_search_tool_output = ""
     _last_search_tool_output_hash = "empty"
     _last_generic_llm_fallback_used = False
+    _search_turn_id = turn_id or _current_turn_id
 
 
-def _mark_search_wait_started(pre_ack_spoken: bool = False) -> None:
-    global _search_tool_called, _search_in_progress, _search_started_at, _search_completed_at, _search_failed, _search_pre_ack_spoken, _search_specific_response_produced, _search_result_handoff_spoken, _last_search_tool_output, _last_search_tool_output_hash
+def _mark_search_wait_started(pre_ack_spoken: bool = False, turn_id: int | None = None) -> None:
+    global _search_tool_called, _search_in_progress, _search_started_at, _search_completed_at, _search_failed, _search_pre_ack_spoken, _search_specific_response_produced, _search_result_handoff_spoken, _last_search_tool_output, _last_search_tool_output_hash, _search_turn_id
+    _search_turn_id = turn_id or _current_turn_id
     _search_tool_called = True
     _search_in_progress = True
     _search_started_at = time.monotonic()
@@ -213,8 +228,17 @@ def _mark_search_wait_started(pre_ack_spoken: bool = False) -> None:
     _last_search_tool_output_hash = "empty"
 
 
-def _mark_search_wait_completed(failed: bool, output: str, result_handoff_spoken: bool = False) -> None:
+def _mark_search_wait_completed(failed: bool, output: str, result_handoff_spoken: bool = False, turn_id: int | None = None) -> bool:
     global _search_in_progress, _search_completed_at, _search_failed, _search_specific_response_produced, _search_result_handoff_spoken, _last_search_tool_output, _last_search_tool_output_hash
+    completion_turn_id = turn_id or _search_turn_id
+    if completion_turn_id != _current_turn_id or _search_turn_id != _current_turn_id:
+        logger.warning(
+            "search_wait_completed stale_search_result_ignored=true search_turn_id=%s current_turn_id=%s completion_turn_id=%s",
+            _search_turn_id,
+            _current_turn_id,
+            completion_turn_id,
+        )
+        return False
     _search_in_progress = False
     _search_completed_at = time.monotonic()
     _search_failed = failed
@@ -222,6 +246,19 @@ def _mark_search_wait_completed(failed: bool, output: str, result_handoff_spoken
     _search_result_handoff_spoken = result_handoff_spoken
     _last_search_tool_output = output
     _last_search_tool_output_hash = _text_hash(output)
+    return True
+
+
+def _search_turn_matches_current() -> bool:
+    return _search_turn_id == _current_turn_id
+
+
+def _search_active_for_current_turn() -> bool:
+    return _search_in_progress and _search_turn_matches_current()
+
+
+def _search_specific_response_for_current_turn() -> bool:
+    return _search_tool_called and _search_specific_response_produced and _search_turn_matches_current()
 
 
 def _search_wait_elapsed_seconds() -> float:
@@ -229,6 +266,36 @@ def _search_wait_elapsed_seconds() -> float:
         return 0.0
     end = time.monotonic() if _search_in_progress else (_search_completed_at or time.monotonic())
     return max(0.0, end - _search_started_at)
+
+
+async def _maybe_await(value: object) -> None:
+    if inspect.isawaitable(value):
+        await value
+
+
+def _test_invoke_cleanup_method(target: object, method_name: str, speech_id: str, reason: str) -> tuple[bool, str]:
+    """Testable cleanup scheduler helper; production cleanup uses the same safe wrapping pattern."""
+    method = getattr(target, method_name, None)
+    if not callable(method):
+        return False, "missing"
+    result = method()
+    if inspect.isawaitable(result):
+        loop = asyncio.get_running_loop()
+        loop.create_task(_maybe_await(result))
+        logger.info(
+            "Assistant speech cleanup method succeeded: speech_id=%s method=%s reason=%s result=scheduled_awaitable",
+            speech_id,
+            method_name,
+            reason,
+        )
+        return True, "scheduled_awaitable"
+    logger.info(
+        "Assistant speech cleanup method succeeded: speech_id=%s method=%s reason=%s result=called",
+        speech_id,
+        method_name,
+        reason,
+    )
+    return True, "called"
 
 
 def _next_local_speech_id() -> str:
@@ -481,6 +548,25 @@ def attach_session_diagnostics(session: AgentSession) -> None:
 
         return lowered.strip()
 
+    async def _maybe_await_cleanup_result(value: object, speech_id: str, method_name: str, reason: str) -> None:
+        if inspect.isawaitable(value):
+            try:
+                await value
+                logger.info(
+                    "Assistant speech cleanup awaitable completed: speech_id=%s method=%s reason=%s",
+                    speech_id,
+                    method_name,
+                    reason,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Assistant speech cleanup awaitable failed: speech_id=%s method=%s reason=%s error=%s",
+                    speech_id,
+                    method_name,
+                    reason,
+                    _redact_sensitive_text(exc),
+                )
+
     def _invoke_cancel_method(target: object, method_name: str, speech_id: str, reason: str) -> tuple[bool, str]:
         method = getattr(target, method_name, None)
         if not callable(method):
@@ -490,7 +576,13 @@ def attach_session_diagnostics(session: AgentSession) -> None:
             if inspect.isawaitable(result):
                 try:
                     loop = asyncio.get_running_loop()
-                    loop.create_task(result)
+                    loop.create_task(_maybe_await_cleanup_result(result, speech_id, method_name, reason))
+                    logger.info(
+                        "Assistant speech cleanup method succeeded: speech_id=%s method=%s reason=%s result=scheduled_awaitable",
+                        speech_id,
+                        method_name,
+                        reason,
+                    )
                     return True, "scheduled_awaitable"
                 except RuntimeError:
                     logger.warning(
@@ -503,6 +595,12 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                     if callable(close_awaitable):
                         close_awaitable()
                     return False, "awaitable_without_running_loop"
+            logger.info(
+                "Assistant speech cleanup method succeeded: speech_id=%s method=%s reason=%s result=called",
+                speech_id,
+                method_name,
+                reason,
+            )
             return True, "called"
         except Exception as e:
             logger.warning(
@@ -527,7 +625,8 @@ def attach_session_diagnostics(session: AgentSession) -> None:
         active_count_before = len(active_speech_handles)
         active_ids_before = list(active_speech_handles.keys())
         logger.info(
-            "assistant_speech_cleanup_started cleanup_reason=%s current_new_speech_id=%s active_count_before=%s active_speech_ids=%s stale_speech_ids=%s",
+            "assistant_speech_cleanup_started turn_id=%s cleanup_reason=%s current_new_speech_id=%s active_count_before=%s active_speech_ids=%s stale_speech_ids=%s",
+            _current_turn_id,
             cleanup_reason,
             current_new_speech_id or "none",
             active_count_before,
@@ -536,7 +635,8 @@ def attach_session_diagnostics(session: AgentSession) -> None:
         )
         if not active_speech_handles:
             logger.info(
-                "Assistant speech cleanup finished: cleanup_reason=%s active_count_before=%s active_count_after=%s stale_speech_ids=%s new_speech_allowed=%s",
+                "Assistant speech cleanup finished: turn_id=%s cleanup_reason=%s active_count_before=%s active_count_after=%s stale_speech_ids=%s new_speech_allowed=%s",
+                _current_turn_id,
                 cleanup_reason,
                 active_count_before,
                 0,
@@ -600,7 +700,8 @@ def attach_session_diagnostics(session: AgentSession) -> None:
             if pending_user_handoff_speech_id == speech_id:
                 pending_user_handoff_speech_id = None
             logger.info(
-                "Assistant speech cleanup item: cleanup_reason=%s speech_id=%s current_new_speech_id=%s attempted_method=%s cleanup_result=%s active_count_after_item=%s stale_speech_ids=%s",
+                "Assistant speech cleanup item: turn_id=%s cleanup_reason=%s speech_id=%s current_new_speech_id=%s attempted_method=%s cleanup_result=%s active_count_after_item=%s stale_speech_ids=%s",
+                _current_turn_id,
                 cleanup_reason,
                 speech_id,
                 current_new_speech_id or "none",
@@ -613,7 +714,8 @@ def attach_session_diagnostics(session: AgentSession) -> None:
         _latest_active_assistant_count_for_hume = len(active_speech_handles)
         new_speech_allowed = current_new_speech_id is None or len(active_speech_handles) <= 1
         logger.info(
-            "Assistant speech cleanup finished: cleanup_reason=%s current_new_speech_id=%s active_count_before=%s active_count_after=%s stale_speech_ids=%s new_speech_allowed=%s",
+            "Assistant speech cleanup finished: turn_id=%s cleanup_reason=%s current_new_speech_id=%s active_count_before=%s active_count_after=%s stale_speech_ids=%s new_speech_allowed=%s",
+            _current_turn_id,
             cleanup_reason,
             current_new_speech_id or "none",
             active_count_before,
@@ -655,6 +757,29 @@ def attach_session_diagnostics(session: AgentSession) -> None:
         speech_id = _speech_id(resolved_handle)
         now = time.monotonic()
         speech_created_at[speech_id] = now
+
+        if latest_user_state == "speaking":
+            attempted_method = "none"
+            cleanup_result = "not_attempted"
+            for method_name in ("interrupt", "cancel", "stop", "close"):
+                attempted_method = method_name
+                ok, result = _invoke_cancel_method(resolved_handle, method_name, speech_id, "user_speaking_before_assistant_start")
+                if ok:
+                    cleanup_result = f"cancel_requested:{method_name}:{result}"
+                    break
+                if result != "missing":
+                    cleanup_result = f"cancel_failed:{method_name}:{result}"
+            stale_speech_ids.add(speech_id)
+            suppressed_speech_ids.add(speech_id)
+            assistant_speech_finished_at.setdefault(speech_id, time.monotonic())
+            logger.warning(
+                "assistant_speech_start_allowed=false assistant_speech_start_blocked_reason=user_speaking turn_id=%s speech_id=%s attempted_method=%s cleanup_result=%s",
+                _current_turn_id,
+                speech_id,
+                attempted_method,
+                cleanup_result,
+            )
+            return
 
         if speech_id in stale_speech_ids:
             logger.warning(
@@ -717,6 +842,11 @@ def attach_session_diagnostics(session: AgentSession) -> None:
             )
             _cleanup_active_assistant_speeches(speech_id, "force_cleanup_before_new_registration")
 
+        logger.info(
+            "assistant_speech_start_allowed=true assistant_speech_start_blocked_reason=none turn_id=%s speech_id=%s",
+            _current_turn_id,
+            speech_id,
+        )
         active_speech_handles[speech_id] = resolved_handle
         speech_start_times[speech_id] = now
         assistant_speech_started_at[speech_id] = now
@@ -738,7 +868,7 @@ def attach_session_diagnostics(session: AgentSession) -> None:
             _latest_current_speech_id_for_hume = speech_id
             _latest_active_assistant_count_for_hume = len(active_speech_handles)
 
-        logger.info("Assistant speech started: speech_id=%s active_count=%s", speech_id, len(active_speech_handles))
+        logger.info("Assistant speech started: turn_id=%s speech_id=%s active_count=%s", _current_turn_id, speech_id, len(active_speech_handles))
         logger.info(
             "Assistant speech Hume request baseline: speech_id=%s hume_request_count_at_start=%s active_count=%s",
             speech_id,
@@ -775,7 +905,8 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                 if was_active and not was_stale:
                     pending_user_handoff_speech_id = done_id
                 logger.info(
-                    "Assistant speech finished: speech_id=%s interrupted=%s active_count=%s was_suppressed=%s was_stale=%s was_active=%s",
+                    "Assistant speech finished: turn_id=%s speech_id=%s interrupted=%s active_count=%s was_suppressed=%s was_stale=%s was_active=%s",
+                    _current_turn_id,
                     done_id,
                     interrupted,
                     len(active_speech_handles),
@@ -840,7 +971,9 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                 tts_first_audio_to_playout_start = (speaking_at - _last_tts_first_audio_at) if (speaking_at is not None and _last_tts_first_audio_at is not None) else -1.0
                 user_stopped_to_assistant_complete = (finished_at - last_user_listening_at) if last_user_listening_at > 0 else -1.0
                 logger.info(
-                    "Voice latency audit: user_speech_started_at=%s user_speech_stopped_at=%s final_stt_received_at=%s user_turn_committed_at=%s llm_request_started_at=%s llm_first_token_at=%s llm_completed_at=%s tts_request_started_at=%s tts_first_audio_at=%s tts_completed_at=%s assistant_playout_started_at=%s assistant_playout_completed_at=%s user_stopped_to_final_stt=%s final_stt_to_turn_committed=%s turn_committed_to_llm_first_token=%s llm_first_token_to_llm_complete=%s llm_complete_to_tts_request=%s tts_request_to_first_audio=%s tts_first_audio_to_playout_start=%s user_stopped_to_first_audio=%s user_stopped_to_assistant_complete=%s endpointing_min_delay=%s endpointing_max_delay=%s mistral_target_streaming_delay_ms=%s spoken_text_normalization_enabled=%s spoken_text_normalization_mode=%s tts_input_buffering_mode=%s raw_chunk_count=%s normalized_yield_count=%s time_from_llm_first_token_to_first_tts_input=%s tts_provider=%s hume_instant_mode=%s hume_model_version=%s hume_speed=%s openrouter_model=%s llm_stream_status=%s llm_timeout_stage=%s llm_fallback_response_used=%s text_length=%s sentence_end_count=%s hume_requests_during_speech=%s tts_path=%s description_applied=%s",
+                    "Voice latency audit: turn_id=%s speech_id=%s user_speech_started_at=%s user_speech_stopped_at=%s final_stt_received_at=%s user_turn_committed_at=%s llm_request_started_at=%s llm_first_token_at=%s llm_completed_at=%s tts_request_started_at=%s tts_first_audio_at=%s tts_completed_at=%s assistant_playout_started_at=%s assistant_playout_completed_at=%s user_stopped_to_final_stt=%s final_stt_to_turn_committed=%s turn_committed_to_llm_first_token=%s llm_first_token_to_llm_complete=%s llm_complete_to_tts_request=%s tts_request_to_first_audio=%s tts_first_audio_to_playout_start=%s user_stopped_to_first_audio=%s user_stopped_to_assistant_complete=%s endpointing_min_delay=%s endpointing_max_delay=%s mistral_target_streaming_delay_ms=%s spoken_text_normalization_enabled=%s spoken_text_normalization_mode=%s tts_input_buffering_mode=%s raw_chunk_count=%s normalized_yield_count=%s time_from_llm_first_token_to_first_tts_input=%s tts_provider=%s hume_instant_mode=%s hume_model_version=%s hume_speed=%s openrouter_model=%s llm_stream_status=%s llm_timeout_stage=%s llm_fallback_response_used=%s text_length=%s sentence_end_count=%s hume_requests_during_speech=%s tts_path=%s description_applied=%s",
+                    _current_turn_id,
+                    done_id,
                     _fmt_seconds(last_user_speaking_at),
                     _fmt_seconds(last_user_listening_at),
                     _fmt_seconds(last_stt_final_at),
@@ -1111,6 +1244,8 @@ LLM_FALLBACK_RESPONSE = os.getenv(
     "Sorry, I blanked for a second. Say that again?",
 ).strip() or "Sorry, I blanked for a second. Say that again?"
 LLM_TO_TTS_HANDOFF_GUARD_ENABLED = env_bool("LLM_TO_TTS_HANDOFF_GUARD_ENABLED", False)
+PREEMPTIVE_GENERATION_ENABLED = env_bool("PREEMPTIVE_GENERATION_ENABLED", False)
+SEARCH_BRIDGE_MIN_DELAY_SECONDS = float(os.getenv("SEARCH_BRIDGE_MIN_DELAY_SECONDS", "0.75") or "0.75")
 
 
 def _pcm16_to_audio_frames(pcm_data: bytes, sample_rate: int, channels: int) -> list[rtc.AudioFrame]:
@@ -1753,9 +1888,10 @@ def _capability_contract_note_present(context: TranscriptContext) -> bool:
     return (context.detected_intent in capability_intents and bool(context.llm_context_note)) or "runtime capability contract" in note
 
 
-def _log_transcript_context_result(context: TranscriptContext, *, llm_started: bool, llm_error_type: str = "none") -> None:
+def _log_transcript_context_result(context: TranscriptContext, *, llm_started: bool, llm_error_type: str = "none", turn_id: int | None = None) -> None:
     logger.info(
-        "Transcript context result: transcript_context_layer_enabled=%s transcript_context_llm_enabled=%s transcript_context_llm_model=%s transcript_context_llm_timeout_ms=%s transcript_context_source=%s transcript_context_llm_started=%s transcript_context_llm_completed=%s transcript_context_llm_timed_out=%s transcript_context_llm_error_type=%s original_length=%s cleaned_length=%s detected_intent=%s ambiguity_detected=%s clarification_suggested=%s confidence=%s should_replace_user_text=%s context_note_present=%s capability_contract_note_present=%s",
+        "Transcript context result: turn_id=%s transcript_context_layer_enabled=%s transcript_context_llm_enabled=%s transcript_context_llm_model=%s transcript_context_llm_timeout_ms=%s transcript_context_source=%s transcript_context_llm_started=%s transcript_context_llm_completed=%s transcript_context_llm_timed_out=%s transcript_context_llm_error_type=%s original_length=%s cleaned_length=%s detected_intent=%s ambiguity_detected=%s clarification_suggested=%s confidence=%s should_replace_user_text=%s context_note_present=%s capability_contract_note_present=%s",
+        turn_id or _current_turn_id,
         transcript_context_layer_enabled(),
         transcript_context_llm_enabled(),
         transcript_context_llm_model(),
@@ -1782,6 +1918,27 @@ def _log_transcript_context_result(context: TranscriptContext, *, llm_started: b
             _redact_sensitive_text(context.cleaned_text)[:200],
             _redact_sensitive_text(context.llm_context_note or "")[:200],
         )
+
+
+def _search_policy_for_intent(intent: str | None, clarification_suggested: bool) -> tuple[bool, str]:
+    normalized = (intent or "unknown").strip().lower()
+    blocked_intents = {
+        "unclear_fragment",
+        "numeric_fragment",
+        "language_request",
+        "counting_request",
+        "calculation_request",
+        "pronunciation_correction",
+        "voice_change_request",
+        "date_time_question",
+    }
+    if normalized == "tool_request_search":
+        if clarification_suggested:
+            return False, "blocked_unclear_fragment"
+        return True, "clear_search_intent"
+    if normalized in blocked_intents:
+        return False, "blocked_non_lookup_intent" if normalized != "unclear_fragment" else "blocked_unclear_fragment"
+    return True, "llm_tool_call"
 
 
 def _metadata_candidates_from_context(ctx: JobContext) -> list[Any]:
@@ -1825,6 +1982,9 @@ class LucyAgent(Agent):
         provider = search_provider()
         disabled_reason = search_disabled_reason()
         runtime_context = self.runtime_context
+        turn_id = _current_turn_id
+        search_allowed = _current_turn_search_allowed
+        search_allowed_reason = _current_turn_search_allowed_reason
         current_date = runtime_context.current_date if runtime_context else None
         current_datetime_iso = runtime_context.current_datetime_iso if runtime_context else None
         session_timezone = runtime_context.session_timezone if runtime_context else None
@@ -1835,7 +1995,9 @@ class LucyAgent(Agent):
             requested_max_results = search_max_results()
         capped_max_results = min(requested_max_results, search_max_results())
         logger.info(
-            "search_tool_called search_provider=%s search_query_original=%s search_current_date=%s search_current_datetime_iso=%s search_timezone=%s search_freshness_applied=%s search_disabled_reason=%s search_pre_ack_spoken=%s requested_max_results=%s capped_max_results=%s",
+            "search_tool_called turn_id=%s search_turn_id=%s search_provider=%s search_query_original=%s search_current_date=%s search_current_datetime_iso=%s search_timezone=%s search_freshness_applied=%s search_disabled_reason=%s search_pre_ack_spoken=%s requested_max_results=%s capped_max_results=%s search_allowed_for_turn=%s search_allowed_reason=%s detected_intent=%s",
+            turn_id,
+            turn_id,
             provider,
             _redact_sensitive_text(query),
             current_date or "unknown",
@@ -1846,7 +2008,21 @@ class LucyAgent(Agent):
             False,
             max_results,
             capped_max_results,
+            search_allowed,
+            search_allowed_reason,
+            _current_turn_transcript_intent,
         )
+        if not search_allowed:
+            output = "I need one more detail before searching. What exactly should I look up?"
+            logger.warning(
+                "search_blocked_by_turn_policy turn_id=%s search_allowed_for_turn=%s search_allowed_reason=%s detected_intent=%s search_query_original=%s",
+                turn_id,
+                search_allowed,
+                search_allowed_reason,
+                _current_turn_transcript_intent,
+                _redact_sensitive_text(query),
+            )
+            return output
         if disabled_reason is not None:
             logger.warning(
                 "search_disabled_reason=%s search_provider=%s search_query_original=%s search_current_date=%s search_current_datetime_iso=%s search_timezone=%s search_freshness_applied=%s search_specific_failure_response_used=%s",
@@ -1860,16 +2036,20 @@ class LucyAgent(Agent):
                 True,
             )
             output = f"{SEARCH_DISABLED_MESSAGE} Say: {search_failure_response()}"
-            _mark_search_wait_completed(failed=True, output=output, result_handoff_spoken=False)
+            _mark_search_wait_completed(failed=True, output=output, result_handoff_spoken=False, turn_id=turn_id)
             return output
 
-        _mark_search_wait_started(pre_ack_spoken=False)
+        _mark_search_wait_started(pre_ack_spoken=False, turn_id=turn_id)
         logger.info(
-            "search_wait_started search_in_progress=%s search_started_at=%s search_pre_ack_spoken=%s search_query_original=%s",
+            "search_wait_started turn_id=%s search_turn_id=%s search_in_progress=%s search_started_at=%s search_pre_ack_spoken=%s search_query_original=%s search_allowed_for_turn=%s search_allowed_reason=%s",
+            turn_id,
+            _search_turn_id,
             _search_in_progress,
             _search_started_at,
             _search_pre_ack_spoken,
             _redact_sensitive_text(query),
+            search_allowed,
+            search_allowed_reason,
         )
         results = await internet_search(
             query=query,
@@ -1880,9 +2060,13 @@ class LucyAgent(Agent):
         )
         if not results:
             output = f"{SEARCH_DISABLED_MESSAGE} Say: {search_failure_response()}"
-            _mark_search_wait_completed(failed=True, output=output, result_handoff_spoken=False)
+            completion_applied = _mark_search_wait_completed(failed=True, output=output, result_handoff_spoken=False, turn_id=turn_id)
+            if not completion_applied:
+                return "Search result ignored because a newer user turn started. Do not speak this stale result."
             logger.info(
-                "search_result_count=0 search_provider=exa search_query_original=%s search_current_date=%s search_current_datetime_iso=%s search_timezone=%s search_freshness_applied=%s search_result_handoff_spoken=%s search_wait_completed search_in_progress=%s search_failed=%s search_specific_failure_response_used=%s search_latency_seconds=%.3f",
+                "search_result_count=0 turn_id=%s search_turn_id=%s search_provider=exa search_query_original=%s search_current_date=%s search_current_datetime_iso=%s search_timezone=%s search_freshness_applied=%s search_result_handoff_spoken=%s search_wait_completed search_in_progress=%s search_failed=%s search_specific_failure_response_used=%s search_latency_seconds=%.3f",
+                turn_id,
+                _search_turn_id,
                 _redact_sensitive_text(query),
                 current_date or "unknown",
                 current_datetime_iso or "unknown",
@@ -1896,10 +2080,21 @@ class LucyAgent(Agent):
             )
         else:
             output = format_search_results_for_voice(results, current_date=current_date, freshness_applied=freshness_applied)
-            _mark_search_wait_completed(failed=False, output=output, result_handoff_spoken=False)
+            search_elapsed = _search_wait_elapsed_seconds()
+            if search_elapsed < SEARCH_BRIDGE_MIN_DELAY_SECONDS:
+                output = output.replace(
+                    "If you did not already say a lookup bridge before the tool call, say:",
+                    "Search returned quickly; do not say a separate lookup bridge. Start with the result handoff instead of:",
+                    1,
+                )
+            completion_applied = _mark_search_wait_completed(failed=False, output=output, result_handoff_spoken=False, turn_id=turn_id)
+            if not completion_applied:
+                return "Search result ignored because a newer user turn started. Do not speak this stale result."
             logger.info(
-                "search_result_count=%s search_provider=exa search_query_original=%s search_current_date=%s search_current_datetime_iso=%s search_timezone=%s search_freshness_applied=%s search_result_dates=%s search_result_handoff_spoken=%s search_wait_completed search_in_progress=%s search_failed=%s search_specific_failure_response_used=%s search_latency_seconds=%.3f",
+                "search_result_count=%s turn_id=%s search_turn_id=%s search_provider=exa search_query_original=%s search_current_date=%s search_current_datetime_iso=%s search_timezone=%s search_freshness_applied=%s search_result_dates=%s search_result_handoff_spoken=%s search_wait_completed search_in_progress=%s search_failed=%s search_specific_failure_response_used=%s search_latency_seconds=%.3f search_bridge_min_delay_seconds=%.3f",
                 len(results),
+                turn_id,
+                _search_turn_id,
                 _redact_sensitive_text(query),
                 current_date or "unknown",
                 current_datetime_iso or "unknown",
@@ -1911,6 +2106,7 @@ class LucyAgent(Agent):
                 _search_failed,
                 False,
                 _search_wait_elapsed_seconds(),
+                SEARCH_BRIDGE_MIN_DELAY_SECONDS,
             )
         return output
 
@@ -1932,7 +2128,8 @@ class LucyAgent(Agent):
         _last_tts_normalized_yield_count = 0
         _last_tts_first_input_at = None
         logger.info(
-            "TTS node entered: TTS_PROVIDER=%s SPOKEN_TEXT_NORMALIZATION=%s spoken_text_normalization_mode=%s tts_input_buffering_mode=%s handoff_guard_enabled=%s llm_stream_status=%s",
+            "TTS node entered: turn_id=%s TTS_PROVIDER=%s SPOKEN_TEXT_NORMALIZATION=%s spoken_text_normalization_mode=%s tts_input_buffering_mode=%s handoff_guard_enabled=%s llm_stream_status=%s",
+            _current_turn_id,
             TTS_PROVIDER,
             SPOKEN_TEXT_NORMALIZATION,
             SPOKEN_TEXT_NORMALIZATION_MODE,
@@ -2214,7 +2411,8 @@ class LucyAgent(Agent):
         datetime_intent = detect_datetime_intent(datetime_user_text)
         if datetime_intent and self.runtime_context is not None:
             async def _datetime_guard_stream():
-                global _last_llm_start_at, _last_llm_first_token_at, _last_llm_complete_at, _last_llm_stream_status, _last_llm_timeout_stage, _last_llm_fallback_response_used, _pending_llm_fallback_text, _last_llm_completed_text, _last_llm_completed_text_hash, _last_llm_completed_at, _last_generic_llm_fallback_used
+                global _last_llm_start_at, _last_llm_first_token_at, _last_llm_complete_at, _last_llm_stream_status, _last_llm_timeout_stage, _last_llm_fallback_response_used, _pending_llm_fallback_text, _last_llm_completed_text, _last_llm_completed_text_hash, _last_llm_completed_at, _last_generic_llm_fallback_used, _llm_turn_id
+                _llm_turn_id = _current_turn_id
                 answer = answer_datetime_intent(self.runtime_context, datetime_intent)
                 now = time.monotonic()
                 _last_llm_start_at = now
@@ -2229,9 +2427,11 @@ class LucyAgent(Agent):
                 _last_llm_completed_text = answer
                 _last_llm_completed_text_hash = _text_hash(answer)
                 logger.info(
-                    "Date/time guard triggered: datetime_guard_triggered=%s datetime_intent=%s datetime_answer_source=runtime_context search_called=%s session_timezone=%s runtime_current_date=%s runtime_current_time=%s text_length=%s",
+                    "Date/time guard triggered: turn_id=%s datetime_guard_triggered=%s datetime_intent=%s datetime_answer_source=runtime_context search_called=%s session_timezone=%s runtime_current_date=%s runtime_current_time=%s text_length=%s",
+                    _current_turn_id,
                     True,
                     datetime_intent,
+                    "runtime_context",
                     False,
                     self.runtime_context.session_timezone,
                     self.runtime_context.current_date,
@@ -2240,7 +2440,10 @@ class LucyAgent(Agent):
                 )
                 yield answer
                 logger.info(
-                    "LLM stream ended: status=%s first_token_seen=%s chunk_count=%s text_length=%s fallback_used=%s timeout_stage=%s search_in_progress=%s search_tool_called=%s search_failed=%s generic_llm_fallback_used=%s",
+                    "LLM stream ended: turn_id=%s llm_turn_id=%s search_turn_id=%s status=%s first_token_seen=%s chunk_count=%s text_length=%s fallback_used=%s timeout_stage=%s search_in_progress=%s search_tool_called=%s search_failed=%s generic_llm_fallback_used=%s",
+                    _current_turn_id,
+                    _llm_turn_id,
+                    _search_turn_id,
                     _last_llm_stream_status,
                     True,
                     1,
@@ -2261,6 +2464,8 @@ class LucyAgent(Agent):
             assistant_fragments: list[str] = []
             chunk_count = 0
             model_name = os.getenv("OPENROUTER_MODEL", OPENROUTER_DEFAULT_MODEL)
+            llm_turn_id = _current_turn_id
+            _llm_turn_id = llm_turn_id
             _last_llm_stream_status = "started"
             _last_llm_timeout_stage = "none"
             _last_llm_fallback_response_used = False
@@ -2278,10 +2483,13 @@ class LucyAgent(Agent):
             it = stream.__aiter__()
             fallback_yielded = False
             logger.info(
-                "LLM stream starting: openrouter_model=%s first_token_timeout_seconds=%s total_timeout_seconds=%s",
+                "LLM stream starting: turn_id=%s llm_turn_id=%s openrouter_model=%s first_token_timeout_seconds=%s total_timeout_seconds=%s search_turn_id=%s",
+                _current_turn_id,
+                llm_turn_id,
                 model_name,
                 LLM_FIRST_TOKEN_TIMEOUT_SECONDS,
                 LLM_TOTAL_TIMEOUT_SECONDS,
+                _search_turn_id,
             )
 
             def _extract_text_delta(chunk: object) -> str:
@@ -2339,24 +2547,29 @@ class LucyAgent(Agent):
             async def _yield_fallback(reason: str) -> AsyncIterable[str]:
                 nonlocal fallback_yielded
                 global _pending_llm_fallback_text, _last_llm_fallback_response_used, _last_generic_llm_fallback_used
-                if _search_in_progress:
+                search_turn_matches_current = _search_turn_matches_current() and _search_turn_id == llm_turn_id
+                if _search_in_progress and search_turn_matches_current:
                     logger.warning(
-                        "llm_fallback_suppressed_reason=search_in_progress reason=%s search_in_progress=%s search_tool_called=%s search_wait_elapsed_seconds=%.3f generic_llm_fallback_used=%s",
-                        reason,
+                        "fallback_decision_turn_id=%s fallback_suppressed=true fallback_suppressed_reason=search_in_progress search_in_progress=%s search_tool_called=%s search_turn_id=%s search_turn_matches_current=%s search_wait_elapsed_seconds=%.3f generic_llm_fallback_used=%s",
+                        llm_turn_id,
                         _search_in_progress,
                         _search_tool_called,
+                        _search_turn_id,
+                        search_turn_matches_current,
                         _search_wait_elapsed_seconds(),
                         False,
                     )
                     return
-                if _search_tool_called and _search_specific_response_produced:
+                if _search_specific_response_produced and search_turn_matches_current:
                     logger.warning(
-                        "llm_fallback_suppressed_reason=search_specific_response_available reason=%s search_in_progress=%s search_tool_called=%s search_failed=%s search_specific_failure_response_used=%s generic_llm_fallback_used=%s",
-                        reason,
+                        "fallback_decision_turn_id=%s fallback_suppressed=true fallback_suppressed_reason=search_specific_response_available search_in_progress=%s search_tool_called=%s search_failed=%s search_specific_failure_response_used=%s search_turn_id=%s search_turn_matches_current=%s generic_llm_fallback_used=%s",
+                        llm_turn_id,
                         _search_in_progress,
                         _search_tool_called,
                         _search_failed,
                         _search_failed,
+                        _search_turn_id,
+                        search_turn_matches_current,
                         False,
                     )
                     return
@@ -2365,12 +2578,15 @@ class LucyAgent(Agent):
                 _last_generic_llm_fallback_used = True
                 _pending_llm_fallback_text = None
                 logger.warning(
-                    "LLM fallback yielded to TTS: reason=%s fallback_text_length=%s generic_llm_fallback_used=%s search_in_progress=%s search_tool_called=%s",
+                    "LLM fallback yielded to TTS: fallback_decision_turn_id=%s fallback_suppressed=false fallback_suppressed_reason=none reason=%s fallback_text_length=%s generic_llm_fallback_used=%s search_in_progress=%s search_tool_called=%s search_turn_id=%s search_turn_matches_current=%s",
+                    llm_turn_id,
                     reason,
                     len(LLM_FALLBACK_RESPONSE),
                     True,
                     _search_in_progress,
                     _search_tool_called,
+                    _search_turn_id,
+                    _search_turn_matches_current() and _search_turn_id == llm_turn_id,
                 )
                 yield LLM_FALLBACK_RESPONSE
 
@@ -2379,27 +2595,34 @@ class LucyAgent(Agent):
 
             def _suppress_generic_fallback_for_search(reason: str) -> bool:
                 nonlocal search_fallback_suppressed_logged
-                if _search_in_progress:
+                search_turn_matches_current = _search_turn_matches_current() and _search_turn_id == llm_turn_id
+                if _search_in_progress and search_turn_matches_current:
                     if not search_fallback_suppressed_logged:
                         logger.warning(
-                            "llm_fallback_suppressed_reason=search_in_progress reason=%s search_in_progress=%s search_tool_called=%s search_started_at=%s search_wait_elapsed_seconds=%.3f generic_llm_fallback_used=%s",
+                            "fallback_decision_turn_id=%s fallback_suppressed=true fallback_suppressed_reason=search_in_progress reason=%s search_in_progress=%s search_tool_called=%s search_started_at=%s search_turn_id=%s search_turn_matches_current=%s search_wait_elapsed_seconds=%.3f generic_llm_fallback_used=%s",
+                            llm_turn_id,
                             reason,
                             _search_in_progress,
                             _search_tool_called,
                             _search_started_at,
+                            _search_turn_id,
+                            search_turn_matches_current,
                             _search_wait_elapsed_seconds(),
                             False,
                         )
                         search_fallback_suppressed_logged = True
                     return True
-                if _search_tool_called and _search_specific_response_produced:
+                if _search_specific_response_produced and search_turn_matches_current:
                     logger.warning(
-                        "llm_fallback_suppressed_reason=search_specific_response_available reason=%s search_in_progress=%s search_tool_called=%s search_failed=%s search_specific_failure_response_used=%s generic_llm_fallback_used=%s",
+                        "fallback_decision_turn_id=%s fallback_suppressed=true fallback_suppressed_reason=search_specific_response_available reason=%s search_in_progress=%s search_tool_called=%s search_failed=%s search_specific_failure_response_used=%s search_turn_id=%s search_turn_matches_current=%s generic_llm_fallback_used=%s",
+                        llm_turn_id,
                         reason,
                         _search_in_progress,
                         _search_tool_called,
                         _search_failed,
                         _search_failed,
+                        _search_turn_id,
+                        search_turn_matches_current,
                         False,
                     )
                     return True
@@ -2608,7 +2831,10 @@ class LucyAgent(Agent):
                 if _last_llm_completed_at <= 0.0 and _last_llm_stream_status in {"ok", "empty_stream", "provider_error", "first_token_timeout", "total_timeout"}:
                     _last_llm_completed_at = _last_llm_complete_at
                 logger.info(
-                    "LLM stream ended: status=%s first_token_seen=%s chunk_count=%s text_length=%s fallback_used=%s timeout_stage=%s search_in_progress=%s search_tool_called=%s search_failed=%s generic_llm_fallback_used=%s",
+                    "LLM stream ended: turn_id=%s llm_turn_id=%s search_turn_id=%s status=%s first_token_seen=%s chunk_count=%s text_length=%s fallback_used=%s timeout_stage=%s search_in_progress=%s search_tool_called=%s search_failed=%s generic_llm_fallback_used=%s",
+                    _current_turn_id,
+                    _llm_turn_id,
+                    _search_turn_id,
                     _last_llm_stream_status,
                     _last_llm_first_token_at is not None,
                     chunk_count,
@@ -2624,7 +2850,9 @@ class LucyAgent(Agent):
         return _llm_stream()
 
     async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
-        global _last_turn_committed_at, _last_llm_start_at, _last_llm_first_token_at, _last_llm_complete_at, _last_llm_stream_status, _last_llm_timeout_stage, _last_llm_fallback_response_used, _last_llm_completed_text, _last_llm_completed_text_hash, _last_llm_completed_at, _last_tts_received_text_hash, _last_user_message_text
+        global _last_turn_committed_at, _last_llm_start_at, _last_llm_first_token_at, _last_llm_complete_at, _last_llm_stream_status, _last_llm_timeout_stage, _last_llm_fallback_response_used, _last_llm_completed_text, _last_llm_completed_text_hash, _last_llm_completed_at, _last_tts_received_text_hash, _last_user_message_text, _current_turn_id, _current_turn_transcript_intent, _current_turn_search_allowed, _current_turn_search_allowed_reason
+        _current_turn_id = _next_turn_id()
+        _reset_search_state_for_turn(_current_turn_id)
         _last_turn_committed_at = time.monotonic()
         _last_llm_start_at = 0.0
         _last_llm_first_token_at = None
@@ -2637,6 +2865,13 @@ class LucyAgent(Agent):
         _last_llm_completed_at = 0.0
         _last_user_message_text = _extract_text_for_debug(new_message).strip()
         _last_tts_received_text_hash = "empty"
+        logger.info(
+            "User turn committed: turn_id=%s search_state_reset=true search_turn_id=%s search_in_progress=%s search_tool_called=%s",
+            _current_turn_id,
+            _search_turn_id,
+            _search_in_progress,
+            _search_tool_called,
+        )
         if transcript_context_layer_enabled():
             transcript_context_llm_started = transcript_context_llm_enabled()
             context_error_type = "none"
@@ -2654,16 +2889,33 @@ class LucyAgent(Agent):
                     _redact_sensitive_text(exc),
                 )
                 transcript_context = detect_transcript_context(_last_user_message_text)
+            _current_turn_transcript_intent = transcript_context.detected_intent or "unknown"
+            _current_turn_search_allowed, _current_turn_search_allowed_reason = _search_policy_for_intent(
+                _current_turn_transcript_intent,
+                transcript_context.clarification_suggested,
+            )
+            logger.info(
+                "search_allowed_for_turn=%s search_allowed_reason=%s turn_id=%s detected_intent=%s clarification_suggested=%s",
+                _current_turn_search_allowed,
+                _current_turn_search_allowed_reason,
+                _current_turn_id,
+                _current_turn_transcript_intent,
+                transcript_context.clarification_suggested,
+            )
             _apply_transcript_context_to_message(new_message, transcript_context)
             if transcript_context.should_replace_user_text and transcript_context.cleaned_text:
                 _last_user_message_text = transcript_context.cleaned_text
             _inject_transcript_context_note(turn_ctx, transcript_context)
             if transcript_context.source == "deterministic_llm_error_fallback" and context_error_type == "none":
                 context_error_type = "llm_error_or_invalid_json"
-            _log_transcript_context_result(transcript_context, llm_started=transcript_context_llm_started, llm_error_type=context_error_type)
+            _log_transcript_context_result(transcript_context, llm_started=transcript_context_llm_started, llm_error_type=context_error_type, turn_id=_current_turn_id)
         else:
+            _current_turn_transcript_intent = "disabled"
+            _current_turn_search_allowed = True
+            _current_turn_search_allowed_reason = "llm_tool_call"
             logger.info(
-                "Transcript context result: transcript_context_layer_enabled=%s transcript_context_llm_enabled=%s transcript_context_llm_model=%s transcript_context_llm_timeout_ms=%s transcript_context_source=%s original_length=%s cleaned_length=%s context_note_present=%s capability_contract_note_present=%s",
+                "Transcript context result: turn_id=%s transcript_context_layer_enabled=%s transcript_context_llm_enabled=%s transcript_context_llm_model=%s transcript_context_llm_timeout_ms=%s transcript_context_source=%s original_length=%s cleaned_length=%s context_note_present=%s capability_contract_note_present=%s",
+                _current_turn_id,
                 False,
                 transcript_context_llm_enabled(),
                 transcript_context_llm_model(),
@@ -3008,6 +3260,12 @@ async def entrypoint(ctx: JobContext):
         resolved_turn_detection_mode = "vad"
         logger.info("Using non-Flux VAD turn handling")
 
+    session_kwargs["preemptive_generation"] = PREEMPTIVE_GENERATION_ENABLED
+    logger.info(
+        "Preemptive generation config: preemptive_generation_enabled=%s context_or_tools_mutate=%s",
+        PREEMPTIVE_GENERATION_ENABLED,
+        True,
+    )
     session = AgentSession(**session_kwargs)
     resolved_stt = session_kwargs.get("stt")
     logger.info("Resolved STT type: %s", type(resolved_stt).__name__)
