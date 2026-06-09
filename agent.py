@@ -36,6 +36,7 @@ from internet_search import (
 from runtime_context import RuntimeContext, answer_datetime_intent, detect_datetime_intent, runtime_context_from_metadata
 from transcript_context import (
     TranscriptContext,
+    clean_transcript,
     detect_transcript_context,
     interpret_transcript_context,
     transcript_context_debug,
@@ -171,6 +172,9 @@ _last_tts_first_input_at: float | None = None
 _latest_user_state_for_greeting = "unknown"
 _latest_user_state_changed_at = 0.0
 _latest_user_speaking_at = 0.0
+_latest_stt_partial_at = 0.0
+_latest_stt_partial_text_hash = "empty"
+_latest_stt_final_at = 0.0
 _search_tool_called = False
 _search_in_progress = False
 _search_started_at = 0.0
@@ -995,8 +999,8 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                     _fmt_seconds(tts_first_audio_to_playout_start),
                     _fmt_seconds(user_stopped_to_first_audio),
                     _fmt_seconds(user_stopped_to_assistant_complete),
-                    os.getenv("LIVEKIT_ENDPOINTING_MIN_DELAY", "0.7"),
-                    os.getenv("LIVEKIT_ENDPOINTING_MAX_DELAY", "3.0"),
+                    os.getenv("ENDPOINTING_MIN_DELAY_SECONDS", os.getenv("LIVEKIT_ENDPOINTING_MIN_DELAY", "1.1")),
+                    os.getenv("ENDPOINTING_MAX_DELAY_SECONDS", os.getenv("LIVEKIT_ENDPOINTING_MAX_DELAY", "2.4")),
                     os.getenv("MISTRAL_TARGET_STREAMING_DELAY_MS", "160"),
                     SPOKEN_TEXT_NORMALIZATION,
                     SPOKEN_TEXT_NORMALIZATION_MODE,
@@ -1119,6 +1123,7 @@ def attach_session_diagnostics(session: AgentSession) -> None:
     @session.on("user_input_transcribed")
     def _on_user_input_transcribed(event: object) -> None:
         nonlocal stt_partial_count, stt_final_count, last_stt_any_at, last_stt_final_at, last_stt_preview, last_stt_final_preview
+        global _latest_stt_partial_at, _latest_stt_partial_text_hash, _latest_stt_final_at
         final = getattr(event, "final", getattr(event, "is_final", "n/a"))
         language = _safe_attr(event, "language", "n/a")
         speaker_id = getattr(event, "speaker_id", None)
@@ -1132,9 +1137,12 @@ def attach_session_diagnostics(session: AgentSession) -> None:
         if is_final:
             stt_final_count += 1
             last_stt_final_at = last_stt_any_at
+            _latest_stt_final_at = last_stt_any_at
             last_stt_final_preview = last_stt_preview
         else:
             stt_partial_count += 1
+            _latest_stt_partial_at = last_stt_any_at
+            _latest_stt_partial_text_hash = _text_hash(transcript_str)
         if not PIPELINE_TEXT_DEBUG:
             return
         logger.info(
@@ -1186,8 +1194,8 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                     os.getenv("AI_COUSTICS_MODEL", "QUAIL_L"),
                     os.getenv("AI_COUSTICS_LEVEL", "0.7"),
                     os.getenv("LIVEKIT_ENDPOINTING_MODE", "dynamic"),
-                    os.getenv("LIVEKIT_ENDPOINTING_MIN_DELAY", "0.7"),
-                    os.getenv("LIVEKIT_ENDPOINTING_MAX_DELAY", "3.0"),
+                    os.getenv("ENDPOINTING_MIN_DELAY_SECONDS", os.getenv("LIVEKIT_ENDPOINTING_MIN_DELAY", "1.1")),
+                    os.getenv("ENDPOINTING_MAX_DELAY_SECONDS", os.getenv("LIVEKIT_ENDPOINTING_MAX_DELAY", "2.4")),
                 )
 
     @session.on("close")
@@ -1247,6 +1255,8 @@ LLM_TO_TTS_HANDOFF_GUARD_ENABLED = env_bool("LLM_TO_TTS_HANDOFF_GUARD_ENABLED", 
 CONTEXT_WINDOW_TURNS = env_int_clamped("CONTEXT_WINDOW_TURNS", 10, 4, 100)
 PREEMPTIVE_GENERATION_ENABLED = env_bool("PREEMPTIVE_GENERATION_ENABLED", False)
 SEARCH_BRIDGE_MIN_DELAY_SECONDS = float(os.getenv("SEARCH_BRIDGE_MIN_DELAY_SECONDS", "0.75") or "0.75")
+ENDPOINTING_WAIT_EXTENSION_MIN_MS = env_int_clamped("ENDPOINTING_WAIT_EXTENSION_MIN_MS", 600, 100, 5000)
+ENDPOINTING_WAIT_EXTENSION_MAX_MS = env_int_clamped("ENDPOINTING_WAIT_EXTENSION_MAX_MS", 1200, 100, 5000)
 
 
 def _pcm16_to_audio_frames(pcm_data: bytes, sample_rate: int, channels: int) -> list[rtc.AudioFrame]:
@@ -1834,6 +1844,69 @@ def _recent_turn_previews_from_chat_ctx(chat_ctx: object, limit: int = 5) -> lis
             continue
         previews.append(f"{role}: {_redact_sensitive_text(text)[:240]}")
     return previews
+
+
+def _word_count(text: str) -> int:
+    return len(re.findall(r"\b[\w']+\b", text))
+
+
+def _generic_fallback_suppression_reason(fallback_turn_id: int, fallback_started_at: float) -> str | None:
+    if (
+        _latest_user_state_for_greeting == "speaking"
+        or _current_turn_id != fallback_turn_id
+        or _latest_user_speaking_at > fallback_started_at
+        or (_latest_stt_partial_at > fallback_started_at and _latest_stt_partial_at > _latest_stt_final_at)
+    ):
+        return "user_speaking_or_newer_turn_pending"
+    return None
+
+
+def _endpointing_wait_extension_ms() -> int:
+    lower = min(ENDPOINTING_WAIT_EXTENSION_MIN_MS, ENDPOINTING_WAIT_EXTENSION_MAX_MS)
+    upper = max(ENDPOINTING_WAIT_EXTENSION_MIN_MS, ENDPOINTING_WAIT_EXTENSION_MAX_MS)
+    return max(lower, min(upper, 900))
+
+
+def _is_clear_short_commit(text: str) -> bool:
+    cleaned = clean_transcript(text).strip().lower()
+    normalized = cleaned.rstrip(".!?").strip()
+    if not normalized:
+        return False
+    if cleaned.endswith("?"):
+        return True
+    if normalized in {"yes", "no", "yeah", "yep", "nope", "okay", "ok", "stop", "send it"}:
+        return True
+    if re.search(r"\b(what time is it|what day is it|what'?s today|count to|search that|look that up|stop|send it)\b", normalized):
+        return True
+    return False
+
+
+def _is_stale_llm_turn(llm_turn_id: int) -> bool:
+    return _current_turn_id != llm_turn_id
+
+
+def _endpointing_decision_for_transcript(text: str, context: TranscriptContext | None = None) -> tuple[str, str, int]:
+    cleaned = clean_transcript(text or "")
+    normalized = cleaned.strip().lower().replace("’", "'")
+    stripped = normalized.rstrip()
+    if _is_clear_short_commit(cleaned):
+        return "commit", "none", 0
+    if stripped.endswith(","):
+        return "extend_wait", "trailing_comma", _endpointing_wait_extension_ms()
+    stripped_no_punct = stripped.rstrip(".!?").strip()
+    filler_phrases = ("so", "like", "i mean", "you know", "because", "and")
+    if stripped_no_punct in filler_phrases or any(stripped_no_punct.endswith(f" {phrase}") for phrase in filler_phrases):
+        return "extend_wait", "filler_phrase", _endpointing_wait_extension_ms()
+    if stripped_no_punct.startswith("now") and _word_count(stripped_no_punct) <= 3:
+        return "extend_wait", "filler_phrase", _endpointing_wait_extension_ms()
+    if context is not None:
+        if context.detected_intent == "unclear_fragment":
+            return "extend_wait", "unclear_fragment", _endpointing_wait_extension_ms()
+        if context.ambiguity_detected and context.clarification_suggested:
+            return "extend_wait", "unclear_fragment", _endpointing_wait_extension_ms()
+    if _word_count(stripped_no_punct) < 4:
+        return "extend_wait", "short_fragment", _endpointing_wait_extension_ms()
+    return "commit", "none", 0
 
 
 def _is_system_or_developer_message(message: object) -> bool:
@@ -2520,7 +2593,7 @@ class LucyAgent(Agent):
                 yield answer
                 logger.info(
                     "LLM stream ended: turn_id=%s llm_turn_id=%s search_turn_id=%s status=%s first_token_seen=%s chunk_count=%s text_length=%s fallback_used=%s timeout_stage=%s search_in_progress=%s search_tool_called=%s search_failed=%s generic_llm_fallback_used=%s",
-                    _current_turn_id,
+                    _llm_turn_id,
                     _llm_turn_id,
                     _search_turn_id,
                     _last_llm_stream_status,
@@ -2563,7 +2636,7 @@ class LucyAgent(Agent):
             fallback_yielded = False
             logger.info(
                 "LLM stream starting: turn_id=%s llm_turn_id=%s openrouter_model=%s first_token_timeout_seconds=%s total_timeout_seconds=%s search_turn_id=%s",
-                _current_turn_id,
+                llm_turn_id,
                 llm_turn_id,
                 model_name,
                 LLM_FIRST_TOKEN_TIMEOUT_SECONDS,
@@ -2627,6 +2700,18 @@ class LucyAgent(Agent):
                 nonlocal fallback_yielded
                 global _pending_llm_fallback_text, _last_llm_fallback_response_used, _last_generic_llm_fallback_used
                 search_turn_matches_current = _search_turn_matches_current() and _search_turn_id == llm_turn_id
+                generic_suppression_reason = _generic_fallback_suppression_reason(llm_turn_id, start)
+                if generic_suppression_reason == "user_speaking_or_newer_turn_pending":
+                    logger.warning(
+                        "fallback_decision_turn_id=%s fallback_suppressed=true fallback_suppressed_reason=user_speaking_or_newer_turn_pending latest_user_state=%s current_turn_id=%s user_speaking_after_fallback_turn_started=%s stt_partial_after_llm_start=%s generic_llm_fallback_used=%s",
+                        llm_turn_id,
+                        _latest_user_state_for_greeting,
+                        _current_turn_id,
+                        _latest_user_speaking_at > start,
+                        _latest_stt_partial_at > start and _latest_stt_partial_at > _latest_stt_final_at,
+                        False,
+                    )
+                    return
                 if _search_in_progress and search_turn_matches_current:
                     logger.warning(
                         "fallback_decision_turn_id=%s fallback_suppressed=true fallback_suppressed_reason=search_in_progress search_in_progress=%s search_tool_called=%s search_turn_id=%s search_turn_matches_current=%s search_wait_elapsed_seconds=%.3f generic_llm_fallback_used=%s",
@@ -2675,6 +2760,21 @@ class LucyAgent(Agent):
             def _suppress_generic_fallback_for_search(reason: str) -> bool:
                 nonlocal search_fallback_suppressed_logged
                 search_turn_matches_current = _search_turn_matches_current() and _search_turn_id == llm_turn_id
+                generic_suppression_reason = _generic_fallback_suppression_reason(llm_turn_id, start)
+                if generic_suppression_reason == "user_speaking_or_newer_turn_pending":
+                    if not search_fallback_suppressed_logged:
+                        logger.warning(
+                            "fallback_decision_turn_id=%s fallback_suppressed=true fallback_suppressed_reason=user_speaking_or_newer_turn_pending reason=%s latest_user_state=%s current_turn_id=%s user_speaking_after_fallback_turn_started=%s stt_partial_after_llm_start=%s generic_llm_fallback_used=%s",
+                            llm_turn_id,
+                            reason,
+                            _latest_user_state_for_greeting,
+                            _current_turn_id,
+                            _latest_user_speaking_at > start,
+                            _latest_stt_partial_at > start and _latest_stt_partial_at > _latest_stt_final_at,
+                            False,
+                        )
+                        search_fallback_suppressed_logged = True
+                    return True
                 if _search_in_progress and search_turn_matches_current:
                     if not search_fallback_suppressed_logged:
                         logger.warning(
@@ -2888,6 +2988,20 @@ class LucyAgent(Agent):
                                 yield fallback
                         break
 
+                    if _is_stale_llm_turn(llm_turn_id):
+                        _last_llm_stream_status = "stale_turn"
+                        _last_llm_complete_at = time.monotonic()
+                        logger.warning(
+                            "stale_llm_output_ignored=true original_turn_id=%s current_turn_id=%s llm_turn_id=%s chunk_count=%s",
+                            llm_turn_id,
+                            _current_turn_id,
+                            llm_turn_id,
+                            chunk_count,
+                        )
+                        await _cancel_pending_next_chunk("stale_turn")
+                        await _close_llm_stream("stale_turn")
+                        break
+
                     chunk_count += 1
                     text_delta = _extract_text_delta(chunk)
                     if text_delta:
@@ -2911,8 +3025,8 @@ class LucyAgent(Agent):
                     _last_llm_completed_at = _last_llm_complete_at
                 logger.info(
                     "LLM stream ended: turn_id=%s llm_turn_id=%s search_turn_id=%s status=%s first_token_seen=%s chunk_count=%s text_length=%s fallback_used=%s timeout_stage=%s search_in_progress=%s search_tool_called=%s search_failed=%s generic_llm_fallback_used=%s",
-                    _current_turn_id,
-                    _llm_turn_id,
+                    llm_turn_id,
+                    llm_turn_id,
                     _search_turn_id,
                     _last_llm_stream_status,
                     _last_llm_first_token_at is not None,
@@ -3005,6 +3119,33 @@ class LucyAgent(Agent):
                 False,
                 False,
             )
+        endpointing_decision_context = transcript_context if transcript_context_layer_enabled() else detect_transcript_context(_last_user_message_text)
+        endpointing_decision, endpointing_extend_reason, endpointing_wait_extension_ms = _endpointing_decision_for_transcript(
+            _last_user_message_text,
+            endpointing_decision_context,
+        )
+        logger.info(
+            "endpointing_decision=%s endpointing_extend_reason=%s endpointing_wait_extension_ms=%s turn_id=%s",
+            endpointing_decision,
+            endpointing_extend_reason,
+            endpointing_wait_extension_ms,
+            _current_turn_id,
+        )
+        if endpointing_decision == "extend_wait" and endpointing_wait_extension_ms > 0:
+            endpointing_wait_started_at = time.monotonic()
+            await asyncio.sleep(endpointing_wait_extension_ms / 1000)
+            if _latest_user_state_for_greeting == "speaking" or _latest_user_speaking_at > endpointing_wait_started_at or _current_turn_id != _search_turn_id:
+                logger.warning(
+                    "endpointing_decision=extend_wait endpointing_extend_reason=%s endpointing_wait_extension_ms=%s turn_id=%s suppress_generation_after_extension=true latest_user_state=%s user_speaking_after_wait_started=%s current_turn_id=%s search_turn_id=%s",
+                    endpointing_extend_reason,
+                    endpointing_wait_extension_ms,
+                    _current_turn_id,
+                    _latest_user_state_for_greeting,
+                    _latest_user_speaking_at > endpointing_wait_started_at,
+                    _current_turn_id,
+                    _search_turn_id,
+                )
+
         _prune_turn_context_messages(turn_ctx, _current_turn_id)
         if PIPELINE_TEXT_DEBUG:
             msg_str = _last_user_message_text
@@ -3210,8 +3351,8 @@ async def entrypoint(ctx: JobContext):
     }
     logger.info("Resolved interruption config: %s", interruption_options)
     endpointing_mode = os.getenv("LIVEKIT_ENDPOINTING_MODE", "dynamic")
-    endpointing_min_delay = float(os.getenv("LIVEKIT_ENDPOINTING_MIN_DELAY", "0.7"))
-    endpointing_max_delay = float(os.getenv("LIVEKIT_ENDPOINTING_MAX_DELAY", "3.0"))
+    endpointing_min_delay = float(os.getenv("ENDPOINTING_MIN_DELAY_SECONDS", os.getenv("LIVEKIT_ENDPOINTING_MIN_DELAY", "1.1")))
+    endpointing_max_delay = float(os.getenv("ENDPOINTING_MAX_DELAY_SECONDS", os.getenv("LIVEKIT_ENDPOINTING_MAX_DELAY", "2.4")))
     logger.info(
         "Endpointing config: mode=%s min_delay=%s max_delay=%s",
         endpointing_mode,
