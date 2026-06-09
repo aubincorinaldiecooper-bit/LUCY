@@ -395,6 +395,24 @@ def _record_hume_request_metadata(
     return key, duplicate, previous_count + (1 if register else 0)
 
 
+def _assistant_cleanup_action(
+    *,
+    cleanup_reason: str,
+    current_user_turn_id: int,
+    speech_turn_id: int | None,
+    latest_user_state: str,
+) -> str:
+    normalized_reason = (cleanup_reason or "").strip().lower()
+    normalized_user_state = (latest_user_state or "").strip().lower()
+    if normalized_reason in {"session_closing", "session_close", "disconnect", "shutdown"}:
+        return "interrupt"
+    if normalized_user_state == "speaking" or normalized_reason in {"user_speaking_before_assistant_start", "user_started_speaking"}:
+        return "interrupt"
+    if speech_turn_id is not None and speech_turn_id > 0 and speech_turn_id < current_user_turn_id:
+        return "interrupt"
+    return "skip"
+
+
 def _build_voice_latency_audit(
     *,
     turn_id: int,
@@ -627,6 +645,8 @@ def attach_session_diagnostics(session: AgentSession) -> None:
     hume_request_count_at_speech_finish: dict[str, int] = {}
     stale_speech_id_order: list[str] = []
     speech_latency_audits: dict[str, dict[str, float | int | str | None]] = {}
+    assistant_speech_turn_ids: dict[str, int] = {}
+    assistant_speech_llm_turn_ids: dict[str, int] = {}
 
     def _resolve_speech_handle(event_or_handle: object) -> object:
         for attr in ("speech_handle", "handle", "speech"):
@@ -774,6 +794,27 @@ def attach_session_diagnostics(session: AgentSession) -> None:
         global _latest_active_assistant_count_for_hume
         if cleanup_reason is None:
             cleanup_reason = "legacy_cleanup_call"
+            logger.info(
+                "assistant_speech_cleanup_started cleanup_reason=%s current_user_turn_id=%s current_new_speech_id=%s active_count_before=%s cleanup_action=skip reason=legacy_cleanup_disabled",
+                cleanup_reason,
+                _current_turn_id,
+                current_new_speech_id or "none",
+                len(active_speech_handles),
+            )
+            for speech_id in active_speech_handles:
+                speech_turn_id = assistant_speech_turn_ids.get(speech_id, 0)
+                speech_llm_turn_id = assistant_speech_llm_turn_ids.get(speech_id, 0)
+                logger.info(
+                    "assistant_speech_cleanup_decision cleanup_reason=%s current_user_turn_id=%s speech_id=%s speech_turn_id=%s llm_turn_id=%s is_current_turn_speech=%s cleanup_action=skip latest_user_state=%s",
+                    cleanup_reason,
+                    _current_turn_id,
+                    speech_id,
+                    speech_turn_id or "unknown",
+                    speech_llm_turn_id or "unknown",
+                    speech_turn_id == _current_turn_id,
+                    latest_user_state,
+                )
+            return
         active_count_before = len(active_speech_handles)
         active_ids_before = list(active_speech_handles.keys())
         logger.info(
@@ -815,6 +856,29 @@ def attach_session_diagnostics(session: AgentSession) -> None:
             if handle is None:
                 continue
 
+            speech_turn_id = assistant_speech_turn_ids.get(speech_id, 0)
+            speech_llm_turn_id = assistant_speech_llm_turn_ids.get(speech_id, 0)
+            is_current_turn_speech = speech_turn_id == _current_turn_id
+            cleanup_action = _assistant_cleanup_action(
+                cleanup_reason=cleanup_reason,
+                current_user_turn_id=_current_turn_id,
+                speech_turn_id=speech_turn_id,
+                latest_user_state=latest_user_state,
+            )
+            logger.info(
+                "assistant_speech_cleanup_decision cleanup_reason=%s current_user_turn_id=%s speech_id=%s speech_turn_id=%s llm_turn_id=%s is_current_turn_speech=%s cleanup_action=%s latest_user_state=%s",
+                cleanup_reason,
+                _current_turn_id,
+                speech_id,
+                speech_turn_id or "unknown",
+                speech_llm_turn_id or "unknown",
+                is_current_turn_speech,
+                cleanup_action,
+                latest_user_state,
+            )
+            if cleanup_action == "skip":
+                continue
+
             attempted_method = "none"
             cleanup_result = "not_attempted"
             method_targets: list[tuple[str, object]] = [("", handle)]
@@ -843,11 +907,15 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                 )
                 cleanup_result = "marked_stale_no_safe_cancel_method"
 
+            assistant_speech_turn_ids[speech_id] = speech_turn_id
+            assistant_speech_llm_turn_ids[speech_id] = speech_llm_turn_id
             _mark_speech_stale(speech_id)
             suppressed_speech_ids.add(speech_id)
             active_speech_handles.pop(speech_id, None)
             speech_start_times.pop(speech_id, None)
             speech_latency_audits.pop(speech_id, None)
+            assistant_speech_turn_ids.pop(speech_id, None)
+            assistant_speech_llm_turn_ids.pop(speech_id, None)
             hume_request_count_at_speech_finish.setdefault(speech_id, _hume_tts_request_counter)
             assistant_speech_finished_at.setdefault(speech_id, time.monotonic())
             if pending_user_handoff_speech_id == speech_id:
@@ -893,6 +961,8 @@ def attach_session_diagnostics(session: AgentSession) -> None:
         active_speech_handles.clear()
         speech_start_times.clear()
         speech_latency_audits.clear()
+        assistant_speech_turn_ids.clear()
+        assistant_speech_llm_turn_ids.clear()
         suppressed_speech_ids.clear()
         _prune_stale_speech_ids()
         _latest_active_assistant_count_for_hume = 0
@@ -911,6 +981,8 @@ def attach_session_diagnostics(session: AgentSession) -> None:
 
         resolved_handle = _resolve_speech_handle(event_or_handle)
         speech_id = _speech_id(resolved_handle)
+        speech_turn_id = _llm_turn_id if _llm_turn_id > 0 else _current_turn_id
+        speech_llm_turn_id = _llm_turn_id if _llm_turn_id > 0 else speech_turn_id
         now = time.monotonic()
         speech_created_at[speech_id] = now
 
@@ -925,13 +997,18 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                     break
                 if result != "missing":
                     cleanup_result = f"cancel_failed:{method_name}:{result}"
+            assistant_speech_turn_ids[speech_id] = speech_turn_id
+            assistant_speech_llm_turn_ids[speech_id] = speech_llm_turn_id
             _mark_speech_stale(speech_id)
             suppressed_speech_ids.add(speech_id)
             assistant_speech_finished_at.setdefault(speech_id, time.monotonic())
             logger.warning(
-                "assistant_speech_start_allowed=false assistant_speech_start_blocked_reason=user_speaking turn_id=%s speech_id=%s attempted_method=%s cleanup_result=%s",
+                "assistant_speech_start_allowed=false assistant_speech_start_blocked_reason=user_speaking current_user_turn_id=%s speech_id=%s speech_turn_id=%s llm_turn_id=%s cleanup_reason=%s cleanup_action=interrupt attempted_method=%s cleanup_result=%s",
                 _current_turn_id,
                 speech_id,
+                speech_turn_id,
+                speech_llm_turn_id,
+                "user_speaking_before_assistant_start",
                 attempted_method,
                 cleanup_result,
             )
@@ -997,12 +1074,23 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                 list(active_speech_handles.keys()),
             )
             _cleanup_active_assistant_speeches(speech_id, "force_cleanup_before_new_registration")
+            if active_speech_handles:
+                logger.warning(
+                    "assistant_speech_start_allowed=false assistant_speech_start_blocked_reason=active_speech_cleanup_skipped_current_turn current_user_turn_id=%s speech_id=%s speech_turn_id=%s active_speech_ids=%s",
+                    _current_turn_id,
+                    speech_id,
+                    speech_turn_id,
+                    list(active_speech_handles.keys()),
+                )
+                return
 
         logger.info(
             "assistant_speech_start_allowed=true assistant_speech_start_blocked_reason=none turn_id=%s speech_id=%s",
             _current_turn_id,
             speech_id,
         )
+        assistant_speech_turn_ids[speech_id] = speech_turn_id
+        assistant_speech_llm_turn_ids[speech_id] = speech_llm_turn_id
         active_speech_handles[speech_id] = resolved_handle
         speech_start_times[speech_id] = now
         assistant_speech_started_at[speech_id] = now
@@ -1033,6 +1121,8 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                 list(active_speech_handles.keys()),
             )
             _cleanup_active_assistant_speeches(speech_id, "post_registration_active_count_gt_one")
+            assistant_speech_turn_ids[speech_id] = speech_turn_id
+            assistant_speech_llm_turn_ids[speech_id] = speech_llm_turn_id
             active_speech_handles[speech_id] = resolved_handle
             speech_start_times[speech_id] = now
             assistant_speech_started_at[speech_id] = now
@@ -1056,7 +1146,14 @@ def attach_session_diagnostics(session: AgentSession) -> None:
             _latest_current_speech_id_for_hume = speech_id
             _latest_active_assistant_count_for_hume = len(active_speech_handles)
 
-        logger.info("Assistant speech started: turn_id=%s speech_id=%s active_count=%s", _current_turn_id, speech_id, len(active_speech_handles))
+        logger.info(
+            "Assistant speech started: current_user_turn_id=%s speech_id=%s speech_turn_id=%s llm_turn_id=%s active_count=%s",
+            _current_turn_id,
+            speech_id,
+            speech_turn_id,
+            speech_llm_turn_id,
+            len(active_speech_handles),
+        )
         logger.info(
             "Assistant speech Hume request baseline: speech_id=%s hume_request_count_at_start=%s active_count=%s",
             speech_id,
@@ -1091,12 +1188,16 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                 assistant_speech_finished_at[done_id] = finished_at
                 hume_request_count_at_speech_finish[done_id] = _hume_tts_request_counter
                 speech_latency_audit = speech_latency_audits.pop(done_id, None)
+                done_speech_turn_id = assistant_speech_turn_ids.pop(done_id, 0)
+                done_speech_llm_turn_id = assistant_speech_llm_turn_ids.pop(done_id, 0)
                 if was_active and not was_stale:
                     pending_user_handoff_speech_id = done_id
                 logger.info(
-                    "Assistant speech finished: turn_id=%s speech_id=%s interrupted=%s active_count=%s was_suppressed=%s was_stale=%s was_active=%s",
+                    "Assistant speech finished: current_user_turn_id=%s speech_id=%s speech_turn_id=%s llm_turn_id=%s interrupted=%s active_count=%s was_suppressed=%s was_stale=%s was_active=%s",
                     _current_turn_id,
                     done_id,
+                    done_speech_turn_id or "unknown",
+                    done_speech_llm_turn_id or "unknown",
                     interrupted,
                     len(active_speech_handles),
                     was_suppressed,
@@ -2122,27 +2223,41 @@ def _is_system_or_developer_message(message: object) -> bool:
 
 
 def _prune_turn_context_messages(turn_ctx: object, turn_id: int | None = None) -> tuple[int, int, int]:
+    messages_owner = turn_ctx
     messages = getattr(turn_ctx, "messages", None)
+    if callable(messages):
+        try:
+            messages = messages()
+        except Exception:
+            messages = None
     if messages is None:
-        logger.info(
-            "context_pruned: turn_id=%s total_messages=%s kept_messages=%s dropped_messages=%s context_window_turns=%s",
-            turn_id or _current_turn_id,
-            0,
-            0,
-            0,
-            CONTEXT_WINDOW_TURNS,
-        )
-        return 0, 0, 0
+        if isinstance(turn_ctx, list):
+            messages = turn_ctx
+        else:
+            try:
+                messages = list(turn_ctx)  # type: ignore[arg-type]
+            except Exception:
+                logger.info(
+                    "context_pruned: turn_id=%s total_messages=%s kept_messages=%s dropped_messages=%s context_window_turns=%s reason=messages_unavailable",
+                    turn_id or _current_turn_id,
+                    0,
+                    0,
+                    0,
+                    CONTEXT_WINDOW_TURNS,
+                )
+                return 0, 0, 0
+            messages_owner = None
     try:
         message_list = list(messages)
-    except Exception:
-        logger.warning(
-            "context_pruned: turn_id=%s total_messages=%s kept_messages=%s dropped_messages=%s context_window_turns=%s reason=messages_not_iterable",
+    except Exception as exc:
+        logger.info(
+            "context_pruned: turn_id=%s total_messages=%s kept_messages=%s dropped_messages=%s context_window_turns=%s reason=messages_unavailable error=%s",
             turn_id or _current_turn_id,
-            "n/a",
-            "n/a",
+            0,
+            0,
             0,
             CONTEXT_WINDOW_TURNS,
+            _redact_sensitive_text(exc),
         )
         return 0, 0, 0
 
@@ -2171,7 +2286,10 @@ def _prune_turn_context_messages(turn_ctx: object, turn_id: int | None = None) -
         messages[:] = pruned_messages
     except Exception:
         try:
-            setattr(turn_ctx, "messages", pruned_messages)
+            if messages_owner is not None:
+                setattr(messages_owner, "messages", pruned_messages)
+            else:
+                raise TypeError("message container is not mutable")
         except Exception as exc:
             logger.warning(
                 "context_pruned: turn_id=%s total_messages=%s kept_messages=%s dropped_messages=0 context_window_turns=%s reason=messages_not_mutable error=%s",

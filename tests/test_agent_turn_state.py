@@ -299,6 +299,39 @@ class VoiceLifecycleObservabilityTests(unittest.TestCase):
         self.assertIn("latest_agent_state=%s", source)
         self.assertIn("global _latest_agent_state_for_hume", source)
 
+    def test_cleanup_skips_current_turn_speech(self):
+        self.assertEqual(
+            agent._assistant_cleanup_action(
+                cleanup_reason="before_new_assistant_speech",
+                current_user_turn_id=12,
+                speech_turn_id=12,
+                latest_user_state="listening",
+            ),
+            "skip",
+        )
+
+    def test_cleanup_interrupts_stale_turn_speech(self):
+        self.assertEqual(
+            agent._assistant_cleanup_action(
+                cleanup_reason="before_new_assistant_speech",
+                current_user_turn_id=12,
+                speech_turn_id=11,
+                latest_user_state="listening",
+            ),
+            "interrupt",
+        )
+
+    def test_cleanup_interrupts_when_user_is_speaking(self):
+        self.assertEqual(
+            agent._assistant_cleanup_action(
+                cleanup_reason="before_new_assistant_speech",
+                current_user_turn_id=12,
+                speech_turn_id=12,
+                latest_user_state="speaking",
+            ),
+            "interrupt",
+        )
+
 
 class ContextPruningTests(unittest.TestCase):
     class Message:
@@ -366,6 +399,21 @@ class ContextPruningTests(unittest.TestCase):
 
         self.assertEqual((total, kept, dropped), (7, 7, 0))
         self.assertEqual([id(message) for message in ctx.messages], original_ids)
+
+    def test_pruning_accepts_message_list_directly(self):
+        messages = [self.Message("system", "system")]
+        for index in range(6):
+            messages.append(self.Message("user", f"user {index}"))
+            messages.append(self.Message("assistant", f"assistant {index}"))
+
+        with patch.object(agent, "CONTEXT_WINDOW_TURNS", 4):
+            total, kept, dropped = agent._prune_turn_context_messages(messages, turn_id=126)
+
+        self.assertEqual(total, 13)
+        self.assertEqual(kept, 9)
+        self.assertEqual(dropped, 4)
+        self.assertEqual(messages[0].role, "system")
+        self.assertEqual(messages[1].content, "user 2")
 
     def test_context_window_zero_clamps_to_safe_minimum(self):
         with patch.dict("os.environ", {"CONTEXT_WINDOW_TURNS": "0"}):
