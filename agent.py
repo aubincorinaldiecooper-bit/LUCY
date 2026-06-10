@@ -17,7 +17,7 @@ import aiohttp
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from livekit.agents import Agent, AgentSession, InterruptionOptions, JobContext, TurnHandlingOptions, WorkerOptions, cli, function_tool, room_io
+from livekit.agents import Agent, AgentSession, InterruptionOptions, JobContext, StopResponse, TurnHandlingOptions, WorkerOptions, cli, function_tool, room_io
 from livekit import rtc
 from livekit.plugins import ai_coustics, deepgram, hume, mistralai, openai, silero
 from internet_search import (
@@ -178,6 +178,8 @@ _latest_user_speaking_at = 0.0
 _latest_stt_partial_at = 0.0
 _latest_stt_partial_text_hash = "empty"
 _latest_stt_final_at = 0.0
+_held_fragment_texts: list[tuple[float, str]] = []
+_consecutive_fragment_holds = 0
 _search_tool_called = False
 _search_in_progress = False
 _search_started_at = 0.0
@@ -789,32 +791,9 @@ def attach_session_diagnostics(session: AgentSession) -> None:
             )
             return False, "failed"
 
-    def _cleanup_active_assistant_speeches(current_new_speech_id: str | None, cleanup_reason: str | None = None) -> None:
+    def _cleanup_active_assistant_speeches(current_new_speech_id: str | None, cleanup_reason: str) -> None:
         nonlocal pending_user_handoff_speech_id
         global _latest_active_assistant_count_for_hume
-        if cleanup_reason is None:
-            cleanup_reason = "legacy_cleanup_call"
-            logger.info(
-                "assistant_speech_cleanup_started cleanup_reason=%s current_user_turn_id=%s current_new_speech_id=%s active_count_before=%s cleanup_action=skip reason=legacy_cleanup_disabled",
-                cleanup_reason,
-                _current_turn_id,
-                current_new_speech_id or "none",
-                len(active_speech_handles),
-            )
-            for speech_id in active_speech_handles:
-                speech_turn_id = assistant_speech_turn_ids.get(speech_id, 0)
-                speech_llm_turn_id = assistant_speech_llm_turn_ids.get(speech_id, 0)
-                logger.info(
-                    "assistant_speech_cleanup_decision cleanup_reason=%s current_user_turn_id=%s speech_id=%s speech_turn_id=%s llm_turn_id=%s is_current_turn_speech=%s cleanup_action=skip latest_user_state=%s",
-                    cleanup_reason,
-                    _current_turn_id,
-                    speech_id,
-                    speech_turn_id or "unknown",
-                    speech_llm_turn_id or "unknown",
-                    speech_turn_id == _current_turn_id,
-                    latest_user_state,
-                )
-            return
         active_count_before = len(active_speech_handles)
         active_ids_before = list(active_speech_handles.keys())
         logger.info(
@@ -967,6 +946,41 @@ def attach_session_diagnostics(session: AgentSession) -> None:
         _prune_stale_speech_ids()
         _latest_active_assistant_count_for_hume = 0
 
+    def _prune_speech_tracking(now: float) -> None:
+        expired: set[str] = set()
+        for sid, finished_at in assistant_speech_finished_at.items():
+            if sid not in active_speech_handles and now - finished_at > SPEECH_TRACKING_TTL_SECONDS:
+                expired.add(sid)
+        for sid, created_at in speech_created_at.items():
+            if (
+                sid not in active_speech_handles
+                and sid not in assistant_speech_finished_at
+                and now - created_at > SPEECH_TRACKING_TTL_SECONDS
+            ):
+                expired.add(sid)
+        if not expired:
+            return
+        for sid in expired:
+            stale_speech_ids.discard(sid)
+            suppressed_speech_ids.discard(sid)
+            for store in (
+                speech_created_at,
+                assistant_speech_started_at,
+                agent_speaking_at,
+                agent_listening_at,
+                assistant_speech_finished_at,
+                hume_request_count_at_speech_start,
+                hume_request_count_at_speech_finish,
+                speech_start_times,
+            ):
+                store.pop(sid, None)
+        logger.info(
+            "Speech tracking pruned: pruned_count=%s remaining_stale_count=%s remaining_suppressed_count=%s ttl_seconds=%s",
+            len(expired),
+            len(stale_speech_ids),
+            len(suppressed_speech_ids),
+            SPEECH_TRACKING_TTL_SECONDS,
+        )
 
     @session.on("speech_created")
     def _on_speech_created(event_or_handle: object) -> None:
@@ -984,6 +998,7 @@ def attach_session_diagnostics(session: AgentSession) -> None:
         speech_turn_id = _llm_turn_id if _llm_turn_id > 0 else _current_turn_id
         speech_llm_turn_id = _llm_turn_id if _llm_turn_id > 0 else speech_turn_id
         now = time.monotonic()
+        _prune_speech_tracking(now)
         speech_created_at[speech_id] = now
 
         if latest_user_state == "speaking":
@@ -1393,10 +1408,6 @@ def attach_session_diagnostics(session: AgentSession) -> None:
         target = event_item if event_item is not None else item
         role = _safe_attr(target, "role")
         interrupted = _safe_attr(target, "interrupted")
-        if str(role).strip().lower() == "user" and active_speech_handles:
-            _cleanup_active_assistant_speeches("user_turn_committed")
-        if str(interrupted).strip().lower() in {"true", "1", "yes"} and active_speech_handles:
-            _cleanup_active_assistant_speeches("conversation_item_interrupted")
         if PIPELINE_TEXT_DEBUG:
             text_str = _extract_text_for_debug(target)
             logger.info(
@@ -1433,6 +1444,8 @@ def attach_session_diagnostics(session: AgentSession) -> None:
             last_stt_final_preview = last_stt_preview
         else:
             stt_partial_count += 1
+            _latest_stt_partial_at = last_stt_any_at
+            _latest_stt_partial_text_hash = _text_hash(transcript_str)
             _latest_stt_partial_at = last_stt_any_at
             _latest_stt_partial_text_hash = _text_hash(transcript_str)
         if not PIPELINE_TEXT_DEBUG:
@@ -1516,6 +1529,12 @@ def env_int_clamped(name: str, default: int, min_value: int, max_value: int) -> 
 
 
 AI_COUSTICS_ENABLED = env_bool("AI_COUSTICS_ENABLED", True)
+# Hold replies on clearly cut-off user fragments while the user is still talking,
+# instead of answering mid-sentence (the "you're interrupting me" failure mode).
+TURN_HOLD_INCOMPLETE_FRAGMENTS = env_bool("TURN_HOLD_INCOMPLETE_FRAGMENTS", True)
+TURN_HOLD_MAX_CONSECUTIVE = env_int_clamped("TURN_HOLD_MAX_CONSECUTIVE", 2, 0, 5)
+TURN_HOLD_FRAGMENT_TTL_SECONDS = float(os.getenv("TURN_HOLD_FRAGMENT_TTL_SECONDS", "60"))
+SPEECH_TRACKING_TTL_SECONDS = float(os.getenv("SPEECH_TRACKING_TTL_SECONDS", "120"))
 SPOKEN_TEXT_NORMALIZATION = env_bool("SPOKEN_TEXT_NORMALIZATION", False)
 TTS_TEXT_DEBUG = env_bool("TTS_TEXT_DEBUG", False)
 PIPELINE_TEXT_DEBUG = env_bool("PIPELINE_TEXT_DEBUG", False)
@@ -2136,13 +2155,54 @@ def _extract_latest_user_text_from_chat_ctx(chat_ctx: object) -> str:
 
 
 
-def _recent_turn_previews_from_chat_ctx(chat_ctx: object, limit: int = 5) -> list[str]:
+def _chat_ctx_items(chat_ctx: object) -> list[object] | None:
+    # LiveKit 1.x ChatContext exposes `items` (property) and `messages()` (method);
+    # older shapes exposed a `messages` list attribute. Support all three.
+    items = getattr(chat_ctx, "items", None)
+    if items is not None and not callable(items):
+        try:
+            return list(items)
+        except Exception:
+            pass
     messages = getattr(chat_ctx, "messages", None)
-    if not messages:
-        return []
-    try:
-        iterable = list(messages)
-    except Exception:
+    if callable(messages):
+        try:
+            return list(messages())
+        except Exception:
+            return None
+    if messages is not None:
+        try:
+            return list(messages)
+        except Exception:
+            return None
+    return None
+
+
+def _replace_chat_ctx_items(chat_ctx: object, new_items: list[object]) -> bool:
+    items = getattr(chat_ctx, "items", None)
+    if items is not None and not callable(items):
+        try:
+            chat_ctx.items = new_items  # type: ignore[attr-defined]
+            return True
+        except Exception:
+            try:
+                items[:] = new_items
+                return True
+            except Exception:
+                return False
+    messages = getattr(chat_ctx, "messages", None)
+    if messages is not None and not callable(messages):
+        try:
+            messages[:] = new_items
+            return True
+        except Exception:
+            return False
+    return False
+
+
+def _recent_turn_previews_from_chat_ctx(chat_ctx: object, limit: int = 5) -> list[str]:
+    iterable = _chat_ctx_items(chat_ctx)
+    if not iterable:
         return []
     previews: list[str] = []
     for message in iterable[-limit:]:
@@ -2223,38 +2283,53 @@ def _is_system_or_developer_message(message: object) -> bool:
 
 
 def _prune_turn_context_messages(turn_ctx: object, turn_id: int | None = None) -> tuple[int, int, int]:
-    messages_owner = turn_ctx
+    # Resolve the message container across context shapes:
+    # - LiveKit 1.x ChatContext: `items` is a property returning the live list
+    #   (note: `messages()` is a method returning a throwaway copy)
+    # - test/legacy shapes: `.messages` plain list attribute
+    # - a plain list passed directly
+    container: list[object] | None = None
+    owner_attr: str | None = None
+    items = getattr(turn_ctx, "items", None)
     messages = getattr(turn_ctx, "messages", None)
-    if callable(messages):
+    if items is not None and not callable(items):
+        container = items
+        owner_attr = "items"
+    elif messages is not None and not callable(messages):
+        container = messages
+        owner_attr = "messages"
+    elif callable(messages):
         try:
-            messages = messages()
+            container = messages()
         except Exception:
-            messages = None
-    if messages is None:
-        if isinstance(turn_ctx, list):
-            messages = turn_ctx
-        else:
-            try:
-                messages = list(turn_ctx)  # type: ignore[arg-type]
-            except Exception:
-                logger.info(
-                    "context_pruned: turn_id=%s total_messages=%s kept_messages=%s dropped_messages=%s context_window_turns=%s reason=messages_unavailable",
-                    turn_id or _current_turn_id,
-                    0,
-                    0,
-                    0,
-                    CONTEXT_WINDOW_TURNS,
-                )
-                return 0, 0, 0
-            messages_owner = None
+            container = None
+        owner_attr = "messages"
+    elif isinstance(turn_ctx, list):
+        container = turn_ctx
+    else:
+        try:
+            container = list(turn_ctx)  # type: ignore[arg-type]
+        except Exception:
+            container = None
+    if container is None:
+        logger.warning(
+            "context_pruned: turn_id=%s total_messages=%s kept_messages=%s dropped_messages=%s context_window_turns=%s reason=messages_unavailable",
+            turn_id or _current_turn_id,
+            "n/a",
+            "n/a",
+            0,
+            CONTEXT_WINDOW_TURNS,
+        )
+        return 0, 0, 0
+
     try:
-        message_list = list(messages)
+        message_list = list(container)
     except Exception as exc:
-        logger.info(
+        logger.warning(
             "context_pruned: turn_id=%s total_messages=%s kept_messages=%s dropped_messages=%s context_window_turns=%s reason=messages_unavailable error=%s",
             turn_id or _current_turn_id,
-            0,
-            0,
+            "n/a",
+            "n/a",
             0,
             CONTEXT_WINDOW_TURNS,
             _redact_sensitive_text(exc),
@@ -2283,11 +2358,11 @@ def _prune_turn_context_messages(turn_ctx: object, turn_id: int | None = None) -
     dropped_messages = total_messages - len(pruned_messages)
 
     try:
-        messages[:] = pruned_messages
+        container[:] = pruned_messages
     except Exception:
         try:
-            if messages_owner is not None:
-                setattr(messages_owner, "messages", pruned_messages)
+            if owner_attr is not None:
+                setattr(turn_ctx, owner_attr, pruned_messages)
             else:
                 raise TypeError("message container is not mutable")
         except Exception as exc:
@@ -2310,6 +2385,30 @@ def _prune_turn_context_messages(turn_ctx: object, turn_id: int | None = None) -
         CONTEXT_WINDOW_TURNS,
     )
     return total_messages, len(pruned_messages), dropped_messages
+
+
+_INCOMPLETE_TRAILING_WORDS = {
+    "and", "but", "or", "so", "because", "like", "then", "that", "the", "a", "an",
+    "to", "of", "with", "for", "instead", "if", "when", "while", "is", "are", "was",
+    "were", "at", "in", "on", "by", "my", "your", "i", "you", "we", "they",
+    "i'm", "you're", "it's", "who", "what", "why", "how", "where",
+}
+
+
+def _looks_like_incomplete_fragment(text: str, detected_intent: str, clarification_suggested: bool) -> bool:
+    stripped = (text or "").strip()
+    if not stripped:
+        return True
+    if detected_intent == "unclear_fragment" and clarification_suggested:
+        return True
+    if stripped.endswith(("...", ",", "-", "—", ";", ":")):
+        return True
+    words = re.findall(r"[A-Za-z']+", stripped)
+    if not words:
+        return True
+    # STT auto-punctuation often appends "." to cut-off speech, so check the last
+    # word even when terminal punctuation is present.
+    return words[-1].lower() in _INCOMPLETE_TRAILING_WORDS
 
 
 def _apply_transcript_context_to_message(new_message: object, context: TranscriptContext) -> None:
@@ -3421,6 +3520,8 @@ class LucyAgent(Agent):
 
     async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
         global _last_turn_committed_at, _last_llm_start_at, _last_llm_first_token_at, _last_llm_complete_at, _last_llm_stream_status, _last_llm_timeout_stage, _last_llm_fallback_response_used, _last_llm_completed_text, _last_llm_completed_text_hash, _last_llm_completed_at, _last_tts_received_text_hash, _last_user_message_text, _current_turn_id, _current_turn_transcript_intent, _current_turn_search_allowed, _current_turn_search_allowed_reason
+        global _last_tts_request_start_at, _last_tts_first_audio_at, _last_tts_completed_at, _last_tts_first_input_at, _last_tts_raw_chunk_count, _last_tts_normalized_yield_count, _last_tts_text_length, _last_tts_sentence_end_count, _last_tts_path, _last_hume_request_start_at
+        global _held_fragment_texts, _consecutive_fragment_holds
         _current_turn_id = _next_turn_id()
         _reset_search_state_for_turn(_current_turn_id)
         _last_turn_committed_at = time.monotonic()
@@ -3433,8 +3534,51 @@ class LucyAgent(Agent):
         _last_llm_completed_text = ""
         _last_llm_completed_text_hash = "empty"
         _last_llm_completed_at = 0.0
+        _last_tts_request_start_at = 0.0
+        _last_tts_first_audio_at = None
+        _last_tts_completed_at = 0.0
+        _last_tts_first_input_at = None
+        _last_tts_raw_chunk_count = 0
+        _last_tts_normalized_yield_count = 0
+        _last_tts_text_length = 0
+        _last_tts_sentence_end_count = 0
+        _last_tts_path = None
+        _last_hume_request_start_at = 0.0
         _last_user_message_text = _extract_text_for_debug(new_message).strip()
         _last_tts_received_text_hash = "empty"
+        if _held_fragment_texts:
+            fresh_fragments = [
+                text
+                for held_at, text in _held_fragment_texts
+                if _last_turn_committed_at - held_at <= TURN_HOLD_FRAGMENT_TTL_SECONDS
+            ]
+            expired_fragment_count = len(_held_fragment_texts) - len(fresh_fragments)
+            _held_fragment_texts = []
+            if fresh_fragments:
+                merged_text = " ".join(fresh_fragments + [_last_user_message_text]).strip()
+                try:
+                    setattr(new_message, "content", [merged_text])
+                    _last_user_message_text = merged_text
+                except Exception as exc:
+                    logger.warning(
+                        "Held fragment merge could not replace user text: error_type=%s error=%s",
+                        type(exc).__name__,
+                        _redact_sensitive_text(exc),
+                    )
+                logger.info(
+                    "held_fragment_merged turn_id=%s held_count=%s expired_count=%s merged_length=%s",
+                    _current_turn_id,
+                    len(fresh_fragments),
+                    expired_fragment_count,
+                    len(_last_user_message_text),
+                )
+            elif expired_fragment_count:
+                logger.info(
+                    "held_fragment_expired turn_id=%s expired_count=%s ttl_seconds=%s",
+                    _current_turn_id,
+                    expired_fragment_count,
+                    TURN_HOLD_FRAGMENT_TTL_SECONDS,
+                )
         logger.info(
             "User turn committed: turn_id=%s search_state_reset=true search_turn_id=%s search_in_progress=%s search_tool_called=%s",
             _current_turn_id,
@@ -3479,6 +3623,7 @@ class LucyAgent(Agent):
             if transcript_context.source == "deterministic_llm_error_fallback" and context_error_type == "none":
                 context_error_type = "llm_error_or_invalid_json"
             _log_transcript_context_result(transcript_context, llm_started=transcript_context_llm_started, llm_error_type=context_error_type, turn_id=_current_turn_id)
+            turn_clarification_suggested = transcript_context.clarification_suggested
         else:
             _current_turn_transcript_intent = "disabled"
             _current_turn_search_allowed = True
@@ -3496,6 +3641,7 @@ class LucyAgent(Agent):
                 False,
                 False,
             )
+            turn_clarification_suggested = False
         endpointing_decision_context = transcript_context if transcript_context_layer_enabled() else detect_transcript_context(_last_user_message_text)
         endpointing_decision, endpointing_extend_reason, endpointing_wait_extension_ms = _endpointing_decision_for_transcript(
             _last_user_message_text,
@@ -3508,10 +3654,12 @@ class LucyAgent(Agent):
             endpointing_wait_extension_ms,
             _current_turn_id,
         )
+        suppress_generation_after_extension = False
         if endpointing_decision == "extend_wait" and endpointing_wait_extension_ms > 0:
             endpointing_wait_started_at = time.monotonic()
             await asyncio.sleep(endpointing_wait_extension_ms / 1000)
             if _latest_user_state_for_greeting == "speaking" or _latest_user_speaking_at > endpointing_wait_started_at or _current_turn_id != _search_turn_id:
+                suppress_generation_after_extension = True
                 logger.warning(
                     "endpointing_decision=extend_wait endpointing_extend_reason=%s endpointing_wait_extension_ms=%s turn_id=%s suppress_generation_after_extension=true latest_user_state=%s user_speaking_after_wait_started=%s current_turn_id=%s search_turn_id=%s",
                     endpointing_extend_reason,
@@ -3522,17 +3670,45 @@ class LucyAgent(Agent):
                     _current_turn_id,
                     _search_turn_id,
                 )
-
+        if TURN_HOLD_INCOMPLETE_FRAGMENTS:
+            user_continuing = (
+                suppress_generation_after_extension
+                or _latest_user_state_for_greeting == "speaking"
+                or (_latest_stt_partial_at > 0 and _latest_stt_partial_at > _latest_stt_final_at)
+            )
+            fragment_like = suppress_generation_after_extension or _looks_like_incomplete_fragment(
+                _last_user_message_text,
+                _current_turn_transcript_intent,
+                turn_clarification_suggested,
+            )
+            if fragment_like and user_continuing and _consecutive_fragment_holds < TURN_HOLD_MAX_CONSECUTIVE:
+                _consecutive_fragment_holds += 1
+                _held_fragment_texts.append((time.monotonic(), _last_user_message_text))
+                logger.info(
+                    "user_turn_reply_held turn_id=%s reason=incomplete_fragment_user_continuing detected_intent=%s endpointing_extend_reason=%s suppress_generation_after_extension=%s consecutive_holds=%s latest_user_state=%s fragment_length=%s fragment_preview=%s",
+                    _current_turn_id,
+                    _current_turn_transcript_intent,
+                    endpointing_extend_reason,
+                    suppress_generation_after_extension,
+                    _consecutive_fragment_holds,
+                    _latest_user_state_for_greeting,
+                    len(_last_user_message_text),
+                    _redact_sensitive_text(_last_user_message_text)[:120],
+                )
+                raise StopResponse()
+            if fragment_like and user_continuing:
+                logger.info(
+                    "user_turn_reply_hold_skipped turn_id=%s reason=max_consecutive_holds_reached consecutive_holds=%s max_consecutive=%s",
+                    _current_turn_id,
+                    _consecutive_fragment_holds,
+                    TURN_HOLD_MAX_CONSECUTIVE,
+                )
+            _consecutive_fragment_holds = 0
         _prune_turn_context_messages(turn_ctx, _current_turn_id)
         if PIPELINE_TEXT_DEBUG:
             msg_str = _last_user_message_text
-            messages = getattr(turn_ctx, "messages", None)
-            message_count = "n/a"
-            if messages is not None:
-                try:
-                    message_count = len(messages)
-                except Exception:
-                    message_count = "n/a"
+            turn_ctx_items = _chat_ctx_items(turn_ctx)
+            message_count = len(turn_ctx_items) if turn_ctx_items is not None else "n/a"
             logger.info(
                 "User turn debug: new_message_length=%s preview=%s turn_ctx_message_count=%s",
                 len(msg_str),
