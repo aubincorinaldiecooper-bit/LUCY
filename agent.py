@@ -1421,6 +1421,9 @@ def attach_session_diagnostics(session: AgentSession) -> None:
             )
             return
         logger.info("Conversation item added: role=%s interrupted=%s", role, interrupted)
+        if str(role).strip().lower() == "user":
+            _reset_search_state_for_turn()
+            logger.info("Search state reset for new user turn: search_in_progress=%s search_tool_called=%s", _search_in_progress, _search_tool_called)
 
     @session.on("user_input_transcribed")
     def _on_user_input_transcribed(event: object) -> None:
@@ -1526,6 +1529,12 @@ def env_int_clamped(name: str, default: int, min_value: int, max_value: int) -> 
 
 
 AI_COUSTICS_ENABLED = env_bool("AI_COUSTICS_ENABLED", True)
+# Hold replies on clearly cut-off user fragments while the user is still talking,
+# instead of answering mid-sentence (the "you're interrupting me" failure mode).
+TURN_HOLD_INCOMPLETE_FRAGMENTS = env_bool("TURN_HOLD_INCOMPLETE_FRAGMENTS", True)
+TURN_HOLD_MAX_CONSECUTIVE = env_int_clamped("TURN_HOLD_MAX_CONSECUTIVE", 2, 0, 5)
+TURN_HOLD_FRAGMENT_TTL_SECONDS = float(os.getenv("TURN_HOLD_FRAGMENT_TTL_SECONDS", "60"))
+SPEECH_TRACKING_TTL_SECONDS = float(os.getenv("SPEECH_TRACKING_TTL_SECONDS", "120"))
 SPOKEN_TEXT_NORMALIZATION = env_bool("SPOKEN_TEXT_NORMALIZATION", False)
 TTS_TEXT_DEBUG = env_bool("TTS_TEXT_DEBUG", False)
 PIPELINE_TEXT_DEBUG = env_bool("PIPELINE_TEXT_DEBUG", False)
@@ -2873,6 +2882,654 @@ class LucyAgent(Agent):
 
             return _default_tts_with_hume_logs()
 
+
+def _replace_chat_ctx_items(chat_ctx: object, new_items: list[object]) -> bool:
+    items = getattr(chat_ctx, "items", None)
+    if items is not None and not callable(items):
+        try:
+            chat_ctx.items = new_items  # type: ignore[attr-defined]
+            return True
+        except Exception:
+            try:
+                items[:] = new_items
+                return True
+            except Exception:
+                return False
+    messages = getattr(chat_ctx, "messages", None)
+    if messages is not None and not callable(messages):
+        try:
+            messages[:] = new_items
+            return True
+        except Exception:
+            return False
+    return False
+
+
+def _recent_turn_previews_from_chat_ctx(chat_ctx: object, limit: int = 5) -> list[str]:
+    iterable = _chat_ctx_items(chat_ctx)
+    if not iterable:
+        return []
+    previews: list[str] = []
+    for message in iterable[-limit:]:
+        role = str(getattr(message, "role", "unknown"))
+        text = _extract_text_for_debug(message).strip()
+        if not text:
+            continue
+        previews.append(f"{role}: {_redact_sensitive_text(text)[:240]}")
+    return previews
+
+
+def _word_count(text: str) -> int:
+    return len(re.findall(r"\b[\w']+\b", text))
+
+
+def _generic_fallback_suppression_reason(fallback_turn_id: int, fallback_started_at: float) -> str | None:
+    if (
+        _latest_user_state_for_greeting == "speaking"
+        or _current_turn_id != fallback_turn_id
+        or _latest_user_speaking_at > fallback_started_at
+        or (_latest_stt_partial_at > fallback_started_at and _latest_stt_partial_at > _latest_stt_final_at)
+    ):
+        return "user_speaking_or_newer_turn_pending"
+    return None
+
+
+def _endpointing_wait_extension_ms() -> int:
+    lower = min(ENDPOINTING_WAIT_EXTENSION_MIN_MS, ENDPOINTING_WAIT_EXTENSION_MAX_MS)
+    upper = max(ENDPOINTING_WAIT_EXTENSION_MIN_MS, ENDPOINTING_WAIT_EXTENSION_MAX_MS)
+    return max(lower, min(upper, 900))
+
+
+def _is_clear_short_commit(text: str) -> bool:
+    cleaned = clean_transcript(text).strip().lower()
+    normalized = cleaned.rstrip(".!?").strip()
+    if not normalized:
+        return False
+    if cleaned.endswith("?"):
+        return True
+    if normalized in {"yes", "no", "yeah", "yep", "nope", "okay", "ok", "stop", "send it"}:
+        return True
+    if re.search(r"\b(what time is it|what day is it|what'?s today|count to|search that|look that up|stop|send it)\b", normalized):
+        return True
+    return False
+
+
+def _is_stale_llm_turn(llm_turn_id: int, stream_started_at: float | None = None) -> bool:
+    if _current_turn_id == llm_turn_id:
+        return False
+    if stream_started_at is None:
+        return True
+    if _current_turn_id - llm_turn_id > 1:
+        return True
+    # With preemptive generation the reply stream starts at final STT, before
+    # on_user_turn_completed increments the turn counter for the same
+    # utterance, so an off-by-one alone is not staleness. The stream is only
+    # answering outdated text if a newer final transcript arrived after it
+    # started.
+    return _latest_stt_final_at > stream_started_at
+
+
+def _endpointing_decision_for_transcript(text: str, context: TranscriptContext | None = None) -> tuple[str, str, int]:
+    cleaned = clean_transcript(text or "")
+    normalized = cleaned.strip().lower().replace("’", "'")
+    stripped = normalized.rstrip()
+    if _is_clear_short_commit(cleaned):
+        return "commit", "none", 0
+    if stripped.endswith(","):
+        return "extend_wait", "trailing_comma", _endpointing_wait_extension_ms()
+    stripped_no_punct = stripped.rstrip(".!?").strip()
+    filler_phrases = ("so", "like", "i mean", "you know", "because", "and")
+    if stripped_no_punct in filler_phrases or any(stripped_no_punct.endswith(f" {phrase}") for phrase in filler_phrases):
+        return "extend_wait", "filler_phrase", _endpointing_wait_extension_ms()
+    if stripped_no_punct.startswith("now") and _word_count(stripped_no_punct) <= 3:
+        return "extend_wait", "filler_phrase", _endpointing_wait_extension_ms()
+    if context is not None:
+        if context.detected_intent == "unclear_fragment":
+            return "extend_wait", "unclear_fragment", _endpointing_wait_extension_ms()
+        if context.ambiguity_detected and context.clarification_suggested:
+            return "extend_wait", "unclear_fragment", _endpointing_wait_extension_ms()
+    if _word_count(stripped_no_punct) < 4:
+        return "extend_wait", "short_fragment", _endpointing_wait_extension_ms()
+    return "commit", "none", 0
+
+
+def _is_system_or_developer_message(message: object) -> bool:
+    role = str(getattr(message, "role", "")).strip().lower()
+    return role in {"system", "developer"}
+
+
+def _prune_turn_context_messages(turn_ctx: object, turn_id: int | None = None) -> tuple[int, int, int]:
+    # Resolve the message container across context shapes:
+    # - LiveKit 1.x ChatContext: `items` is a property returning the live list
+    #   (note: `messages()` is a method returning a throwaway copy)
+    # - test/legacy shapes: `.messages` plain list attribute
+    # - a plain list passed directly
+    container: list[object] | None = None
+    owner_attr: str | None = None
+    items = getattr(turn_ctx, "items", None)
+    messages = getattr(turn_ctx, "messages", None)
+    if items is not None and not callable(items):
+        container = items
+        owner_attr = "items"
+    elif messages is not None and not callable(messages):
+        container = messages
+        owner_attr = "messages"
+    elif callable(messages):
+        try:
+            container = messages()
+        except Exception:
+            container = None
+        owner_attr = "messages"
+    elif isinstance(turn_ctx, list):
+        container = turn_ctx
+    else:
+        try:
+            container = list(turn_ctx)  # type: ignore[arg-type]
+        except Exception:
+            container = None
+    if container is None:
+        logger.warning(
+            "context_pruned: turn_id=%s total_messages=%s kept_messages=%s dropped_messages=%s context_window_turns=%s reason=messages_unavailable",
+            turn_id or _current_turn_id,
+            "n/a",
+            "n/a",
+            0,
+            CONTEXT_WINDOW_TURNS,
+        )
+        return 0, 0, 0
+
+    try:
+        message_list = list(container)
+    except Exception as exc:
+        logger.warning(
+            "context_pruned: turn_id=%s total_messages=%s kept_messages=%s dropped_messages=%s context_window_turns=%s reason=messages_unavailable error=%s",
+            turn_id or _current_turn_id,
+            "n/a",
+            "n/a",
+            0,
+            CONTEXT_WINDOW_TURNS,
+            _redact_sensitive_text(exc),
+        )
+        return 0, 0, 0
+
+    total_messages = len(message_list)
+    max_non_system_messages = CONTEXT_WINDOW_TURNS * 2
+    non_system_messages = [message for message in message_list if not _is_system_or_developer_message(message)]
+    if len(non_system_messages) <= max_non_system_messages:
+        logger.info(
+            "context_pruned: turn_id=%s total_messages=%s kept_messages=%s dropped_messages=0 context_window_turns=%s",
+            turn_id or _current_turn_id,
+            total_messages,
+            total_messages,
+            CONTEXT_WINDOW_TURNS,
+        )
+        return total_messages, total_messages, 0
+
+    recent_non_system_ids = {id(message) for message in non_system_messages[-max_non_system_messages:]}
+    pruned_messages = [
+        message
+        for message in message_list
+        if _is_system_or_developer_message(message) or id(message) in recent_non_system_ids
+    ]
+    dropped_messages = total_messages - len(pruned_messages)
+
+    try:
+        container[:] = pruned_messages
+    except Exception:
+        try:
+            if owner_attr is not None:
+                setattr(turn_ctx, owner_attr, pruned_messages)
+            else:
+                raise TypeError("message container is not mutable")
+        except Exception as exc:
+            logger.warning(
+                "context_pruned: turn_id=%s total_messages=%s kept_messages=%s dropped_messages=0 context_window_turns=%s reason=messages_not_mutable error=%s",
+                turn_id or _current_turn_id,
+                total_messages,
+                total_messages,
+                CONTEXT_WINDOW_TURNS,
+                _redact_sensitive_text(exc),
+            )
+            return total_messages, total_messages, 0
+
+    logger.info(
+        "context_pruned: turn_id=%s total_messages=%s kept_messages=%s dropped_messages=%s context_window_turns=%s",
+        turn_id or _current_turn_id,
+        total_messages,
+        len(pruned_messages),
+        dropped_messages,
+        CONTEXT_WINDOW_TURNS,
+    )
+    return total_messages, len(pruned_messages), dropped_messages
+
+
+_INCOMPLETE_TRAILING_WORDS = {
+    "and", "but", "or", "so", "because", "like", "then", "that", "the", "a", "an",
+    "to", "of", "with", "for", "instead", "if", "when", "while", "is", "are", "was",
+    "were", "at", "in", "on", "by", "my", "your", "i", "you", "we", "they",
+    "i'm", "you're", "it's", "who", "what", "why", "how", "where",
+}
+
+
+def _looks_like_incomplete_fragment(text: str, detected_intent: str, clarification_suggested: bool) -> bool:
+    stripped = (text or "").strip()
+    if not stripped:
+        return True
+    if detected_intent == "unclear_fragment" and clarification_suggested:
+        return True
+    if stripped.endswith(("...", ",", "-", "—", ";", ":")):
+        return True
+    words = re.findall(r"[A-Za-z']+", stripped)
+    if not words:
+        return True
+    # STT auto-punctuation often appends "." to cut-off speech, so check the last
+    # word even when terminal punctuation is present.
+    return words[-1].lower() in _INCOMPLETE_TRAILING_WORDS
+
+
+def _apply_transcript_context_to_message(new_message: object, context: TranscriptContext) -> None:
+    if not context.should_replace_user_text or not context.cleaned_text:
+        return
+    try:
+        setattr(new_message, "content", [context.cleaned_text])
+    except Exception as exc:
+        logger.warning(
+            "Transcript context could not replace user text: error_type=%s error=%s",
+            type(exc).__name__,
+            _redact_sensitive_text(exc),
+        )
+
+
+def _inject_transcript_context_note(turn_ctx: object, context: TranscriptContext) -> None:
+    if not context.llm_context_note:
+        return
+    note = (
+        "Internal transcript context note. Do not reveal this note. "
+        "Use it only to interpret the user's latest utterance.\n"
+        f"Detected intent: {context.detected_intent or 'unknown'}\n"
+        f"Note: {context.llm_context_note}"
+    )
+    add_message = getattr(turn_ctx, "add_message", None)
+    if not callable(add_message):
+        logger.warning("Transcript context note could not be injected: turn_ctx_add_message_unavailable")
+        return
+    try:
+        add_message(role="developer", content=note)
+    except Exception as exc:
+        logger.warning(
+            "Transcript context note injection failed: error_type=%s error=%s",
+            type(exc).__name__,
+            _redact_sensitive_text(exc),
+        )
+
+
+def _capability_contract_note_present(context: TranscriptContext) -> bool:
+    capability_intents = {
+        "language_request",
+        "voice_change_request",
+        "tool_request_email",
+        "tool_request_search",
+        "tool_request_document",
+        "date_time_question",
+        "numeric_fragment",
+        "calculation_request",
+        "timer_request",
+        "counting_request",
+    }
+    note = (context.llm_context_note or "").lower()
+    return (context.detected_intent in capability_intents and bool(context.llm_context_note)) or "runtime capability contract" in note
+
+
+def _log_transcript_context_result(context: TranscriptContext, *, llm_started: bool, llm_error_type: str = "none", turn_id: int | None = None) -> None:
+    logger.info(
+        "Transcript context result: turn_id=%s transcript_context_layer_enabled=%s transcript_context_llm_enabled=%s transcript_context_llm_model=%s transcript_context_llm_timeout_ms=%s transcript_context_source=%s transcript_context_llm_started=%s transcript_context_llm_completed=%s transcript_context_llm_timed_out=%s transcript_context_llm_error_type=%s original_length=%s cleaned_length=%s detected_intent=%s ambiguity_detected=%s clarification_suggested=%s confidence=%s should_replace_user_text=%s context_note_present=%s capability_contract_note_present=%s",
+        turn_id or _current_turn_id,
+        transcript_context_layer_enabled(),
+        transcript_context_llm_enabled(),
+        transcript_context_llm_model(),
+        transcript_context_llm_timeout_ms(),
+        context.source,
+        llm_started,
+        context.source == "llm",
+        context.source == "deterministic_timeout_fallback",
+        llm_error_type,
+        len(context.original_text),
+        len(context.cleaned_text),
+        context.detected_intent or "none",
+        context.ambiguity_detected,
+        context.clarification_suggested,
+        f"{context.confidence:.2f}",
+        context.should_replace_user_text,
+        bool(context.llm_context_note),
+        _capability_contract_note_present(context),
+    )
+    if transcript_context_debug():
+        logger.info(
+            "Transcript context debug: original_preview=%s cleaned_preview=%s note_preview=%s",
+            _redact_sensitive_text(context.original_text)[:200],
+            _redact_sensitive_text(context.cleaned_text)[:200],
+            _redact_sensitive_text(context.llm_context_note or "")[:200],
+        )
+
+
+def _search_policy_for_intent(intent: str | None, clarification_suggested: bool) -> tuple[bool, str]:
+    normalized = (intent or "unknown").strip().lower()
+    blocked_intents = {
+        "unclear_fragment",
+        "numeric_fragment",
+        "language_request",
+        "counting_request",
+        "calculation_request",
+        "pronunciation_correction",
+        "voice_change_request",
+        "date_time_question",
+    }
+    if normalized == "tool_request_search":
+        if clarification_suggested:
+            return False, "blocked_unclear_fragment"
+        return True, "clear_search_intent"
+    if normalized in blocked_intents:
+        return False, "blocked_non_lookup_intent" if normalized != "unclear_fragment" else "blocked_unclear_fragment"
+    return True, "llm_tool_call"
+
+
+def _metadata_candidates_from_context(ctx: JobContext) -> list[Any]:
+    candidates: list[Any] = []
+    for attr_name in ("job", "room"):
+        obj = _safe_attr(ctx, attr_name)
+        metadata = _safe_attr(obj, "metadata")
+        if metadata:
+            candidates.append(metadata)
+
+    job = _safe_attr(ctx, "job")
+    for attr_name in ("participant", "participant_info"):  # wrapper versions differ
+        participant = _safe_attr(job, attr_name)
+        metadata = _safe_attr(participant, "metadata")
+        if metadata:
+            candidates.append(metadata)
+
+    room = _safe_attr(ctx, "room")
+    remote_participants = _safe_attr(room, "remote_participants")
+    if isinstance(remote_participants, dict):
+        for participant in remote_participants.values():
+            metadata = _safe_attr(participant, "metadata")
+            if metadata:
+                candidates.append(metadata)
+
+    return candidates
+
+
+class LucyAgent(Agent):
+    def __init__(self, runtime_context: RuntimeContext | None = None) -> None:
+        self.runtime_context = runtime_context
+        instruction_parts = [SYSTEM_PROMPT, RUNTIME_CAPABILITY_CONTRACT]
+        if runtime_context is not None:
+            instruction_parts.append(runtime_context.system_message)
+        instructions = "\n\n".join(part for part in instruction_parts if part)
+        super().__init__(instructions=instructions)
+
+    @function_tool(name="internet_search", description=SEARCH_TOOL_DESCRIPTION)
+    async def internet_search_tool(self, query: str, max_results: int = 5) -> str:
+        """Search the internet with Exa for current or external information."""
+        provider = search_provider()
+        disabled_reason = search_disabled_reason()
+        runtime_context = self.runtime_context
+        turn_id = _current_turn_id
+        search_allowed = _current_turn_search_allowed
+        search_allowed_reason = _current_turn_search_allowed_reason
+        current_date = runtime_context.current_date if runtime_context else None
+        current_datetime_iso = runtime_context.current_datetime_iso if runtime_context else None
+        session_timezone = runtime_context.session_timezone if runtime_context else None
+        _, freshness_applied = build_effective_search_query(query, current_date=current_date)
+        try:
+            requested_max_results = max(1, int(max_results or search_max_results()))
+        except Exception:
+            requested_max_results = search_max_results()
+        capped_max_results = min(requested_max_results, search_max_results())
+        logger.info(
+            "search_tool_called turn_id=%s search_turn_id=%s search_provider=%s search_query_original=%s search_current_date=%s search_current_datetime_iso=%s search_timezone=%s search_freshness_applied=%s search_disabled_reason=%s search_pre_ack_spoken=%s requested_max_results=%s capped_max_results=%s search_allowed_for_turn=%s search_allowed_reason=%s detected_intent=%s",
+            turn_id,
+            turn_id,
+            provider,
+            _redact_sensitive_text(query),
+            current_date or "unknown",
+            current_datetime_iso or "unknown",
+            session_timezone or "unknown",
+            freshness_applied,
+            disabled_reason or "none",
+            False,
+            max_results,
+            capped_max_results,
+            search_allowed,
+            search_allowed_reason,
+            _current_turn_transcript_intent,
+        )
+        if not search_allowed:
+            output = "I need one more detail before searching. What exactly should I look up?"
+            logger.warning(
+                "search_blocked_by_turn_policy turn_id=%s search_allowed_for_turn=%s search_allowed_reason=%s detected_intent=%s search_query_original=%s",
+                turn_id,
+                search_allowed,
+                search_allowed_reason,
+                _current_turn_transcript_intent,
+                _redact_sensitive_text(query),
+            )
+            return output
+        if disabled_reason is not None:
+            logger.warning(
+                "search_disabled_reason=%s search_provider=%s search_query_original=%s search_current_date=%s search_current_datetime_iso=%s search_timezone=%s search_freshness_applied=%s search_specific_failure_response_used=%s",
+                disabled_reason,
+                provider,
+                _redact_sensitive_text(query),
+                current_date or "unknown",
+                current_datetime_iso or "unknown",
+                session_timezone or "unknown",
+                freshness_applied,
+                True,
+            )
+            output = f"{SEARCH_DISABLED_MESSAGE} Say: {search_failure_response()}"
+            _mark_search_wait_completed(failed=True, output=output, result_handoff_spoken=False, turn_id=turn_id)
+            return output
+
+        _mark_search_wait_started(pre_ack_spoken=False, turn_id=turn_id)
+        logger.info(
+            "search_wait_started turn_id=%s search_turn_id=%s search_in_progress=%s search_started_at=%s search_pre_ack_spoken=%s search_query_original=%s search_allowed_for_turn=%s search_allowed_reason=%s",
+            turn_id,
+            _search_turn_id,
+            _search_in_progress,
+            _search_started_at,
+            _search_pre_ack_spoken,
+            _redact_sensitive_text(query),
+            search_allowed,
+            search_allowed_reason,
+        )
+        results = await internet_search(
+            query=query,
+            max_results=capped_max_results,
+            current_date=current_date,
+            current_datetime_iso=current_datetime_iso,
+            session_timezone=session_timezone,
+        )
+        if not results:
+            output = f"{SEARCH_DISABLED_MESSAGE} Say: {search_failure_response()}"
+            completion_applied = _mark_search_wait_completed(failed=True, output=output, result_handoff_spoken=False, turn_id=turn_id)
+            if not completion_applied:
+                return "Search result ignored because a newer user turn started. Do not speak this stale result."
+            logger.info(
+                "search_result_count=0 turn_id=%s search_turn_id=%s search_provider=exa search_query_original=%s search_current_date=%s search_current_datetime_iso=%s search_timezone=%s search_freshness_applied=%s search_result_handoff_spoken=%s search_wait_completed search_in_progress=%s search_failed=%s search_specific_failure_response_used=%s search_latency_seconds=%.3f",
+                turn_id,
+                _search_turn_id,
+                _redact_sensitive_text(query),
+                current_date or "unknown",
+                current_datetime_iso or "unknown",
+                session_timezone or "unknown",
+                freshness_applied,
+                False,
+                _search_in_progress,
+                _search_failed,
+                True,
+                _search_wait_elapsed_seconds(),
+            )
+        else:
+            output = format_search_results_for_voice(results, current_date=current_date, freshness_applied=freshness_applied)
+            search_elapsed = _search_wait_elapsed_seconds()
+            if search_elapsed < SEARCH_BRIDGE_MIN_DELAY_SECONDS:
+                output = output.replace(
+                    "If you did not already say a lookup bridge before the tool call, say:",
+                    "Search returned quickly; do not say a separate lookup bridge. Start with the result handoff instead of:",
+                    1,
+                )
+            completion_applied = _mark_search_wait_completed(failed=False, output=output, result_handoff_spoken=False, turn_id=turn_id)
+            if not completion_applied:
+                return "Search result ignored because a newer user turn started. Do not speak this stale result."
+            logger.info(
+                "search_result_count=%s turn_id=%s search_turn_id=%s search_provider=exa search_query_original=%s search_current_date=%s search_current_datetime_iso=%s search_timezone=%s search_freshness_applied=%s search_result_dates=%s search_result_handoff_spoken=%s search_wait_completed search_in_progress=%s search_failed=%s search_specific_failure_response_used=%s search_latency_seconds=%.3f search_bridge_min_delay_seconds=%.3f",
+                len(results),
+                turn_id,
+                _search_turn_id,
+                _redact_sensitive_text(query),
+                current_date or "unknown",
+                current_datetime_iso or "unknown",
+                session_timezone or "unknown",
+                freshness_applied,
+                ",".join(result.published_date for result in results if result.published_date) or "none",
+                False,
+                _search_in_progress,
+                _search_failed,
+                False,
+                _search_wait_elapsed_seconds(),
+                SEARCH_BRIDGE_MIN_DELAY_SECONDS,
+            )
+        return output
+
+    def _normalize_spoken_text(self, text: str) -> str:
+        normalized = text.strip()
+        if not normalized:
+            return normalized
+        if "```" in normalized:
+            return normalized
+        if normalized[-1] not in {".", "?", "!", "…"}:
+            return normalized + "."
+        return normalized
+
+    def tts_node(self, text: AsyncIterable[str], model_settings):
+        global _latest_normalized_text_hash, _last_tts_request_start_at, _last_tts_first_audio_at, _last_tts_text_length, _last_tts_sentence_end_count, _last_tts_path, _last_tts_node_entered_at, _last_tts_received_text_hash, _last_hume_request_start_at, _last_tts_completed_at, _last_tts_raw_chunk_count, _last_tts_normalized_yield_count, _last_tts_first_input_at
+        _last_tts_node_entered_at = time.monotonic()
+        _last_tts_completed_at = 0.0
+        _last_tts_raw_chunk_count = 0
+        _last_tts_normalized_yield_count = 0
+        _last_tts_first_input_at = None
+        logger.info(
+            "TTS node entered: turn_id=%s TTS_PROVIDER=%s SPOKEN_TEXT_NORMALIZATION=%s spoken_text_normalization_mode=%s tts_input_buffering_mode=%s handoff_guard_enabled=%s llm_stream_status=%s",
+            _current_turn_id,
+            TTS_PROVIDER,
+            SPOKEN_TEXT_NORMALIZATION,
+            SPOKEN_TEXT_NORMALIZATION_MODE,
+            SPOKEN_TEXT_NORMALIZATION_MODE,
+            LLM_TO_TTS_HANDOFF_GUARD_ENABLED,
+            _last_llm_stream_status,
+        )
+
+        if not SPOKEN_TEXT_NORMALIZATION:
+            logger.info("Spoken text normalization enabled=false")
+
+            async def _logging_passthrough_stream() -> AsyncIterable[str]:
+                global _last_tts_received_text_hash, _last_tts_text_length, _last_tts_sentence_end_count, _last_tts_raw_chunk_count, _last_tts_normalized_yield_count, _last_tts_first_input_at
+                chunks: list[str] = []
+                count = 0
+                try:
+                    async for chunk in text:
+                        count += 1
+                        if _last_tts_first_input_at is None:
+                            _last_tts_first_input_at = time.monotonic()
+                        if isinstance(chunk, str):
+                            chunks.append(chunk)
+                        yield chunk
+                finally:
+                    raw_text = "".join(chunks)
+                    _last_tts_received_text_hash = _text_hash(raw_text)
+                    _last_tts_text_length = len(raw_text)
+                    _last_tts_sentence_end_count = sum(raw_text.count(mark) for mark in (".", "?", "!", "…"))
+                    _last_tts_raw_chunk_count = count
+                    _last_tts_normalized_yield_count = count
+                    logger.info(
+                        "TTS node received text chunk count: raw_chunk_count=%s raw_total_length=%s text_hash=%s handoff_guard_enabled=%s",
+                        count,
+                        len(raw_text),
+                        _last_tts_received_text_hash,
+                        LLM_TO_TTS_HANDOFF_GUARD_ENABLED,
+                    )
+                    if not raw_text.strip():
+                        logger.warning(
+                            "TTS node completed with empty text stream: llm_stream_status=%s fallback_used=%s",
+                            _last_llm_stream_status,
+                            _last_llm_fallback_response_used,
+                        )
+                    if TTS_TEXT_DEBUG:
+                        preview = _redact_sensitive_text(raw_text)[:200]
+                        logger.info(
+                            "TTS text debug: raw_chunk_count=%s raw_total_length=%s raw_preview=%s final_preview=%s",
+                            count,
+                            len(raw_text),
+                            preview,
+                            preview,
+                        )
+
+            async def _default_tts_with_hume_logs() -> AsyncIterable[Any]:
+                global _last_hume_request_start_at, _last_tts_path, _last_tts_first_audio_at, _last_tts_request_start_at, _last_tts_completed_at
+                start = time.monotonic()
+                _last_tts_request_start_at = start
+                _last_tts_first_audio_at = None
+                _last_tts_path = None
+                frame_count = 0
+                if TTS_PROVIDER == "hume":
+                    _last_hume_request_start_at = start
+                    dedupe_key, duplicate, seen_count = _record_hume_request_metadata(
+                        path="default_agent_tts_node_fallback",
+                        speech_id=_latest_current_speech_id_for_hume,
+                        normalized_text_hash="normalization_false",
+                        feeds_playout=True,
+                    )
+                    logger.info(
+                        "Hume TTS HTTP request starting: path=default_agent_tts_node_fallback normalization=false latest_agent_state=%s current_speech_id=%s hume_request_dedupe_key=%s hume_duplicate_request_detected=%s hume_request_seen_count=%s hume_request_feeds_playout=%s hume_retry=%s retry_reason=%s",
+                        _latest_agent_state_for_hume,
+                        _latest_current_speech_id_for_hume,
+                        dedupe_key,
+                        duplicate,
+                        seen_count,
+                        True,
+                        False,
+                        "none",
+                    )
+                try:
+                    async for out in Agent.default.tts_node(self, _logging_passthrough_stream(), model_settings):
+                        if _last_tts_first_audio_at is None:
+                            _last_tts_first_audio_at = time.monotonic()
+                        if _last_tts_path is None:
+                            _last_tts_path = "default_agent_tts_node_fallback"
+                        frame_count += 1
+                        yield out
+                    _last_tts_completed_at = time.monotonic()
+                    if TTS_PROVIDER == "hume":
+                        logger.info(
+                            "Hume TTS HTTP request completed: path=default_agent_tts_node_fallback frame_count_yielded=%s time_to_first_audio_seconds=%s total_tts_seconds=%.3f",
+                            frame_count,
+                            _fmt_seconds((_last_tts_first_audio_at - start) if _last_tts_first_audio_at is not None else None),
+                            _last_tts_completed_at - start,
+                        )
+                except Exception as e:
+                    if TTS_PROVIDER == "hume":
+                        logger.error(
+                            "Hume TTS HTTP request error: path=default_agent_tts_node_fallback error_type=%s error=%s frame_count_yielded=%s total_tts_seconds=%.3f",
+                            type(e).__name__,
+                            _redact_sensitive_text(e),
+                            frame_count,
+                            time.monotonic() - start,
+                        )
+                    raise
+
+            return _default_tts_with_hume_logs()
+
         logger.info("Spoken text normalization enabled=true mode=buffered_full_segment")
 
         async def _direct_or_plugin_or_default() -> AsyncIterable[Any]:
@@ -2895,6 +3552,17 @@ class LucyAgent(Agent):
                 LLM_TO_TTS_HANDOFF_GUARD_ENABLED,
             )
             sanitized = _sanitize_spoken_laughter(raw_text)
+            if raw_text.strip() and _last_llm_stream_status == "stale_turn":
+                # A stale stream may have emitted a chunk or two before
+                # staleness was detected; never speak that fragment.
+                logger.warning(
+                    "TTS stale stream text dropped: raw_chunk_count=%s raw_total_length=%s llm_stream_status=%s preview=%s",
+                    chunk_count,
+                    len(raw_text),
+                    _last_llm_stream_status,
+                    _redact_sensitive_text(raw_text)[:120],
+                )
+                sanitized = ""
             normalized_text = self._normalize_spoken_text(sanitized)
             normalized_hash = _text_hash(normalized_text)
             _latest_normalized_text_hash = normalized_hash
@@ -3839,9 +4507,158 @@ class LucyAgent(Agent):
             message_count = "n/a"
             if messages is not None:
                 try:
-                    message_count = len(messages)
-                except Exception:
-                    message_count = "n/a"
+                    setattr(new_message, "content", [merged_text])
+                    _last_user_message_text = merged_text
+                except Exception as exc:
+                    logger.warning(
+                        "Held fragment merge could not replace user text: error_type=%s error=%s",
+                        type(exc).__name__,
+                        _redact_sensitive_text(exc),
+                    )
+                logger.info(
+                    "held_fragment_merged turn_id=%s held_count=%s expired_count=%s merged_length=%s",
+                    _current_turn_id,
+                    len(fresh_fragments),
+                    expired_fragment_count,
+                    len(_last_user_message_text),
+                )
+            elif expired_fragment_count:
+                logger.info(
+                    "held_fragment_expired turn_id=%s expired_count=%s ttl_seconds=%s",
+                    _current_turn_id,
+                    expired_fragment_count,
+                    TURN_HOLD_FRAGMENT_TTL_SECONDS,
+                )
+        logger.info(
+            "User turn committed: turn_id=%s search_state_reset=true search_turn_id=%s search_in_progress=%s search_tool_called=%s",
+            _current_turn_id,
+            _search_turn_id,
+            _search_in_progress,
+            _search_tool_called,
+        )
+        if transcript_context_layer_enabled():
+            transcript_context_llm_started = transcript_context_llm_enabled()
+            context_error_type = "none"
+            try:
+                transcript_context = await interpret_transcript_context(
+                    _last_user_message_text,
+                    recent_turns=_recent_turn_previews_from_chat_ctx(turn_ctx),
+                    runtime_context=self.runtime_context.system_message if self.runtime_context is not None else None,
+                )
+            except Exception as exc:
+                context_error_type = type(exc).__name__
+                logger.warning(
+                    "Transcript context layer failed; using deterministic fallback: error_type=%s error=%s",
+                    context_error_type,
+                    _redact_sensitive_text(exc),
+                )
+                transcript_context = detect_transcript_context(_last_user_message_text)
+            _current_turn_transcript_intent = transcript_context.detected_intent or "unknown"
+            _current_turn_search_allowed, _current_turn_search_allowed_reason = _search_policy_for_intent(
+                _current_turn_transcript_intent,
+                transcript_context.clarification_suggested,
+            )
+            logger.info(
+                "search_allowed_for_turn=%s search_allowed_reason=%s turn_id=%s detected_intent=%s clarification_suggested=%s",
+                _current_turn_search_allowed,
+                _current_turn_search_allowed_reason,
+                _current_turn_id,
+                _current_turn_transcript_intent,
+                transcript_context.clarification_suggested,
+            )
+            _apply_transcript_context_to_message(new_message, transcript_context)
+            if transcript_context.should_replace_user_text and transcript_context.cleaned_text:
+                _last_user_message_text = transcript_context.cleaned_text
+            _inject_transcript_context_note(turn_ctx, transcript_context)
+            if transcript_context.source == "deterministic_llm_error_fallback" and context_error_type == "none":
+                context_error_type = "llm_error_or_invalid_json"
+            _log_transcript_context_result(transcript_context, llm_started=transcript_context_llm_started, llm_error_type=context_error_type, turn_id=_current_turn_id)
+            turn_clarification_suggested = transcript_context.clarification_suggested
+        else:
+            _current_turn_transcript_intent = "disabled"
+            _current_turn_search_allowed = True
+            _current_turn_search_allowed_reason = "llm_tool_call"
+            logger.info(
+                "Transcript context result: turn_id=%s transcript_context_layer_enabled=%s transcript_context_llm_enabled=%s transcript_context_llm_model=%s transcript_context_llm_timeout_ms=%s transcript_context_source=%s original_length=%s cleaned_length=%s context_note_present=%s capability_contract_note_present=%s",
+                _current_turn_id,
+                False,
+                transcript_context_llm_enabled(),
+                transcript_context_llm_model(),
+                transcript_context_llm_timeout_ms(),
+                "disabled",
+                len(_last_user_message_text),
+                len(_last_user_message_text),
+                False,
+                False,
+            )
+            turn_clarification_suggested = False
+        endpointing_decision_context = transcript_context if transcript_context_layer_enabled() else detect_transcript_context(_last_user_message_text)
+        endpointing_decision, endpointing_extend_reason, endpointing_wait_extension_ms = _endpointing_decision_for_transcript(
+            _last_user_message_text,
+            endpointing_decision_context,
+        )
+        logger.info(
+            "endpointing_decision=%s endpointing_extend_reason=%s endpointing_wait_extension_ms=%s turn_id=%s",
+            endpointing_decision,
+            endpointing_extend_reason,
+            endpointing_wait_extension_ms,
+            _current_turn_id,
+        )
+        suppress_generation_after_extension = False
+        if endpointing_decision == "extend_wait" and endpointing_wait_extension_ms > 0:
+            endpointing_wait_started_at = time.monotonic()
+            await asyncio.sleep(endpointing_wait_extension_ms / 1000)
+            if _latest_user_state_for_greeting == "speaking" or _latest_user_speaking_at > endpointing_wait_started_at or _current_turn_id != _search_turn_id:
+                suppress_generation_after_extension = True
+                logger.warning(
+                    "endpointing_decision=extend_wait endpointing_extend_reason=%s endpointing_wait_extension_ms=%s turn_id=%s suppress_generation_after_extension=true latest_user_state=%s user_speaking_after_wait_started=%s current_turn_id=%s search_turn_id=%s",
+                    endpointing_extend_reason,
+                    endpointing_wait_extension_ms,
+                    _current_turn_id,
+                    _latest_user_state_for_greeting,
+                    _latest_user_speaking_at > endpointing_wait_started_at,
+                    _current_turn_id,
+                    _search_turn_id,
+                )
+        if TURN_HOLD_INCOMPLETE_FRAGMENTS:
+            user_continuing = (
+                suppress_generation_after_extension
+                or _latest_user_state_for_greeting == "speaking"
+                or (_latest_stt_partial_at > 0 and _latest_stt_partial_at > _latest_stt_final_at)
+            )
+            fragment_like = suppress_generation_after_extension or _looks_like_incomplete_fragment(
+                _last_user_message_text,
+                _current_turn_transcript_intent,
+                turn_clarification_suggested,
+            )
+            if fragment_like and user_continuing and _consecutive_fragment_holds < TURN_HOLD_MAX_CONSECUTIVE:
+                _consecutive_fragment_holds += 1
+                _held_fragment_texts.append((time.monotonic(), _last_user_message_text))
+                logger.info(
+                    "user_turn_reply_held turn_id=%s reason=incomplete_fragment_user_continuing detected_intent=%s endpointing_extend_reason=%s suppress_generation_after_extension=%s consecutive_holds=%s latest_user_state=%s fragment_length=%s fragment_preview=%s",
+                    _current_turn_id,
+                    _current_turn_transcript_intent,
+                    endpointing_extend_reason,
+                    suppress_generation_after_extension,
+                    _consecutive_fragment_holds,
+                    _latest_user_state_for_greeting,
+                    len(_last_user_message_text),
+                    _redact_sensitive_text(_last_user_message_text)[:120],
+                )
+                raise StopResponse()
+            if fragment_like and user_continuing:
+                logger.info(
+                    "user_turn_reply_hold_skipped turn_id=%s reason=max_consecutive_holds_reached consecutive_holds=%s max_consecutive=%s",
+                    _current_turn_id,
+                    _consecutive_fragment_holds,
+                    TURN_HOLD_MAX_CONSECUTIVE,
+                )
+            _consecutive_fragment_holds = 0
+        _prune_turn_context_messages(turn_ctx, _current_turn_id)
+        if PIPELINE_TEXT_DEBUG:
+            msg_str = _last_user_message_text
+            turn_ctx_items = _chat_ctx_items(turn_ctx)
+            message_count = len(turn_ctx_items) if turn_ctx_items is not None else "n/a"
             logger.info(
                 "User turn debug: new_message_length=%s preview=%s turn_ctx_message_count=%s",
                 len(msg_str),
@@ -4113,12 +4930,14 @@ async def entrypoint(ctx: JobContext):
         "vad": build_vad(),
     }
 
+    preemptive_generation_options = {"enabled": PREEMPTIVE_GENERATION_ENABLED}
     resolved_turn_detection_mode = "unknown"
     if STT_PROVIDER == "deepgram_flux":
         if resolved_livekit_turn_detection_mode == "stt":
             session_kwargs["turn_handling"] = TurnHandlingOptions(
                 turn_detection="stt",
                 interruption=interruption_options,
+                preemptive_generation=preemptive_generation_options,
             )
             resolved_turn_detection_mode = "stt"
             logger.info("Using Flux STT-based turn detection")
@@ -4127,6 +4946,7 @@ async def entrypoint(ctx: JobContext):
                 session_kwargs["turn_handling"] = TurnHandlingOptions(
                     turn_detection="vad",
                     interruption=interruption_options,
+                    preemptive_generation=preemptive_generation_options,
                 )
                 resolved_turn_detection_mode = "vad"
                 logger.info("Using Flux VAD-based turn detection")
@@ -4135,9 +4955,13 @@ async def entrypoint(ctx: JobContext):
                 session_kwargs["turn_handling"] = TurnHandlingOptions(
                     turn_detection="stt",
                     interruption=interruption_options,
+                    preemptive_generation=preemptive_generation_options,
                 )
                 resolved_turn_detection_mode = "stt"
         elif resolved_livekit_turn_detection_mode == "default":
+            session_kwargs["turn_handling"] = TurnHandlingOptions(
+                preemptive_generation=preemptive_generation_options,
+            )
             resolved_turn_detection_mode = "default"
             logger.info("Using LiveKit default turn handling for Deepgram Flux")
 
@@ -4156,6 +4980,7 @@ async def entrypoint(ctx: JobContext):
                 "min_delay": endpointing_min_delay,
                 "max_delay": endpointing_max_delay,
             },
+            preemptive_generation=preemptive_generation_options,
         )
         resolved_turn_detection_mode = "vad"
         logger.info("Using Mistral VAD-only turn handling")
@@ -4163,6 +4988,7 @@ async def entrypoint(ctx: JobContext):
         session_kwargs["turn_handling"] = TurnHandlingOptions(
             turn_detection="vad",
             interruption=interruption_options,
+            preemptive_generation=preemptive_generation_options,
         )
         resolved_turn_detection_mode = "vad"
         logger.info("Using non-Flux VAD turn handling")
