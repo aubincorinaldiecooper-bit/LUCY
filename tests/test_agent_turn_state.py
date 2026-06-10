@@ -440,6 +440,48 @@ class TurnPolicyTests(unittest.TestCase):
         )
 
 
+class OnUserTurnCompletedRegressionTests(unittest.IsolatedAsyncioTestCase):
+    class Message:
+        def __init__(self, role: str, content: str):
+            self.role = role
+            self.content = content
+
+    class TurnCtx:
+        def __init__(self, messages):
+            self.messages = messages
+
+        def add_message(self, role: str, content: str):
+            self.messages.append(OnUserTurnCompletedRegressionTests.Message(role, content))
+
+    async def _run_turn(self, text: str):
+        lucy = object.__new__(agent.LucyAgent)
+        lucy.runtime_context = None
+        turn_ctx = self.TurnCtx([self.Message("system", "prompt"), self.Message("user", text)])
+        new_message = turn_ctx.messages[-1]
+        async def fake_interpret(transcript, **kwargs):
+            return agent.detect_transcript_context(transcript)
+        with patch.object(agent, "interpret_transcript_context", side_effect=fake_interpret), \
+             patch.object(agent, "_endpointing_decision_for_transcript", return_value=("commit", "none", 0)), \
+             patch.object(agent, "_prune_turn_context_messages", wraps=agent._prune_turn_context_messages) as prune:
+            await lucy.on_user_turn_completed(turn_ctx, new_message)
+        return prune, turn_ctx
+
+    async def test_on_user_turn_completed_commit_now_does_not_raise(self):
+        prune, _ = await self._run_turn("I felt really hurt by that.")
+        self.assertTrue(prune.called)
+        self.assertEqual(agent._current_turn_policy_decision, "COMMIT_NOW")
+
+    async def test_on_user_turn_completed_low_information_filler_does_not_raise(self):
+        prune, _ = await self._run_turn("Yeah.")
+        self.assertTrue(prune.called)
+        self.assertEqual(agent._current_turn_policy_decision, "IGNORE_LOW_INFORMATION_FILLER")
+
+    async def test_on_user_turn_completed_pruning_invoked_with_message_list(self):
+        prune, turn_ctx = await self._run_turn("What time is it?")
+        self.assertTrue(prune.called)
+        self.assertIsInstance(turn_ctx.messages, list)
+
+
 class ContextPruningTests(unittest.TestCase):
     class Message:
         def __init__(self, role: str, content: str):
