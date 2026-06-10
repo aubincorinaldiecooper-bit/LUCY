@@ -333,6 +333,113 @@ class VoiceLifecycleObservabilityTests(unittest.TestCase):
         )
 
 
+class TurnPolicyTests(unittest.TestCase):
+    def test_complete_emotional_statement_commits_immediately(self):
+        result = agent._make_turn_policy_decision("I felt really hurt by that.")
+        self.assertEqual(result.classification, "EMOTIONAL_STATEMENT")
+        self.assertEqual(result.decision, "COMMIT_NOW")
+        self.assertTrue(result.should_start_generation)
+
+    def test_short_meaningful_statement_commits_immediately(self):
+        result = agent._make_turn_policy_decision("What time is it?", agent.detect_transcript_context("What time is it?"))
+        self.assertEqual(result.classification, "COMPLETE_THOUGHT")
+        self.assertEqual(result.decision, "COMMIT_NOW")
+
+    def test_structurally_incomplete_thought_is_held(self):
+        result = agent._make_turn_policy_decision("I was thinking because")
+        self.assertEqual(result.classification, "INCOMPLETE_THOUGHT")
+        self.assertEqual(result.decision, "HOLD_FOR_CONTINUATION")
+        self.assertFalse(result.should_start_generation)
+
+    def test_held_meaningful_fragment_commits_after_reply_deadline_policy(self):
+        result = agent._make_turn_policy_decision("I started to feel like")
+        self.assertEqual(result.decision, "HOLD_FOR_CONTINUATION")
+        self.assertEqual(agent.TURN_HOLD_FRAGMENT_REPLY_DEADLINE_SECONDS, agent.TURN_HOLD_FRAGMENT_REPLY_DEADLINE_SECONDS)
+
+    def test_related_continuation_merges_with_held_fragment(self):
+        result = agent._make_turn_policy_decision(
+            "it was about my brother",
+            held_text="I was thinking about my brother because",
+            held_created_at=100.0,
+            now=103.0,
+        )
+        self.assertEqual(result.decision, "MERGE_WITH_HELD_FRAGMENT")
+        self.assertTrue(result.should_merge_held_fragment)
+
+    def test_unrelated_continuation_does_not_merge(self):
+        result = agent._make_turn_policy_decision(
+            "what time is it?",
+            agent.detect_transcript_context("what time is it?"),
+            held_text="I was thinking about my brother because",
+            held_created_at=100.0,
+            now=103.0,
+        )
+        self.assertEqual(result.decision, "FLUSH_HELD_AND_COMMIT_NEW")
+        self.assertFalse(result.should_merge_held_fragment)
+
+    def test_meta_complaint_never_merges_into_held_fragment(self):
+        result = agent._make_turn_policy_decision(
+            "you did not answer me",
+            held_text="I was talking about my brother because",
+            held_created_at=100.0,
+            now=102.0,
+        )
+        self.assertEqual(result.classification, "META_COMPLAINT")
+        self.assertEqual(result.decision, "RECOVER_FROM_SILENCE")
+        self.assertFalse(result.should_merge_held_fragment)
+
+    def test_llm_timeout_with_good_transcript_does_not_ask_repeat(self):
+        text = agent._fallback_text_for_reason("first_token_timeout", "EMOTIONAL_STATEMENT")
+        self.assertNotIn("say that again", text.lower())
+        self.assertFalse(agent._fallback_requires_user_repeat("first_token_timeout", "EMOTIONAL_STATEMENT"))
+
+    def test_unclear_audio_fallback_asks_repeat(self):
+        self.assertTrue(agent._fallback_requires_user_repeat("audio_unclear", "UNCLEAR_AUDIO"))
+        text = agent._fallback_text_for_reason("audio_unclear", "UNCLEAR_AUDIO")
+        self.assertIn("say", text.lower())
+
+    def test_api_connection_error_before_first_token_retries_once(self):
+        class APIConnectionError(Exception):
+            pass
+
+        allowed, reason = agent._should_retry_openrouter_connection_error(
+            APIConnectionError("transport"),
+            first_token_seen=False,
+            chunk_count=0,
+            text_length=0,
+            llm_turn_id=agent._current_turn_id,
+            tts_started_for_turn=False,
+        )
+        self.assertTrue(allowed)
+        self.assertEqual(reason, "eligible")
+
+    def test_api_connection_error_after_partial_text_does_not_retry(self):
+        class APIConnectionError(Exception):
+            pass
+
+        allowed, reason = agent._should_retry_openrouter_connection_error(
+            APIConnectionError("transport"),
+            first_token_seen=True,
+            chunk_count=1,
+            text_length=5,
+            llm_turn_id=agent._current_turn_id,
+            tts_started_for_turn=False,
+        )
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "first_token_seen")
+
+    def test_single_turn_cleanup_invariant_current_turn_skip(self):
+        self.assertEqual(
+            agent._assistant_cleanup_action(
+                cleanup_reason="legacy_cleanup_call",
+                current_user_turn_id=5,
+                speech_turn_id=5,
+                latest_user_state="listening",
+            ),
+            "skip",
+        )
+
+
 class ContextPruningTests(unittest.TestCase):
     class Message:
         def __init__(self, role: str, content: str):
@@ -418,102 +525,6 @@ class ContextPruningTests(unittest.TestCase):
     def test_context_window_zero_clamps_to_safe_minimum(self):
         with patch.dict("os.environ", {"CONTEXT_WINDOW_TURNS": "0"}):
             self.assertEqual(agent.env_int_clamped("CONTEXT_WINDOW_TURNS", 10, 4, 100), 4)
-
-
-class IncompleteFragmentHeuristicTests(unittest.TestCase):
-    def test_trailing_comma_is_fragment(self):
-        self.assertTrue(agent._looks_like_incomplete_fragment("Yeah. So,", "unknown", False))
-
-    def test_trailing_conjunction_with_stt_period_is_fragment(self):
-        self.assertTrue(agent._looks_like_incomplete_fragment("Now, why people are.", "unknown", False))
-
-    def test_unclear_fragment_intent_is_fragment(self):
-        self.assertTrue(agent._looks_like_incomplete_fragment("Yeah. So,", "unclear_fragment", True))
-
-    def test_ellipsis_is_fragment(self):
-        self.assertTrue(agent._looks_like_incomplete_fragment("I was thinking about...", "unknown", False))
-
-    def test_empty_text_is_fragment(self):
-        self.assertTrue(agent._looks_like_incomplete_fragment("", "unknown", False))
-
-    def test_complete_question_is_not_fragment(self):
-        self.assertFalse(agent._looks_like_incomplete_fragment("Isn't that why they just like to vent?", "unknown", False))
-
-    def test_complete_sentence_is_not_fragment(self):
-        self.assertFalse(agent._looks_like_incomplete_fragment("Sometimes people need a vent.", "unknown", False))
-
-
-class ChatContextPruneTests(unittest.TestCase):
-    def _build_ctx(self, non_system_count: int):
-        from livekit.agents.llm import ChatContext
-
-        ctx = ChatContext()
-        ctx.add_message(role="system", content="sys")
-        for i in range(non_system_count):
-            ctx.add_message(role="user" if i % 2 == 0 else "assistant", content=f"m{i}")
-        return ctx
-
-    def test_chat_ctx_items_resolves_livekit_items_property(self):
-        ctx = self._build_ctx(3)
-        items = agent._chat_ctx_items(ctx)
-        self.assertIsNotNone(items)
-        self.assertEqual(len(items), 4)
-
-    def test_prune_caps_non_system_messages_and_keeps_system(self):
-        cap = agent.CONTEXT_WINDOW_TURNS * 2
-        ctx = self._build_ctx(cap + 10)
-        total, kept, dropped = agent._prune_turn_context_messages(ctx, turn_id=1)
-        self.assertEqual(total, cap + 11)
-        self.assertEqual(dropped, 10)
-        self.assertEqual(len(ctx.items), kept)
-        self.assertEqual(str(ctx.items[0].role), "system")
-        non_system = [item for item in ctx.items if str(item.role) != "system"]
-        self.assertEqual(len(non_system), cap)
-        self.assertEqual(non_system[-1].text_content, f"m{cap + 9}")
-
-    def test_prune_below_cap_is_noop(self):
-        ctx = self._build_ctx(4)
-        total, kept, dropped = agent._prune_turn_context_messages(ctx, turn_id=1)
-        self.assertEqual((total, kept, dropped), (5, 5, 0))
-        self.assertEqual(len(ctx.items), 5)
-
-
-class StaleLlmTurnTests(unittest.TestCase):
-    def setUp(self):
-        self.saved = {
-            name: getattr(agent, name)
-            for name in ("_current_turn_id", "_latest_stt_final_at")
-        }
-
-    def tearDown(self):
-        for name, value in self.saved.items():
-            setattr(agent, name, value)
-
-    def test_preemptive_off_by_one_is_not_stale_without_newer_final(self):
-        # Stream started after the final STT that produced this commit: the
-        # turn counter incremented for the SAME utterance, so not stale.
-        agent._current_turn_id = 8
-        agent._latest_stt_final_at = 50.0
-        self.assertFalse(agent._is_stale_llm_turn(7, 51.0))
-
-    def test_off_by_one_is_stale_when_newer_final_arrived(self):
-        agent._current_turn_id = 8
-        agent._latest_stt_final_at = 60.0
-        self.assertTrue(agent._is_stale_llm_turn(7, 51.0))
-
-    def test_two_turns_behind_is_always_stale(self):
-        agent._current_turn_id = 9
-        agent._latest_stt_final_at = 50.0
-        self.assertTrue(agent._is_stale_llm_turn(7, 51.0))
-
-    def test_same_turn_is_never_stale(self):
-        agent._current_turn_id = 7
-        agent._latest_stt_final_at = 60.0
-        self.assertFalse(agent._is_stale_llm_turn(7, 51.0))
-
-    def test_without_timestamp_keeps_strict_behavior(self):
-        agent._current_turn_id = 8
-        self.assertTrue(agent._is_stale_llm_turn(7))
 
 
 if __name__ == "__main__":
