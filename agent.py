@@ -17,7 +17,7 @@ import aiohttp
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from livekit.agents import Agent, AgentSession, InterruptionOptions, JobContext, TurnHandlingOptions, WorkerOptions, cli, function_tool, room_io
+from livekit.agents import Agent, AgentSession, InterruptionOptions, JobContext, StopResponse, TurnHandlingOptions, WorkerOptions, cli, function_tool, room_io
 from livekit import rtc
 from livekit.plugins import ai_coustics, deepgram, hume, mistralai, openai, silero
 from internet_search import (
@@ -171,6 +171,10 @@ _last_tts_first_input_at: float | None = None
 _latest_user_state_for_greeting = "unknown"
 _latest_user_state_changed_at = 0.0
 _latest_user_speaking_at = 0.0
+_latest_stt_any_at = 0.0
+_latest_stt_final_at = 0.0
+_held_fragment_texts: list[tuple[float, str]] = []
+_consecutive_fragment_holds = 0
 _search_tool_called = False
 _search_in_progress = False
 _search_started_at = 0.0
@@ -316,6 +320,13 @@ def _fmt_seconds(seconds: float | None) -> str:
     if seconds is None or seconds < 0:
         return "n/a"
     return f"{seconds:.1f}s"
+
+
+def _fmt_ts(timestamp: float | None) -> str:
+    # Absolute monotonic timestamps: 0.0 means "never recorded this turn", not t=0.
+    if timestamp is None or timestamp <= 0:
+        return "n/a"
+    return f"{timestamp:.1f}s"
 
 
 def _text_hash(text: str) -> str:
@@ -612,16 +623,9 @@ def attach_session_diagnostics(session: AgentSession) -> None:
             )
             return False, "failed"
 
-    def _cleanup_active_assistant_speeches(current_new_speech_id: str | None, cleanup_reason: str | None = None) -> None:
+    def _cleanup_active_assistant_speeches(current_new_speech_id: str | None, cleanup_reason: str) -> None:
         nonlocal pending_user_handoff_speech_id
         global _latest_active_assistant_count_for_hume
-        if cleanup_reason is None:
-            logger.warning(
-                "Deprecated one-argument assistant speech cleanup call ignored: current_new_speech_id=%s active_count=%s",
-                current_new_speech_id or "none",
-                len(active_speech_handles),
-            )
-            return
         active_count_before = len(active_speech_handles)
         active_ids_before = list(active_speech_handles.keys())
         logger.info(
@@ -741,6 +745,41 @@ def attach_session_diagnostics(session: AgentSession) -> None:
         suppressed_speech_ids.clear()
         _latest_active_assistant_count_for_hume = 0
 
+    def _prune_speech_tracking(now: float) -> None:
+        expired: set[str] = set()
+        for sid, finished_at in assistant_speech_finished_at.items():
+            if sid not in active_speech_handles and now - finished_at > SPEECH_TRACKING_TTL_SECONDS:
+                expired.add(sid)
+        for sid, created_at in speech_created_at.items():
+            if (
+                sid not in active_speech_handles
+                and sid not in assistant_speech_finished_at
+                and now - created_at > SPEECH_TRACKING_TTL_SECONDS
+            ):
+                expired.add(sid)
+        if not expired:
+            return
+        for sid in expired:
+            stale_speech_ids.discard(sid)
+            suppressed_speech_ids.discard(sid)
+            for store in (
+                speech_created_at,
+                assistant_speech_started_at,
+                agent_speaking_at,
+                agent_listening_at,
+                assistant_speech_finished_at,
+                hume_request_count_at_speech_start,
+                hume_request_count_at_speech_finish,
+                speech_start_times,
+            ):
+                store.pop(sid, None)
+        logger.info(
+            "Speech tracking pruned: pruned_count=%s remaining_stale_count=%s remaining_suppressed_count=%s ttl_seconds=%s",
+            len(expired),
+            len(stale_speech_ids),
+            len(suppressed_speech_ids),
+            SPEECH_TRACKING_TTL_SECONDS,
+        )
 
     @session.on("speech_created")
     def _on_speech_created(event_or_handle: object) -> None:
@@ -756,6 +795,7 @@ def attach_session_diagnostics(session: AgentSession) -> None:
         resolved_handle = _resolve_speech_handle(event_or_handle)
         speech_id = _speech_id(resolved_handle)
         now = time.monotonic()
+        _prune_speech_tracking(now)
         speech_created_at[speech_id] = now
 
         if latest_user_state == "speaking":
@@ -974,18 +1014,18 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                     "Voice latency audit: turn_id=%s speech_id=%s user_speech_started_at=%s user_speech_stopped_at=%s final_stt_received_at=%s user_turn_committed_at=%s llm_request_started_at=%s llm_first_token_at=%s llm_completed_at=%s tts_request_started_at=%s tts_first_audio_at=%s tts_completed_at=%s assistant_playout_started_at=%s assistant_playout_completed_at=%s user_stopped_to_final_stt=%s final_stt_to_turn_committed=%s turn_committed_to_llm_first_token=%s llm_first_token_to_llm_complete=%s llm_complete_to_tts_request=%s tts_request_to_first_audio=%s tts_first_audio_to_playout_start=%s user_stopped_to_first_audio=%s user_stopped_to_assistant_complete=%s endpointing_min_delay=%s endpointing_max_delay=%s mistral_target_streaming_delay_ms=%s spoken_text_normalization_enabled=%s spoken_text_normalization_mode=%s tts_input_buffering_mode=%s raw_chunk_count=%s normalized_yield_count=%s time_from_llm_first_token_to_first_tts_input=%s tts_provider=%s hume_instant_mode=%s hume_model_version=%s hume_speed=%s openrouter_model=%s llm_stream_status=%s llm_timeout_stage=%s llm_fallback_response_used=%s text_length=%s sentence_end_count=%s hume_requests_during_speech=%s tts_path=%s description_applied=%s",
                     _current_turn_id,
                     done_id,
-                    _fmt_seconds(last_user_speaking_at),
-                    _fmt_seconds(last_user_listening_at),
-                    _fmt_seconds(last_stt_final_at),
-                    _fmt_seconds(_last_turn_committed_at),
-                    _fmt_seconds(_last_llm_start_at),
-                    _fmt_seconds(_last_llm_first_token_at),
-                    _fmt_seconds(_last_llm_complete_at),
-                    _fmt_seconds(_last_tts_request_start_at),
-                    _fmt_seconds(_last_tts_first_audio_at),
-                    _fmt_seconds(_last_tts_completed_at),
-                    _fmt_seconds(speaking_at),
-                    _fmt_seconds(finished_at),
+                    _fmt_ts(last_user_speaking_at),
+                    _fmt_ts(last_user_listening_at),
+                    _fmt_ts(last_stt_final_at),
+                    _fmt_ts(_last_turn_committed_at),
+                    _fmt_ts(_last_llm_start_at),
+                    _fmt_ts(_last_llm_first_token_at),
+                    _fmt_ts(_last_llm_complete_at),
+                    _fmt_ts(_last_tts_request_start_at),
+                    _fmt_ts(_last_tts_first_audio_at),
+                    _fmt_ts(_last_tts_completed_at),
+                    _fmt_ts(speaking_at),
+                    _fmt_ts(finished_at),
                     _fmt_seconds(user_stopped_to_final_stt),
                     _fmt_seconds(final_stt_to_turn_committed),
                     _fmt_seconds(turn_committed_to_llm_first_token),
@@ -995,7 +1035,7 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                     _fmt_seconds(tts_first_audio_to_playout_start),
                     _fmt_seconds(user_stopped_to_first_audio),
                     _fmt_seconds(user_stopped_to_assistant_complete),
-                    os.getenv("LIVEKIT_ENDPOINTING_MIN_DELAY", "0.7"),
+                    os.getenv("LIVEKIT_ENDPOINTING_MIN_DELAY", "1.0"),
                     os.getenv("LIVEKIT_ENDPOINTING_MAX_DELAY", "3.0"),
                     os.getenv("MISTRAL_TARGET_STREAMING_DELAY_MS", "160"),
                     SPOKEN_TEXT_NORMALIZATION,
@@ -1030,6 +1070,7 @@ def attach_session_diagnostics(session: AgentSession) -> None:
     @session.on("agent_state_changed")
     def _on_agent_state_changed(state: object) -> None:
         nonlocal latest_agent_state, latest_agent_state_timestamp
+        global _latest_agent_state_for_hume, _latest_current_speech_id_for_hume, _latest_active_assistant_count_for_hume
         extracted_new_state = _extract_agent_new_state(state)
         latest_agent_state = extracted_new_state
         _latest_agent_state_for_hume = extracted_new_state
@@ -1097,10 +1138,6 @@ def attach_session_diagnostics(session: AgentSession) -> None:
         target = event_item if event_item is not None else item
         role = _safe_attr(target, "role")
         interrupted = _safe_attr(target, "interrupted")
-        if str(role).strip().lower() == "user" and active_speech_handles:
-            _cleanup_active_assistant_speeches("user_turn_committed")
-        if str(interrupted).strip().lower() in {"true", "1", "yes"} and active_speech_handles:
-            _cleanup_active_assistant_speeches("conversation_item_interrupted")
         if PIPELINE_TEXT_DEBUG:
             text_str = _extract_text_for_debug(target)
             logger.info(
@@ -1119,6 +1156,7 @@ def attach_session_diagnostics(session: AgentSession) -> None:
     @session.on("user_input_transcribed")
     def _on_user_input_transcribed(event: object) -> None:
         nonlocal stt_partial_count, stt_final_count, last_stt_any_at, last_stt_final_at, last_stt_preview, last_stt_final_preview
+        global _latest_stt_any_at, _latest_stt_final_at
         final = getattr(event, "final", getattr(event, "is_final", "n/a"))
         language = _safe_attr(event, "language", "n/a")
         speaker_id = getattr(event, "speaker_id", None)
@@ -1127,11 +1165,13 @@ def attach_session_diagnostics(session: AgentSession) -> None:
             transcript = getattr(event, "text", "")
         transcript_str = str(transcript or "")
         last_stt_any_at = time.monotonic()
+        _latest_stt_any_at = last_stt_any_at
         last_stt_preview = _redact_sensitive_text(transcript_str)[:200]
         is_final = str(final).strip().lower() in {"true", "1", "yes"}
         if is_final:
             stt_final_count += 1
             last_stt_final_at = last_stt_any_at
+            _latest_stt_final_at = last_stt_any_at
             last_stt_final_preview = last_stt_preview
         else:
             stt_partial_count += 1
@@ -1186,7 +1226,7 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                     os.getenv("AI_COUSTICS_MODEL", "QUAIL_L"),
                     os.getenv("AI_COUSTICS_LEVEL", "0.7"),
                     os.getenv("LIVEKIT_ENDPOINTING_MODE", "dynamic"),
-                    os.getenv("LIVEKIT_ENDPOINTING_MIN_DELAY", "0.7"),
+                    os.getenv("LIVEKIT_ENDPOINTING_MIN_DELAY", "1.0"),
                     os.getenv("LIVEKIT_ENDPOINTING_MAX_DELAY", "3.0"),
                 )
 
@@ -1216,6 +1256,12 @@ def env_int_clamped(name: str, default: int, min_value: int, max_value: int) -> 
 
 
 AI_COUSTICS_ENABLED = env_bool("AI_COUSTICS_ENABLED", True)
+# Hold replies on clearly cut-off user fragments while the user is still talking,
+# instead of answering mid-sentence (the "you're interrupting me" failure mode).
+TURN_HOLD_INCOMPLETE_FRAGMENTS = env_bool("TURN_HOLD_INCOMPLETE_FRAGMENTS", True)
+TURN_HOLD_MAX_CONSECUTIVE = env_int_clamped("TURN_HOLD_MAX_CONSECUTIVE", 2, 0, 5)
+TURN_HOLD_FRAGMENT_TTL_SECONDS = float(os.getenv("TURN_HOLD_FRAGMENT_TTL_SECONDS", "60"))
+SPEECH_TRACKING_TTL_SECONDS = float(os.getenv("SPEECH_TRACKING_TTL_SECONDS", "120"))
 SPOKEN_TEXT_NORMALIZATION = env_bool("SPOKEN_TEXT_NORMALIZATION", False)
 TTS_TEXT_DEBUG = env_bool("TTS_TEXT_DEBUG", False)
 PIPELINE_TEXT_DEBUG = env_bool("PIPELINE_TEXT_DEBUG", False)
@@ -1818,13 +1864,54 @@ def _extract_latest_user_text_from_chat_ctx(chat_ctx: object) -> str:
 
 
 
-def _recent_turn_previews_from_chat_ctx(chat_ctx: object, limit: int = 5) -> list[str]:
+def _chat_ctx_items(chat_ctx: object) -> list[object] | None:
+    # LiveKit 1.x ChatContext exposes `items` (property) and `messages()` (method);
+    # older shapes exposed a `messages` list attribute. Support all three.
+    items = getattr(chat_ctx, "items", None)
+    if items is not None and not callable(items):
+        try:
+            return list(items)
+        except Exception:
+            pass
     messages = getattr(chat_ctx, "messages", None)
-    if not messages:
-        return []
-    try:
-        iterable = list(messages)
-    except Exception:
+    if callable(messages):
+        try:
+            return list(messages())
+        except Exception:
+            return None
+    if messages is not None:
+        try:
+            return list(messages)
+        except Exception:
+            return None
+    return None
+
+
+def _replace_chat_ctx_items(chat_ctx: object, new_items: list[object]) -> bool:
+    items = getattr(chat_ctx, "items", None)
+    if items is not None and not callable(items):
+        try:
+            chat_ctx.items = new_items  # type: ignore[attr-defined]
+            return True
+        except Exception:
+            try:
+                items[:] = new_items
+                return True
+            except Exception:
+                return False
+    messages = getattr(chat_ctx, "messages", None)
+    if messages is not None and not callable(messages):
+        try:
+            messages[:] = new_items
+            return True
+        except Exception:
+            return False
+    return False
+
+
+def _recent_turn_previews_from_chat_ctx(chat_ctx: object, limit: int = 5) -> list[str]:
+    iterable = _chat_ctx_items(chat_ctx)
+    if not iterable:
         return []
     previews: list[str] = []
     for message in iterable[-limit:]:
@@ -1842,22 +1929,10 @@ def _is_system_or_developer_message(message: object) -> bool:
 
 
 def _prune_turn_context_messages(turn_ctx: object, turn_id: int | None = None) -> tuple[int, int, int]:
-    messages = getattr(turn_ctx, "messages", None)
-    if messages is None:
-        logger.info(
-            "context_pruned: turn_id=%s total_messages=%s kept_messages=%s dropped_messages=%s context_window_turns=%s",
-            turn_id or _current_turn_id,
-            0,
-            0,
-            0,
-            CONTEXT_WINDOW_TURNS,
-        )
-        return 0, 0, 0
-    try:
-        message_list = list(messages)
-    except Exception:
+    message_list = _chat_ctx_items(turn_ctx)
+    if message_list is None:
         logger.warning(
-            "context_pruned: turn_id=%s total_messages=%s kept_messages=%s dropped_messages=%s context_window_turns=%s reason=messages_not_iterable",
+            "context_pruned: turn_id=%s total_messages=%s kept_messages=%s dropped_messages=%s context_window_turns=%s reason=chat_ctx_items_unavailable",
             turn_id or _current_turn_id,
             "n/a",
             "n/a",
@@ -1887,21 +1962,15 @@ def _prune_turn_context_messages(turn_ctx: object, turn_id: int | None = None) -
     ]
     dropped_messages = total_messages - len(pruned_messages)
 
-    try:
-        messages[:] = pruned_messages
-    except Exception:
-        try:
-            setattr(turn_ctx, "messages", pruned_messages)
-        except Exception as exc:
-            logger.warning(
-                "context_pruned: turn_id=%s total_messages=%s kept_messages=%s dropped_messages=0 context_window_turns=%s reason=messages_not_mutable error=%s",
-                turn_id or _current_turn_id,
-                total_messages,
-                total_messages,
-                CONTEXT_WINDOW_TURNS,
-                _redact_sensitive_text(exc),
-            )
-            return total_messages, total_messages, 0
+    if not _replace_chat_ctx_items(turn_ctx, pruned_messages):
+        logger.warning(
+            "context_pruned: turn_id=%s total_messages=%s kept_messages=%s dropped_messages=0 context_window_turns=%s reason=chat_ctx_items_not_mutable",
+            turn_id or _current_turn_id,
+            total_messages,
+            total_messages,
+            CONTEXT_WINDOW_TURNS,
+        )
+        return total_messages, total_messages, 0
 
     logger.info(
         "context_pruned: turn_id=%s total_messages=%s kept_messages=%s dropped_messages=%s context_window_turns=%s",
@@ -1912,6 +1981,30 @@ def _prune_turn_context_messages(turn_ctx: object, turn_id: int | None = None) -
         CONTEXT_WINDOW_TURNS,
     )
     return total_messages, len(pruned_messages), dropped_messages
+
+
+_INCOMPLETE_TRAILING_WORDS = {
+    "and", "but", "or", "so", "because", "like", "then", "that", "the", "a", "an",
+    "to", "of", "with", "for", "instead", "if", "when", "while", "is", "are", "was",
+    "were", "at", "in", "on", "by", "my", "your", "i", "you", "we", "they",
+    "i'm", "you're", "it's", "who", "what", "why", "how", "where",
+}
+
+
+def _looks_like_incomplete_fragment(text: str, detected_intent: str, clarification_suggested: bool) -> bool:
+    stripped = (text or "").strip()
+    if not stripped:
+        return True
+    if detected_intent == "unclear_fragment" and clarification_suggested:
+        return True
+    if stripped.endswith(("...", ",", "-", "—", ";", ":")):
+        return True
+    words = re.findall(r"[A-Za-z']+", stripped)
+    if not words:
+        return True
+    # STT auto-punctuation often appends "." to cut-off speech, so check the last
+    # word even when terminal punctuation is present.
+    return words[-1].lower() in _INCOMPLETE_TRAILING_WORDS
 
 
 def _apply_transcript_context_to_message(new_message: object, context: TranscriptContext) -> None:
@@ -2626,6 +2719,26 @@ class LucyAgent(Agent):
             async def _yield_fallback(reason: str) -> AsyncIterable[str]:
                 nonlocal fallback_yielded
                 global _pending_llm_fallback_text, _last_llm_fallback_response_used, _last_generic_llm_fallback_used
+                if llm_turn_id != _current_turn_id:
+                    logger.warning(
+                        "fallback_decision_turn_id=%s fallback_suppressed=true fallback_suppressed_reason=stale_llm_turn reason=%s current_turn_id=%s generic_llm_fallback_used=%s",
+                        llm_turn_id,
+                        reason,
+                        _current_turn_id,
+                        False,
+                    )
+                    return
+                if _latest_user_state_for_greeting == "speaking" or (
+                    _latest_stt_any_at > 0 and _latest_stt_any_at > _latest_stt_final_at
+                ):
+                    logger.warning(
+                        "fallback_decision_turn_id=%s fallback_suppressed=true fallback_suppressed_reason=user_speaking reason=%s latest_user_state=%s generic_llm_fallback_used=%s",
+                        llm_turn_id,
+                        reason,
+                        _latest_user_state_for_greeting,
+                        False,
+                    )
+                    return
                 search_turn_matches_current = _search_turn_matches_current() and _search_turn_id == llm_turn_id
                 if _search_in_progress and search_turn_matches_current:
                     logger.warning(
@@ -2930,6 +3043,8 @@ class LucyAgent(Agent):
 
     async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
         global _last_turn_committed_at, _last_llm_start_at, _last_llm_first_token_at, _last_llm_complete_at, _last_llm_stream_status, _last_llm_timeout_stage, _last_llm_fallback_response_used, _last_llm_completed_text, _last_llm_completed_text_hash, _last_llm_completed_at, _last_tts_received_text_hash, _last_user_message_text, _current_turn_id, _current_turn_transcript_intent, _current_turn_search_allowed, _current_turn_search_allowed_reason
+        global _last_tts_request_start_at, _last_tts_first_audio_at, _last_tts_completed_at, _last_tts_first_input_at, _last_tts_raw_chunk_count, _last_tts_normalized_yield_count, _last_tts_text_length, _last_tts_sentence_end_count, _last_tts_path, _last_hume_request_start_at
+        global _held_fragment_texts, _consecutive_fragment_holds
         _current_turn_id = _next_turn_id()
         _reset_search_state_for_turn(_current_turn_id)
         _last_turn_committed_at = time.monotonic()
@@ -2942,8 +3057,51 @@ class LucyAgent(Agent):
         _last_llm_completed_text = ""
         _last_llm_completed_text_hash = "empty"
         _last_llm_completed_at = 0.0
+        _last_tts_request_start_at = 0.0
+        _last_tts_first_audio_at = None
+        _last_tts_completed_at = 0.0
+        _last_tts_first_input_at = None
+        _last_tts_raw_chunk_count = 0
+        _last_tts_normalized_yield_count = 0
+        _last_tts_text_length = 0
+        _last_tts_sentence_end_count = 0
+        _last_tts_path = None
+        _last_hume_request_start_at = 0.0
         _last_user_message_text = _extract_text_for_debug(new_message).strip()
         _last_tts_received_text_hash = "empty"
+        if _held_fragment_texts:
+            fresh_fragments = [
+                text
+                for held_at, text in _held_fragment_texts
+                if _last_turn_committed_at - held_at <= TURN_HOLD_FRAGMENT_TTL_SECONDS
+            ]
+            expired_fragment_count = len(_held_fragment_texts) - len(fresh_fragments)
+            _held_fragment_texts = []
+            if fresh_fragments:
+                merged_text = " ".join(fresh_fragments + [_last_user_message_text]).strip()
+                try:
+                    setattr(new_message, "content", [merged_text])
+                    _last_user_message_text = merged_text
+                except Exception as exc:
+                    logger.warning(
+                        "Held fragment merge could not replace user text: error_type=%s error=%s",
+                        type(exc).__name__,
+                        _redact_sensitive_text(exc),
+                    )
+                logger.info(
+                    "held_fragment_merged turn_id=%s held_count=%s expired_count=%s merged_length=%s",
+                    _current_turn_id,
+                    len(fresh_fragments),
+                    expired_fragment_count,
+                    len(_last_user_message_text),
+                )
+            elif expired_fragment_count:
+                logger.info(
+                    "held_fragment_expired turn_id=%s expired_count=%s ttl_seconds=%s",
+                    _current_turn_id,
+                    expired_fragment_count,
+                    TURN_HOLD_FRAGMENT_TTL_SECONDS,
+                )
         logger.info(
             "User turn committed: turn_id=%s search_state_reset=true search_turn_id=%s search_in_progress=%s search_tool_called=%s",
             _current_turn_id,
@@ -2988,6 +3146,7 @@ class LucyAgent(Agent):
             if transcript_context.source == "deterministic_llm_error_fallback" and context_error_type == "none":
                 context_error_type = "llm_error_or_invalid_json"
             _log_transcript_context_result(transcript_context, llm_started=transcript_context_llm_started, llm_error_type=context_error_type, turn_id=_current_turn_id)
+            turn_clarification_suggested = transcript_context.clarification_suggested
         else:
             _current_turn_transcript_intent = "disabled"
             _current_turn_search_allowed = True
@@ -3005,16 +3164,43 @@ class LucyAgent(Agent):
                 False,
                 False,
             )
+            turn_clarification_suggested = False
+        if TURN_HOLD_INCOMPLETE_FRAGMENTS:
+            user_continuing = (
+                _latest_user_state_for_greeting == "speaking"
+                or (_latest_stt_any_at > 0 and _latest_stt_any_at > _latest_stt_final_at)
+            )
+            fragment_like = _looks_like_incomplete_fragment(
+                _last_user_message_text,
+                _current_turn_transcript_intent,
+                turn_clarification_suggested,
+            )
+            if fragment_like and user_continuing and _consecutive_fragment_holds < TURN_HOLD_MAX_CONSECUTIVE:
+                _consecutive_fragment_holds += 1
+                _held_fragment_texts.append((time.monotonic(), _last_user_message_text))
+                logger.info(
+                    "user_turn_reply_held turn_id=%s reason=incomplete_fragment_user_continuing detected_intent=%s consecutive_holds=%s latest_user_state=%s fragment_length=%s fragment_preview=%s",
+                    _current_turn_id,
+                    _current_turn_transcript_intent,
+                    _consecutive_fragment_holds,
+                    _latest_user_state_for_greeting,
+                    len(_last_user_message_text),
+                    _redact_sensitive_text(_last_user_message_text)[:120],
+                )
+                raise StopResponse()
+            if fragment_like and user_continuing:
+                logger.info(
+                    "user_turn_reply_hold_skipped turn_id=%s reason=max_consecutive_holds_reached consecutive_holds=%s max_consecutive=%s",
+                    _current_turn_id,
+                    _consecutive_fragment_holds,
+                    TURN_HOLD_MAX_CONSECUTIVE,
+                )
+            _consecutive_fragment_holds = 0
         _prune_turn_context_messages(turn_ctx, _current_turn_id)
         if PIPELINE_TEXT_DEBUG:
             msg_str = _last_user_message_text
-            messages = getattr(turn_ctx, "messages", None)
-            message_count = "n/a"
-            if messages is not None:
-                try:
-                    message_count = len(messages)
-                except Exception:
-                    message_count = "n/a"
+            turn_ctx_items = _chat_ctx_items(turn_ctx)
+            message_count = len(turn_ctx_items) if turn_ctx_items is not None else "n/a"
             logger.info(
                 "User turn debug: new_message_length=%s preview=%s turn_ctx_message_count=%s",
                 len(msg_str),
@@ -3210,7 +3396,7 @@ async def entrypoint(ctx: JobContext):
     }
     logger.info("Resolved interruption config: %s", interruption_options)
     endpointing_mode = os.getenv("LIVEKIT_ENDPOINTING_MODE", "dynamic")
-    endpointing_min_delay = float(os.getenv("LIVEKIT_ENDPOINTING_MIN_DELAY", "0.7"))
+    endpointing_min_delay = float(os.getenv("LIVEKIT_ENDPOINTING_MIN_DELAY", "1.0"))
     endpointing_max_delay = float(os.getenv("LIVEKIT_ENDPOINTING_MAX_DELAY", "3.0"))
     logger.info(
         "Endpointing config: mode=%s min_delay=%s max_delay=%s",
