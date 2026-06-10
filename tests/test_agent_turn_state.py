@@ -441,6 +441,22 @@ class TurnPolicyTests(unittest.TestCase):
 
 
 class OnUserTurnCompletedRegressionTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.state = {
+            name: getattr(agent, name)
+            for name in (
+                "_held_turn_fragment_text",
+                "_held_turn_fragment_created_at",
+                "_held_turn_fragment_classification",
+                "_held_turn_fragment_incomplete",
+                "_current_turn_policy_decision",
+            )
+        }
+
+    def tearDown(self):
+        for name, value in self.state.items():
+            setattr(agent, name, value)
+
     class Message:
         def __init__(self, role: str, content: str):
             self.role = role
@@ -480,6 +496,25 @@ class OnUserTurnCompletedRegressionTests(unittest.IsolatedAsyncioTestCase):
         prune, turn_ctx = await self._run_turn("What time is it?")
         self.assertTrue(prune.called)
         self.assertIsInstance(turn_ctx.messages, list)
+
+    async def test_on_user_turn_completed_no_held_fragment_commit_now_does_not_raise(self):
+        agent._held_turn_fragment_text = ""
+        agent._held_turn_fragment_created_at = 0.0
+        prune, _ = await self._run_turn("I felt complete.")
+        self.assertTrue(prune.called)
+        self.assertEqual(agent._current_turn_policy_decision, "COMMIT_NOW")
+
+    async def test_on_user_turn_completed_held_fragment_not_merged_does_not_raise(self):
+        agent._held_turn_fragment_text = "I was talking about my brother because"
+        agent._held_turn_fragment_created_at = 100.0
+        agent._held_turn_fragment_classification = "INCOMPLETE_THOUGHT"
+        agent._held_turn_fragment_incomplete = True
+        with patch("agent.time.monotonic", return_value=103.0):
+            prune, turn_ctx = await self._run_turn("What time is it?")
+        self.assertTrue(prune.called)
+        self.assertEqual(agent._current_turn_policy_decision, "FLUSH_HELD_AND_COMMIT_NEW")
+        user_messages = [message for message in turn_ctx.messages if message.role == "user"]
+        self.assertEqual(user_messages[-1].content, "What time is it?")
 
 
 class ContextPruningTests(unittest.TestCase):

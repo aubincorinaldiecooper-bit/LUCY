@@ -3782,6 +3782,7 @@ class LucyAgent(Agent):
             turn_policy.should_merge_held_fragment,
             turn_policy.should_clear_held_fragment,
         )
+        merged_text: str | None = None
         if turn_policy.classification == "META_COMPLAINT":
             logger.warning(
                 "meta_complaint_detected=true held_fragment_present=%s recovery_from_silence_triggered=%s",
@@ -3795,7 +3796,7 @@ class LucyAgent(Agent):
                 )
                 _set_user_message_text(new_message, recovery_text)
                 _last_user_message_text = recovery_text
-        elif turn_policy.decision == "MERGE_WITH_HELD_FRAGMENT" and _held_turn_fragment_text:
+        elif turn_policy.should_merge_held_fragment and turn_policy.decision == "MERGE_WITH_HELD_FRAGMENT" and _held_turn_fragment_text:
             merged_text = f"{_held_turn_fragment_text.rstrip()} {_last_user_message_text.lstrip()}".strip()
             _set_user_message_text(new_message, merged_text)
             _last_user_message_text = merged_text
