@@ -478,5 +478,43 @@ class ChatContextPruneTests(unittest.TestCase):
         self.assertEqual(len(ctx.items), 5)
 
 
+class StaleLlmTurnTests(unittest.TestCase):
+    def setUp(self):
+        self.saved = {
+            name: getattr(agent, name)
+            for name in ("_current_turn_id", "_latest_stt_final_at")
+        }
+
+    def tearDown(self):
+        for name, value in self.saved.items():
+            setattr(agent, name, value)
+
+    def test_preemptive_off_by_one_is_not_stale_without_newer_final(self):
+        # Stream started after the final STT that produced this commit: the
+        # turn counter incremented for the SAME utterance, so not stale.
+        agent._current_turn_id = 8
+        agent._latest_stt_final_at = 50.0
+        self.assertFalse(agent._is_stale_llm_turn(7, 51.0))
+
+    def test_off_by_one_is_stale_when_newer_final_arrived(self):
+        agent._current_turn_id = 8
+        agent._latest_stt_final_at = 60.0
+        self.assertTrue(agent._is_stale_llm_turn(7, 51.0))
+
+    def test_two_turns_behind_is_always_stale(self):
+        agent._current_turn_id = 9
+        agent._latest_stt_final_at = 50.0
+        self.assertTrue(agent._is_stale_llm_turn(7, 51.0))
+
+    def test_same_turn_is_never_stale(self):
+        agent._current_turn_id = 7
+        agent._latest_stt_final_at = 60.0
+        self.assertFalse(agent._is_stale_llm_turn(7, 51.0))
+
+    def test_without_timestamp_keeps_strict_behavior(self):
+        agent._current_turn_id = 8
+        self.assertTrue(agent._is_stale_llm_turn(7))
+
+
 if __name__ == "__main__":
     unittest.main()

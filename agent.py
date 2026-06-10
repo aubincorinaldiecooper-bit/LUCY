@@ -2249,8 +2249,19 @@ def _is_clear_short_commit(text: str) -> bool:
     return False
 
 
-def _is_stale_llm_turn(llm_turn_id: int) -> bool:
-    return _current_turn_id != llm_turn_id
+def _is_stale_llm_turn(llm_turn_id: int, stream_started_at: float | None = None) -> bool:
+    if _current_turn_id == llm_turn_id:
+        return False
+    if stream_started_at is None:
+        return True
+    if _current_turn_id - llm_turn_id > 1:
+        return True
+    # With preemptive generation the reply stream starts at final STT, before
+    # on_user_turn_completed increments the turn counter for the same
+    # utterance, so an off-by-one alone is not staleness. The stream is only
+    # answering outdated text if a newer final transcript arrived after it
+    # started.
+    return _latest_stt_final_at > stream_started_at
 
 
 def _endpointing_decision_for_transcript(text: str, context: TranscriptContext | None = None) -> tuple[str, str, int]:
@@ -2836,6 +2847,17 @@ class LucyAgent(Agent):
                 LLM_TO_TTS_HANDOFF_GUARD_ENABLED,
             )
             sanitized = _sanitize_spoken_laughter(raw_text)
+            if raw_text.strip() and _last_llm_stream_status == "stale_turn":
+                # A stale stream may have emitted a chunk or two before
+                # staleness was detected; never speak that fragment.
+                logger.warning(
+                    "TTS stale stream text dropped: raw_chunk_count=%s raw_total_length=%s llm_stream_status=%s preview=%s",
+                    chunk_count,
+                    len(raw_text),
+                    _last_llm_stream_status,
+                    _redact_sensitive_text(raw_text)[:120],
+                )
+                sanitized = ""
             normalized_text = self._normalize_spoken_text(sanitized)
             normalized_hash = _text_hash(normalized_text)
             _latest_normalized_text_hash = normalized_hash
@@ -3464,7 +3486,7 @@ class LucyAgent(Agent):
                                 yield fallback
                         break
 
-                    if _is_stale_llm_turn(llm_turn_id):
+                    if _is_stale_llm_turn(llm_turn_id, start):
                         _last_llm_stream_status = "stale_turn"
                         _last_llm_complete_at = time.monotonic()
                         logger.warning(
@@ -3980,12 +4002,14 @@ async def entrypoint(ctx: JobContext):
         "vad": build_vad(),
     }
 
+    preemptive_generation_options = {"enabled": PREEMPTIVE_GENERATION_ENABLED}
     resolved_turn_detection_mode = "unknown"
     if STT_PROVIDER == "deepgram_flux":
         if resolved_livekit_turn_detection_mode == "stt":
             session_kwargs["turn_handling"] = TurnHandlingOptions(
                 turn_detection="stt",
                 interruption=interruption_options,
+                preemptive_generation=preemptive_generation_options,
             )
             resolved_turn_detection_mode = "stt"
             logger.info("Using Flux STT-based turn detection")
@@ -3994,6 +4018,7 @@ async def entrypoint(ctx: JobContext):
                 session_kwargs["turn_handling"] = TurnHandlingOptions(
                     turn_detection="vad",
                     interruption=interruption_options,
+                    preemptive_generation=preemptive_generation_options,
                 )
                 resolved_turn_detection_mode = "vad"
                 logger.info("Using Flux VAD-based turn detection")
@@ -4002,9 +4027,13 @@ async def entrypoint(ctx: JobContext):
                 session_kwargs["turn_handling"] = TurnHandlingOptions(
                     turn_detection="stt",
                     interruption=interruption_options,
+                    preemptive_generation=preemptive_generation_options,
                 )
                 resolved_turn_detection_mode = "stt"
         elif resolved_livekit_turn_detection_mode == "default":
+            session_kwargs["turn_handling"] = TurnHandlingOptions(
+                preemptive_generation=preemptive_generation_options,
+            )
             resolved_turn_detection_mode = "default"
             logger.info("Using LiveKit default turn handling for Deepgram Flux")
 
@@ -4023,6 +4052,7 @@ async def entrypoint(ctx: JobContext):
                 "min_delay": endpointing_min_delay,
                 "max_delay": endpointing_max_delay,
             },
+            preemptive_generation=preemptive_generation_options,
         )
         resolved_turn_detection_mode = "vad"
         logger.info("Using Mistral VAD-only turn handling")
@@ -4030,13 +4060,13 @@ async def entrypoint(ctx: JobContext):
         session_kwargs["turn_handling"] = TurnHandlingOptions(
             turn_detection="vad",
             interruption=interruption_options,
+            preemptive_generation=preemptive_generation_options,
         )
         resolved_turn_detection_mode = "vad"
         logger.info("Using non-Flux VAD turn handling")
 
-    session_kwargs["preemptive_generation"] = PREEMPTIVE_GENERATION_ENABLED
     logger.info(
-        "Preemptive generation config: preemptive_generation_enabled=%s context_or_tools_mutate=%s",
+        "Preemptive generation config: preemptive_generation_enabled=%s applied_via=turn_handling_options context_or_tools_mutate=%s",
         PREEMPTIVE_GENERATION_ENABLED,
         True,
     )
