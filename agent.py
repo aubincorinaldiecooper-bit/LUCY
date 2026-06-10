@@ -1421,6 +1421,9 @@ def attach_session_diagnostics(session: AgentSession) -> None:
             )
             return
         logger.info("Conversation item added: role=%s interrupted=%s", role, interrupted)
+        if str(role).strip().lower() == "user":
+            _reset_search_state_for_turn()
+            logger.info("Search state reset for new user turn: search_in_progress=%s search_tool_called=%s", _search_in_progress, _search_tool_called)
 
     @session.on("user_input_transcribed")
     def _on_user_input_transcribed(event: object) -> None:
@@ -1526,6 +1529,12 @@ def env_int_clamped(name: str, default: int, min_value: int, max_value: int) -> 
 
 
 AI_COUSTICS_ENABLED = env_bool("AI_COUSTICS_ENABLED", True)
+# Hold replies on clearly cut-off user fragments while the user is still talking,
+# instead of answering mid-sentence (the "you're interrupting me" failure mode).
+TURN_HOLD_INCOMPLETE_FRAGMENTS = env_bool("TURN_HOLD_INCOMPLETE_FRAGMENTS", True)
+TURN_HOLD_MAX_CONSECUTIVE = env_int_clamped("TURN_HOLD_MAX_CONSECUTIVE", 2, 0, 5)
+TURN_HOLD_FRAGMENT_TTL_SECONDS = float(os.getenv("TURN_HOLD_FRAGMENT_TTL_SECONDS", "60"))
+SPEECH_TRACKING_TTL_SECONDS = float(os.getenv("SPEECH_TRACKING_TTL_SECONDS", "120"))
 SPOKEN_TEXT_NORMALIZATION = env_bool("SPOKEN_TEXT_NORMALIZATION", False)
 TTS_TEXT_DEBUG = env_bool("TTS_TEXT_DEBUG", False)
 PIPELINE_TEXT_DEBUG = env_bool("PIPELINE_TEXT_DEBUG", False)
@@ -2905,6 +2914,17 @@ class LucyAgent(Agent):
                 LLM_TO_TTS_HANDOFF_GUARD_ENABLED,
             )
             sanitized = _sanitize_spoken_laughter(raw_text)
+            if raw_text.strip() and _last_llm_stream_status == "stale_turn":
+                # A stale stream may have emitted a chunk or two before
+                # staleness was detected; never speak that fragment.
+                logger.warning(
+                    "TTS stale stream text dropped: raw_chunk_count=%s raw_total_length=%s llm_stream_status=%s preview=%s",
+                    chunk_count,
+                    len(raw_text),
+                    _last_llm_stream_status,
+                    _redact_sensitive_text(raw_text)[:120],
+                )
+                sanitized = ""
             normalized_text = self._normalize_spoken_text(sanitized)
             normalized_hash = _text_hash(normalized_text)
             _latest_normalized_text_hash = normalized_hash
@@ -3849,9 +3869,158 @@ class LucyAgent(Agent):
             message_count = "n/a"
             if messages is not None:
                 try:
-                    message_count = len(messages)
-                except Exception:
-                    message_count = "n/a"
+                    setattr(new_message, "content", [merged_text])
+                    _last_user_message_text = merged_text
+                except Exception as exc:
+                    logger.warning(
+                        "Held fragment merge could not replace user text: error_type=%s error=%s",
+                        type(exc).__name__,
+                        _redact_sensitive_text(exc),
+                    )
+                logger.info(
+                    "held_fragment_merged turn_id=%s held_count=%s expired_count=%s merged_length=%s",
+                    _current_turn_id,
+                    len(fresh_fragments),
+                    expired_fragment_count,
+                    len(_last_user_message_text),
+                )
+            elif expired_fragment_count:
+                logger.info(
+                    "held_fragment_expired turn_id=%s expired_count=%s ttl_seconds=%s",
+                    _current_turn_id,
+                    expired_fragment_count,
+                    TURN_HOLD_FRAGMENT_TTL_SECONDS,
+                )
+        logger.info(
+            "User turn committed: turn_id=%s search_state_reset=true search_turn_id=%s search_in_progress=%s search_tool_called=%s",
+            _current_turn_id,
+            _search_turn_id,
+            _search_in_progress,
+            _search_tool_called,
+        )
+        if transcript_context_layer_enabled():
+            transcript_context_llm_started = transcript_context_llm_enabled()
+            context_error_type = "none"
+            try:
+                transcript_context = await interpret_transcript_context(
+                    _last_user_message_text,
+                    recent_turns=_recent_turn_previews_from_chat_ctx(turn_ctx),
+                    runtime_context=self.runtime_context.system_message if self.runtime_context is not None else None,
+                )
+            except Exception as exc:
+                context_error_type = type(exc).__name__
+                logger.warning(
+                    "Transcript context layer failed; using deterministic fallback: error_type=%s error=%s",
+                    context_error_type,
+                    _redact_sensitive_text(exc),
+                )
+                transcript_context = detect_transcript_context(_last_user_message_text)
+            _current_turn_transcript_intent = transcript_context.detected_intent or "unknown"
+            _current_turn_search_allowed, _current_turn_search_allowed_reason = _search_policy_for_intent(
+                _current_turn_transcript_intent,
+                transcript_context.clarification_suggested,
+            )
+            logger.info(
+                "search_allowed_for_turn=%s search_allowed_reason=%s turn_id=%s detected_intent=%s clarification_suggested=%s",
+                _current_turn_search_allowed,
+                _current_turn_search_allowed_reason,
+                _current_turn_id,
+                _current_turn_transcript_intent,
+                transcript_context.clarification_suggested,
+            )
+            _apply_transcript_context_to_message(new_message, transcript_context)
+            if transcript_context.should_replace_user_text and transcript_context.cleaned_text:
+                _last_user_message_text = transcript_context.cleaned_text
+            _inject_transcript_context_note(turn_ctx, transcript_context)
+            if transcript_context.source == "deterministic_llm_error_fallback" and context_error_type == "none":
+                context_error_type = "llm_error_or_invalid_json"
+            _log_transcript_context_result(transcript_context, llm_started=transcript_context_llm_started, llm_error_type=context_error_type, turn_id=_current_turn_id)
+            turn_clarification_suggested = transcript_context.clarification_suggested
+        else:
+            _current_turn_transcript_intent = "disabled"
+            _current_turn_search_allowed = True
+            _current_turn_search_allowed_reason = "llm_tool_call"
+            logger.info(
+                "Transcript context result: turn_id=%s transcript_context_layer_enabled=%s transcript_context_llm_enabled=%s transcript_context_llm_model=%s transcript_context_llm_timeout_ms=%s transcript_context_source=%s original_length=%s cleaned_length=%s context_note_present=%s capability_contract_note_present=%s",
+                _current_turn_id,
+                False,
+                transcript_context_llm_enabled(),
+                transcript_context_llm_model(),
+                transcript_context_llm_timeout_ms(),
+                "disabled",
+                len(_last_user_message_text),
+                len(_last_user_message_text),
+                False,
+                False,
+            )
+            turn_clarification_suggested = False
+        endpointing_decision_context = transcript_context if transcript_context_layer_enabled() else detect_transcript_context(_last_user_message_text)
+        endpointing_decision, endpointing_extend_reason, endpointing_wait_extension_ms = _endpointing_decision_for_transcript(
+            _last_user_message_text,
+            endpointing_decision_context,
+        )
+        logger.info(
+            "endpointing_decision=%s endpointing_extend_reason=%s endpointing_wait_extension_ms=%s turn_id=%s",
+            endpointing_decision,
+            endpointing_extend_reason,
+            endpointing_wait_extension_ms,
+            _current_turn_id,
+        )
+        suppress_generation_after_extension = False
+        if endpointing_decision == "extend_wait" and endpointing_wait_extension_ms > 0:
+            endpointing_wait_started_at = time.monotonic()
+            await asyncio.sleep(endpointing_wait_extension_ms / 1000)
+            if _latest_user_state_for_greeting == "speaking" or _latest_user_speaking_at > endpointing_wait_started_at or _current_turn_id != _search_turn_id:
+                suppress_generation_after_extension = True
+                logger.warning(
+                    "endpointing_decision=extend_wait endpointing_extend_reason=%s endpointing_wait_extension_ms=%s turn_id=%s suppress_generation_after_extension=true latest_user_state=%s user_speaking_after_wait_started=%s current_turn_id=%s search_turn_id=%s",
+                    endpointing_extend_reason,
+                    endpointing_wait_extension_ms,
+                    _current_turn_id,
+                    _latest_user_state_for_greeting,
+                    _latest_user_speaking_at > endpointing_wait_started_at,
+                    _current_turn_id,
+                    _search_turn_id,
+                )
+        if TURN_HOLD_INCOMPLETE_FRAGMENTS:
+            user_continuing = (
+                suppress_generation_after_extension
+                or _latest_user_state_for_greeting == "speaking"
+                or (_latest_stt_partial_at > 0 and _latest_stt_partial_at > _latest_stt_final_at)
+            )
+            fragment_like = suppress_generation_after_extension or _looks_like_incomplete_fragment(
+                _last_user_message_text,
+                _current_turn_transcript_intent,
+                turn_clarification_suggested,
+            )
+            if fragment_like and user_continuing and _consecutive_fragment_holds < TURN_HOLD_MAX_CONSECUTIVE:
+                _consecutive_fragment_holds += 1
+                _held_fragment_texts.append((time.monotonic(), _last_user_message_text))
+                logger.info(
+                    "user_turn_reply_held turn_id=%s reason=incomplete_fragment_user_continuing detected_intent=%s endpointing_extend_reason=%s suppress_generation_after_extension=%s consecutive_holds=%s latest_user_state=%s fragment_length=%s fragment_preview=%s",
+                    _current_turn_id,
+                    _current_turn_transcript_intent,
+                    endpointing_extend_reason,
+                    suppress_generation_after_extension,
+                    _consecutive_fragment_holds,
+                    _latest_user_state_for_greeting,
+                    len(_last_user_message_text),
+                    _redact_sensitive_text(_last_user_message_text)[:120],
+                )
+                raise StopResponse()
+            if fragment_like and user_continuing:
+                logger.info(
+                    "user_turn_reply_hold_skipped turn_id=%s reason=max_consecutive_holds_reached consecutive_holds=%s max_consecutive=%s",
+                    _current_turn_id,
+                    _consecutive_fragment_holds,
+                    TURN_HOLD_MAX_CONSECUTIVE,
+                )
+            _consecutive_fragment_holds = 0
+        _prune_turn_context_messages(turn_ctx, _current_turn_id)
+        if PIPELINE_TEXT_DEBUG:
+            msg_str = _last_user_message_text
+            turn_ctx_items = _chat_ctx_items(turn_ctx)
+            message_count = len(turn_ctx_items) if turn_ctx_items is not None else "n/a"
             logger.info(
                 "User turn debug: new_message_length=%s preview=%s turn_ctx_message_count=%s",
                 len(msg_str),
@@ -4123,12 +4292,14 @@ async def entrypoint(ctx: JobContext):
         "vad": build_vad(),
     }
 
+    preemptive_generation_options = {"enabled": PREEMPTIVE_GENERATION_ENABLED}
     resolved_turn_detection_mode = "unknown"
     if STT_PROVIDER == "deepgram_flux":
         if resolved_livekit_turn_detection_mode == "stt":
             session_kwargs["turn_handling"] = TurnHandlingOptions(
                 turn_detection="stt",
                 interruption=interruption_options,
+                preemptive_generation=preemptive_generation_options,
             )
             resolved_turn_detection_mode = "stt"
             logger.info("Using Flux STT-based turn detection")
@@ -4137,6 +4308,7 @@ async def entrypoint(ctx: JobContext):
                 session_kwargs["turn_handling"] = TurnHandlingOptions(
                     turn_detection="vad",
                     interruption=interruption_options,
+                    preemptive_generation=preemptive_generation_options,
                 )
                 resolved_turn_detection_mode = "vad"
                 logger.info("Using Flux VAD-based turn detection")
@@ -4145,9 +4317,13 @@ async def entrypoint(ctx: JobContext):
                 session_kwargs["turn_handling"] = TurnHandlingOptions(
                     turn_detection="stt",
                     interruption=interruption_options,
+                    preemptive_generation=preemptive_generation_options,
                 )
                 resolved_turn_detection_mode = "stt"
         elif resolved_livekit_turn_detection_mode == "default":
+            session_kwargs["turn_handling"] = TurnHandlingOptions(
+                preemptive_generation=preemptive_generation_options,
+            )
             resolved_turn_detection_mode = "default"
             logger.info("Using LiveKit default turn handling for Deepgram Flux")
 
@@ -4166,6 +4342,7 @@ async def entrypoint(ctx: JobContext):
                 "min_delay": endpointing_min_delay,
                 "max_delay": endpointing_max_delay,
             },
+            preemptive_generation=preemptive_generation_options,
         )
         resolved_turn_detection_mode = "vad"
         logger.info("Using Mistral VAD-only turn handling")
@@ -4173,6 +4350,7 @@ async def entrypoint(ctx: JobContext):
         session_kwargs["turn_handling"] = TurnHandlingOptions(
             turn_detection="vad",
             interruption=interruption_options,
+            preemptive_generation=preemptive_generation_options,
         )
         resolved_turn_detection_mode = "vad"
         logger.info("Using non-Flux VAD turn handling")
