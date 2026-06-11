@@ -3849,27 +3849,13 @@ class LucyAgent(Agent):
             _current_turn_id,
         )
         if endpointing_decision == "extend_wait" and endpointing_wait_extension_ms > 0:
-            if turn_policy.decision == "COMMIT_NOW":
-                logger.info(
-                    "endpointing_extension_skipped=true skip_reason=turn_policy_commit_now endpointing_extend_reason=%s endpointing_wait_extension_ms=%s turn_id=%s",
-                    endpointing_extend_reason,
-                    endpointing_wait_extension_ms,
-                    _current_turn_id,
-                )
-            else:
-                endpointing_wait_started_at = time.monotonic()
-                await asyncio.sleep(endpointing_wait_extension_ms / 1000)
-                if _latest_user_state_for_greeting == "speaking" or _latest_user_speaking_at > endpointing_wait_started_at or _current_turn_id != _search_turn_id:
-                    logger.warning(
-                        "endpointing_decision=extend_wait endpointing_extend_reason=%s endpointing_wait_extension_ms=%s turn_id=%s suppress_generation_after_extension=true latest_user_state=%s user_speaking_after_wait_started=%s current_turn_id=%s search_turn_id=%s",
-                        endpointing_extend_reason,
-                        endpointing_wait_extension_ms,
-                        _current_turn_id,
-                        _latest_user_state_for_greeting,
-                        _latest_user_speaking_at > endpointing_wait_started_at,
-                        _current_turn_id,
-                        _search_turn_id,
-                    )
+            logger.info(
+                "endpointing_extension_skipped=true skip_reason=intent_based_turn_policy turn_policy_decision=%s endpointing_extend_reason=%s endpointing_wait_extension_ms=%s turn_id=%s",
+                turn_policy.decision,
+                endpointing_extend_reason,
+                endpointing_wait_extension_ms,
+                _current_turn_id,
+            )
 
         _prune_turn_context_messages(turn_ctx, _current_turn_id)
         if PIPELINE_TEXT_DEBUG:
