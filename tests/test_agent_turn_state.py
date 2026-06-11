@@ -537,6 +537,23 @@ class OnUserTurnCompletedRegressionTests(unittest.IsolatedAsyncioTestCase):
         user_messages = [message for message in turn_ctx.messages if message.role == "user"]
         self.assertEqual(user_messages[-1].content, "What time is it?")
 
+    async def test_commit_now_skips_endpointing_extension_sleep(self):
+        lucy = object.__new__(agent.LucyAgent)
+        lucy.runtime_context = None
+        turn_ctx = self.TurnCtx([self.Message("system", "prompt"), self.Message("user", "What time is it?")])
+        new_message = turn_ctx.messages[-1]
+        async def fake_interpret(transcript, **kwargs):
+            return agent.detect_transcript_context(transcript)
+        sleep_calls = []
+        async def fake_sleep(delay):
+            sleep_calls.append(delay)
+        with patch.object(agent, "interpret_transcript_context", side_effect=fake_interpret), \
+             patch.object(agent, "_endpointing_decision_for_transcript", return_value=("extend_wait", "short_fragment", 900)), \
+             patch.object(agent.asyncio, "sleep", side_effect=fake_sleep):
+            await lucy.on_user_turn_completed(turn_ctx, new_message)
+        self.assertEqual(agent._current_turn_policy_decision, "COMMIT_NOW")
+        self.assertEqual(sleep_calls, [])
+
     def test_no_stale_fragment_state_references_in_agent_source(self):
         with open(agent.__file__, "r", encoding="utf-8") as source_file:
             source = source_file.read()
