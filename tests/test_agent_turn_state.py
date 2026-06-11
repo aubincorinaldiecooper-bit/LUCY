@@ -516,6 +516,34 @@ class OnUserTurnCompletedRegressionTests(unittest.IsolatedAsyncioTestCase):
         user_messages = [message for message in turn_ctx.messages if message.role == "user"]
         self.assertEqual(user_messages[-1].content, "What time is it?")
 
+    async def test_on_user_turn_completed_commit_now_with_pipeline_text_debug_does_not_raise(self):
+        agent._held_turn_fragment_text = ""
+        agent._held_turn_fragment_created_at = 0.0
+        with patch.object(agent, "PIPELINE_TEXT_DEBUG", True):
+            prune, _ = await self._run_turn("I felt really hurt by that.")
+        self.assertTrue(prune.called)
+        self.assertEqual(agent._current_turn_policy_decision, "COMMIT_NOW")
+
+    async def test_on_user_turn_completed_unmerged_fragment_with_pipeline_text_debug_does_not_raise(self):
+        agent._held_turn_fragment_text = "I was talking about my brother because"
+        agent._held_turn_fragment_created_at = 100.0
+        agent._held_turn_fragment_classification = "INCOMPLETE_THOUGHT"
+        agent._held_turn_fragment_incomplete = True
+        with patch.object(agent, "PIPELINE_TEXT_DEBUG", True), \
+             patch("agent.time.monotonic", return_value=103.0):
+            prune, turn_ctx = await self._run_turn("What time is it?")
+        self.assertTrue(prune.called)
+        self.assertEqual(agent._current_turn_policy_decision, "FLUSH_HELD_AND_COMMIT_NEW")
+        user_messages = [message for message in turn_ctx.messages if message.role == "user"]
+        self.assertEqual(user_messages[-1].content, "What time is it?")
+
+    def test_no_stale_fragment_state_references_in_agent_source(self):
+        with open(agent.__file__, "r", encoding="utf-8") as source_file:
+            source = source_file.read()
+        self.assertNotIn("fresh_fragments", source)
+        self.assertNotIn("_held_fragment_texts", source)
+        self.assertNotIn("_consecutive_fragment_holds", source)
+
 
 class ContextPruningTests(unittest.TestCase):
     class Message:
