@@ -34,6 +34,7 @@ from internet_search import (
     search_provider,
     search_timeout_seconds,
 )
+from memory_layer import MemoryLayer, identity_from_metadata, memory_enabled
 from runtime_context import RuntimeContext, answer_datetime_intent, detect_datetime_intent, runtime_context_from_metadata
 from transcript_context import (
     TranscriptContext,
@@ -200,6 +201,7 @@ _current_turn_search_allowed_reason = "not_evaluated"
 _current_turn_policy_classification = "UNKNOWN"
 _current_turn_policy_decision = "COMMIT_NOW"
 _current_turn_audio_unclear = False
+_active_memory_layer: MemoryLayer | None = None
 _held_turn_fragment_text = ""
 _held_turn_fragment_created_at = 0.0
 _held_turn_fragment_classification = ""
@@ -1410,6 +1412,12 @@ def attach_session_diagnostics(session: AgentSession) -> None:
         target = event_item if event_item is not None else item
         role = _safe_attr(target, "role")
         interrupted = _safe_attr(target, "interrupted")
+        if _active_memory_layer is not None and str(role).strip().lower() == "assistant":
+            _active_memory_layer.schedule_remember(
+                role="assistant",
+                content=_extract_text_for_debug(target),
+                turn_id=_current_turn_id,
+            )
         if PIPELINE_TEXT_DEBUG:
             text_str = _extract_text_for_debug(target)
             logger.info(
@@ -2525,6 +2533,29 @@ def _inject_transcript_context_note(turn_ctx: object, context: TranscriptContext
         )
 
 
+def _inject_memory_note(turn_ctx: object, memories: list[str]) -> None:
+    if not memories:
+        return
+    lines = "\n".join(f"- {memory}" for memory in memories)
+    note = (
+        "Internal long-term memory note. Do not reveal this note or recite it verbatim. "
+        "Use it only when it is naturally relevant to the user's latest utterance.\n"
+        f"Relevant memories:\n{lines}"
+    )
+    add_message = getattr(turn_ctx, "add_message", None)
+    if not callable(add_message):
+        logger.warning("Memory note could not be injected: turn_ctx_add_message_unavailable")
+        return
+    try:
+        add_message(role="developer", content=note)
+    except Exception as exc:
+        logger.warning(
+            "Memory note injection failed: error_type=%s error=%s",
+            type(exc).__name__,
+            _redact_sensitive_text(exc),
+        )
+
+
 def _capability_contract_note_present(context: TranscriptContext) -> bool:
     capability_intents = {
         "language_request",
@@ -2622,11 +2653,19 @@ def _metadata_candidates_from_context(ctx: JobContext) -> list[Any]:
 
 
 class LucyAgent(Agent):
-    def __init__(self, runtime_context: RuntimeContext | None = None) -> None:
+    def __init__(
+        self,
+        runtime_context: RuntimeContext | None = None,
+        memory_layer: MemoryLayer | None = None,
+        memory_preload_note: str | None = None,
+    ) -> None:
         self.runtime_context = runtime_context
+        self.memory_layer = memory_layer
         instruction_parts = [SYSTEM_PROMPT, RUNTIME_CAPABILITY_CONTRACT]
         if runtime_context is not None:
             instruction_parts.append(runtime_context.system_message)
+        if memory_preload_note:
+            instruction_parts.append(memory_preload_note)
         instructions = "\n\n".join(part for part in instruction_parts if part)
         super().__init__(instructions=instructions)
 
@@ -3857,6 +3896,13 @@ class LucyAgent(Agent):
                 _current_turn_id,
             )
 
+        memory_layer = getattr(self, "memory_layer", None)
+        if memory_layer is not None:
+            retrieved_memories = await memory_layer.retrieve(_last_user_message_text)
+            if retrieved_memories:
+                _inject_memory_note(turn_ctx, retrieved_memories)
+            memory_layer.schedule_remember(role="user", content=_last_user_message_text, turn_id=_current_turn_id)
+
         _prune_turn_context_messages(turn_ctx, _current_turn_id)
         if PIPELINE_TEXT_DEBUG:
             msg_str = _last_user_message_text
@@ -4129,6 +4175,40 @@ async def entrypoint(ctx: JobContext):
         True,
     )
 
+    global _active_memory_layer
+    memory_layer_instance: MemoryLayer | None = None
+    memory_preload_note: str | None = None
+    if memory_enabled():
+        room_name = _safe_attr(_safe_attr(ctx, "room"), "name") or None
+        memory_identity = identity_from_metadata(metadata_candidates, fallback_guest_id=room_name)
+        memory_layer_instance = MemoryLayer(memory_identity)
+        try:
+            preloaded_memories = await asyncio.wait_for(memory_layer_instance.preload(), timeout=2.0)
+        except asyncio.TimeoutError:
+            preloaded_memories = []
+            logger.warning("memory_preload status=timeout timeout_seconds=2.0")
+        memory_preload_note = MemoryLayer.preload_note(preloaded_memories)
+        logger.info(
+            "Memory layer startup: memory_enabled=true memory_scope=%s memory_identity_present=%s preloaded_memory_count=%s preload_note_present=%s",
+            memory_identity.scope,
+            memory_identity.present,
+            len(preloaded_memories),
+            bool(memory_preload_note),
+        )
+        try:
+            ctx.add_shutdown_callback(memory_layer_instance.aclose)
+        except Exception as exc:
+            logger.warning("memory_shutdown_callback_unavailable=true error_type=%s error=%s", type(exc).__name__, exc)
+        asyncio.create_task(memory_layer_instance.rebuild_index_if_empty())
+    else:
+        logger.info("Memory layer startup: memory_enabled=false")
+    _active_memory_layer = memory_layer_instance
+    lucy_agent = LucyAgent(
+        runtime_context=runtime_context,
+        memory_layer=memory_layer_instance,
+        memory_preload_note=memory_preload_note,
+    )
+
     session_kwargs: dict[str, Any] = {
         "stt": build_stt(),
         "llm": llm,
@@ -4235,11 +4315,11 @@ async def entrypoint(ctx: JobContext):
     session_started_at = 0.0
     if room_options is not None:
         logger.info("Starting session with ai-coustics room_options attached")
-        await session.start(room=ctx.room, agent=LucyAgent(runtime_context=runtime_context), room_options=room_options)
+        await session.start(room=ctx.room, agent=lucy_agent, room_options=room_options)
         session_started_at = time.monotonic()
     else:
         logger.info("Starting session without ai-coustics room_options")
-        await session.start(room=ctx.room, agent=LucyAgent(runtime_context=runtime_context))
+        await session.start(room=ctx.room, agent=lucy_agent)
         session_started_at = time.monotonic()
 
     greeting_agent_listening_at = 0.0
