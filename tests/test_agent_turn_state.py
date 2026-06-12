@@ -450,6 +450,9 @@ class OnUserTurnCompletedRegressionTests(unittest.IsolatedAsyncioTestCase):
                 "_held_turn_fragment_classification",
                 "_held_turn_fragment_incomplete",
                 "_current_turn_policy_decision",
+                "_latest_user_state_for_greeting",
+                "_latest_stt_partial_at",
+                "_latest_stt_final_at",
             )
         }
 
@@ -487,9 +490,9 @@ class OnUserTurnCompletedRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(prune.called)
         self.assertEqual(agent._current_turn_policy_decision, "COMMIT_NOW")
 
-    async def test_on_user_turn_completed_low_information_filler_does_not_raise(self):
-        prune, _ = await self._run_turn("Yeah.")
-        self.assertTrue(prune.called)
+    async def test_on_user_turn_completed_low_information_filler_skips_generation(self):
+        with self.assertRaises(agent.StopResponse):
+            await self._run_turn("Yeah.")
         self.assertEqual(agent._current_turn_policy_decision, "IGNORE_LOW_INFORMATION_FILLER")
 
     async def test_on_user_turn_completed_pruning_invoked_with_message_list(self):
@@ -554,7 +557,7 @@ class OnUserTurnCompletedRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(agent._current_turn_policy_decision, "COMMIT_NOW")
         self.assertEqual(sleep_calls, [])
 
-    async def test_hold_for_continuation_sleeps_only_reply_deadline_not_endpointing_extension(self):
+    async def test_hold_for_continuation_never_sleeps_endpointing_extension(self):
         lucy = object.__new__(agent.LucyAgent)
         lucy.runtime_context = None
         turn_ctx = self.TurnCtx([self.Message("system", "prompt"), self.Message("user", "I was thinking because")])
@@ -566,11 +569,55 @@ class OnUserTurnCompletedRegressionTests(unittest.IsolatedAsyncioTestCase):
             sleep_calls.append(delay)
         with patch.object(agent, "interpret_transcript_context", side_effect=fake_interpret), \
              patch.object(agent, "_endpointing_decision_for_transcript", return_value=("extend_wait", "short_fragment", 900)), \
+             patch.object(agent, "TURN_HOLD_FRAGMENT_REPLY_DEADLINE_SECONDS", 0.0), \
              patch.object(agent.asyncio, "sleep", side_effect=fake_sleep):
             await lucy.on_user_turn_completed(turn_ctx, new_message)
         self.assertEqual(agent._current_turn_policy_decision, "HOLD_FOR_CONTINUATION")
-        self.assertEqual(sleep_calls, [max(0.0, agent.TURN_HOLD_FRAGMENT_REPLY_DEADLINE_SECONDS)])
         self.assertNotIn(0.9, sleep_calls)
+        self.assertEqual(agent._held_turn_fragment_text, "")
+
+    async def test_hold_yields_to_user_continuation_and_keeps_fragment(self):
+        agent._held_turn_fragment_text = ""
+        agent._latest_user_state_for_greeting = "speaking"
+        with patch.object(agent, "TURN_HOLD_FRAGMENT_REPLY_DEADLINE_SECONDS", 5.0):
+            with self.assertRaises(agent.StopResponse):
+                await self._run_turn("I was thinking because")
+        self.assertEqual(agent._current_turn_policy_decision, "HOLD_FOR_CONTINUATION")
+        self.assertEqual(agent._held_turn_fragment_text, "I was thinking because")
+
+    async def test_hold_yields_on_new_transcript_activity(self):
+        import time as _time
+
+        agent._held_turn_fragment_text = ""
+        agent._latest_user_state_for_greeting = "listening"
+        agent._latest_stt_partial_at = _time.monotonic() + 1000
+        with patch.object(agent, "TURN_HOLD_FRAGMENT_REPLY_DEADLINE_SECONDS", 5.0):
+            with self.assertRaises(agent.StopResponse):
+                await self._run_turn("I was thinking because")
+        self.assertEqual(agent._held_turn_fragment_text, "I was thinking because")
+
+    async def test_hold_commits_at_deadline_when_user_stays_quiet(self):
+        agent._held_turn_fragment_text = ""
+        agent._latest_user_state_for_greeting = "listening"
+        agent._latest_stt_partial_at = 0.0
+        agent._latest_stt_final_at = 0.0
+        with patch.object(agent, "TURN_HOLD_FRAGMENT_REPLY_DEADLINE_SECONDS", 0.2):
+            prune, _ = await self._run_turn("I was thinking because")
+        self.assertTrue(prune.called)
+        self.assertEqual(agent._held_turn_fragment_text, "")
+
+    async def test_action_turn_gets_response_mode_note(self):
+        prune, turn_ctx = await self._run_turn("Can you send an email to my mom?")
+        self.assertTrue(prune.called)
+        developer_notes = [m.content for m in turn_ctx.messages if m.role == "developer" and "action request" in str(m.content)]
+        self.assertEqual(len(developer_notes), 1)
+        self.assertIn("intent: tool_request_email", developer_notes[0])
+
+    async def test_conversation_turn_gets_no_response_mode_note(self):
+        prune, turn_ctx = await self._run_turn("I felt really hurt by that.")
+        self.assertTrue(prune.called)
+        developer_notes = [m.content for m in turn_ctx.messages if m.role == "developer" and "action request" in str(m.content)]
+        self.assertEqual(developer_notes, [])
 
     def test_no_stale_fragment_state_references_in_agent_source(self):
         with open(agent.__file__, "r", encoding="utf-8") as source_file:
