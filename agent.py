@@ -35,6 +35,7 @@ from internet_search import (
     search_timeout_seconds,
 )
 from audiointeraction_shadow import AudioInteractionShadow, audiointeraction_mode, build_shadow_from_env
+from interaction_state import InteractionStateMachine, classify_turn_kind
 from memory_layer import MemoryLayer, identity_from_metadata, memory_enabled
 from runtime_context import RuntimeContext, answer_datetime_intent, detect_datetime_intent, runtime_context_from_metadata
 from transcript_context import (
@@ -202,6 +203,7 @@ _current_turn_search_allowed_reason = "not_evaluated"
 _current_turn_policy_classification = "UNKNOWN"
 _current_turn_policy_decision = "COMMIT_NOW"
 _current_turn_audio_unclear = False
+_interaction_state = InteractionStateMachine()
 _active_memory_layer: MemoryLayer | None = None
 _audiointeraction_shadow: AudioInteractionShadow | None = None
 _held_turn_fragment_text = ""
@@ -245,6 +247,7 @@ def _mark_search_wait_started(pre_ack_spoken: bool = False, turn_id: int | None 
     _search_result_handoff_spoken = False
     _last_search_tool_output = ""
     _last_search_tool_output_hash = "empty"
+    _interaction_state.on_tool_call_started("internet_search")
 
 
 def _mark_search_wait_completed(failed: bool, output: str, result_handoff_spoken: bool = False, turn_id: int | None = None) -> bool:
@@ -265,6 +268,7 @@ def _mark_search_wait_completed(failed: bool, output: str, result_handoff_spoken
     _search_result_handoff_spoken = result_handoff_spoken
     _last_search_tool_output = output
     _last_search_tool_output_hash = _text_hash(output)
+    _interaction_state.on_tool_call_finished("internet_search")
     return True
 
 
@@ -1167,6 +1171,7 @@ def attach_session_diagnostics(session: AgentSession) -> None:
             _latest_current_speech_id_for_hume = speech_id
             _latest_active_assistant_count_for_hume = len(active_speech_handles)
 
+        _interaction_state.on_assistant_speech_started(speech_id)
         logger.info(
             "Assistant speech started: current_user_turn_id=%s speech_id=%s speech_turn_id=%s llm_turn_id=%s active_count=%s",
             _current_turn_id,
@@ -1213,6 +1218,7 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                 done_speech_llm_turn_id = assistant_speech_llm_turn_ids.pop(done_id, 0)
                 if was_active and not was_stale:
                     pending_user_handoff_speech_id = done_id
+                _interaction_state.on_assistant_speech_finished(interrupted=str(interrupted).strip().lower() == "true")
                 logger.info(
                     "Assistant speech finished: current_user_turn_id=%s speech_id=%s speech_turn_id=%s llm_turn_id=%s interrupted=%s active_count=%s was_suppressed=%s was_stale=%s was_active=%s",
                     _current_turn_id,
@@ -1390,6 +1396,10 @@ def attach_session_diagnostics(session: AgentSession) -> None:
             _latest_user_speaking_at = latest_user_state_timestamp
         if latest_user_state == "listening":
             last_user_listening_at = latest_user_state_timestamp
+        if latest_user_state == "speaking":
+            _interaction_state.on_user_speech_started()
+        elif latest_user_state == "listening":
+            _interaction_state.on_user_speech_stopped()
         logger.info("User state changed: state=%s assistant_active_count=%s", state, len(active_speech_handles))
         if latest_user_state == "speaking" and pending_user_handoff_speech_id is not None:
             previous_speech_id = pending_user_handoff_speech_id
@@ -3273,6 +3283,7 @@ class LucyAgent(Agent):
                 LLM_FIRST_TOKEN_TIMEOUT_SOURCE,
                 LLM_TOTAL_TIMEOUT_SOURCE,
             )
+            _interaction_state.on_llm_started()
 
             def _extract_text_delta(chunk: object) -> str:
                 text_delta: object = None
@@ -3332,6 +3343,7 @@ class LucyAgent(Agent):
                 search_turn_matches_current = _search_turn_matches_current() and _search_turn_id == llm_turn_id
                 generic_suppression_reason = _generic_fallback_suppression_reason(llm_turn_id, start)
                 if generic_suppression_reason == "user_speaking_or_newer_turn_pending":
+                    _interaction_state.on_fallback_decision(allowed=False, reason="user_speaking_or_newer_turn_pending", requires_repeat=False)
                     logger.warning(
                         "fallback_decision_turn_id=%s fallback_suppressed=true fallback_suppressed_reason=user_speaking_or_newer_turn_pending latest_user_state=%s current_turn_id=%s user_speaking_after_fallback_turn_started=%s stt_partial_after_llm_start=%s generic_llm_fallback_used=%s",
                         llm_turn_id,
@@ -3380,6 +3392,7 @@ class LucyAgent(Agent):
                 _last_llm_fallback_response_used = True
                 _last_generic_llm_fallback_used = True
                 _pending_llm_fallback_text = None
+                _interaction_state.on_fallback_decision(allowed=True, reason=reason, requires_repeat=bool(requires_repeat))
                 logger.warning(
                     "LLM fallback yielded to TTS: fallback_decision_turn_id=%s fallback_suppressed=false fallback_suppressed_reason=none fallback_reason=%s fallback_requires_user_repeat=%s transcript_classification=%s fallback_text_length=%s generic_llm_fallback_used=%s search_in_progress=%s search_tool_called=%s search_turn_id=%s search_turn_matches_current=%s",
                     llm_turn_id,
@@ -3748,6 +3761,7 @@ class LucyAgent(Agent):
     async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
         global _last_turn_committed_at, _last_llm_start_at, _last_llm_first_token_at, _last_llm_complete_at, _last_llm_stream_status, _last_llm_timeout_stage, _last_llm_fallback_response_used, _last_llm_completed_text, _last_llm_completed_text_hash, _last_llm_completed_at, _last_tts_received_text_hash, _last_user_message_text, _current_turn_id, _current_turn_transcript_intent, _current_turn_search_allowed, _current_turn_search_allowed_reason, _current_turn_policy_classification, _current_turn_policy_decision, _current_turn_audio_unclear, _held_turn_fragment_text, _held_turn_fragment_created_at, _held_turn_fragment_classification, _held_turn_fragment_incomplete
         _current_turn_id = _next_turn_id()
+        _interaction_state.begin_turn(_current_turn_id)
         _reset_search_state_for_turn(_current_turn_id)
         _last_turn_committed_at = time.monotonic()
         _last_llm_start_at = 0.0
@@ -3842,6 +3856,11 @@ class LucyAgent(Agent):
             turn_policy.should_merge_held_fragment,
             turn_policy.should_clear_held_fragment,
         )
+        _interaction_state.set_turn_kind(
+            classify_turn_kind(_current_turn_transcript_intent, turn_policy.classification, turn_policy.decision),
+            detected_intent=_current_turn_transcript_intent,
+        )
+        _interaction_state.on_turn_policy(turn_policy.decision, turn_policy.classification, turn_policy.reason)
         if _audiointeraction_shadow is not None:
             try:
                 _audiointeraction_shadow.compare_at_turn_commit(
@@ -3899,6 +3918,7 @@ class LucyAgent(Agent):
                 "held_fragment_committed_due_to_reply_deadline=true held_fragment_age_seconds=%.3f",
                 time.monotonic() - _held_turn_fragment_created_at,
             )
+            _interaction_state.on_hold_deadline_commit()
             _held_turn_fragment_text = ""
             _held_turn_fragment_created_at = 0.0
             _held_turn_fragment_classification = ""
