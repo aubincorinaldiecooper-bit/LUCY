@@ -13,3 +13,10 @@ dependencies = [
   "livekit-plugins-ai-coustics>=0.2.15",
   "psycopg[binary]",
 ]
+
+[project.optional-dependencies]
+# SimpleMem pulls heavy multimodal dependencies (torch, FAISS); keep it out of the
+# default image. Install with `uv sync --extra memory` and set MEMORY_ENABLED=true.
+memory = [
+  "simplemem",
+]

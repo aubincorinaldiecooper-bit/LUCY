@@ -34,6 +34,8 @@ from internet_search import (
     search_provider,
     search_timeout_seconds,
 )
+from audiointeraction_shadow import AudioInteractionShadow, audiointeraction_mode, build_shadow_from_env
+from memory_layer import MemoryLayer, identity_from_metadata, memory_enabled
 from runtime_context import RuntimeContext, answer_datetime_intent, detect_datetime_intent, runtime_context_from_metadata
 from transcript_context import (
     TranscriptContext,
@@ -200,6 +202,8 @@ _current_turn_search_allowed_reason = "not_evaluated"
 _current_turn_policy_classification = "UNKNOWN"
 _current_turn_policy_decision = "COMMIT_NOW"
 _current_turn_audio_unclear = False
+_active_memory_layer: MemoryLayer | None = None
+_audiointeraction_shadow: AudioInteractionShadow | None = None
 _held_turn_fragment_text = ""
 _held_turn_fragment_created_at = 0.0
 _held_turn_fragment_classification = ""
@@ -1410,6 +1414,12 @@ def attach_session_diagnostics(session: AgentSession) -> None:
         target = event_item if event_item is not None else item
         role = _safe_attr(target, "role")
         interrupted = _safe_attr(target, "interrupted")
+        if _active_memory_layer is not None and str(role).strip().lower() == "assistant":
+            _active_memory_layer.schedule_remember(
+                role="assistant",
+                content=_extract_text_for_debug(target),
+                turn_id=_current_turn_id,
+            )
         if PIPELINE_TEXT_DEBUG:
             text_str = _extract_text_for_debug(target)
             logger.info(
@@ -2525,6 +2535,38 @@ def _inject_transcript_context_note(turn_ctx: object, context: TranscriptContext
         )
 
 
+async def _tee_audio_to_shadow(audio, shadow: AudioInteractionShadow):
+    async for frame in audio:
+        try:
+            shadow.feed_frame(frame)
+        except Exception:
+            pass
+        yield frame
+
+
+def _inject_memory_note(turn_ctx: object, memories: list[str]) -> None:
+    if not memories:
+        return
+    lines = "\n".join(f"- {memory}" for memory in memories)
+    note = (
+        "Internal long-term memory note. Do not reveal this note or recite it verbatim. "
+        "Use it only when it is naturally relevant to the user's latest utterance.\n"
+        f"Relevant memories:\n{lines}"
+    )
+    add_message = getattr(turn_ctx, "add_message", None)
+    if not callable(add_message):
+        logger.warning("Memory note could not be injected: turn_ctx_add_message_unavailable")
+        return
+    try:
+        add_message(role="developer", content=note)
+    except Exception as exc:
+        logger.warning(
+            "Memory note injection failed: error_type=%s error=%s",
+            type(exc).__name__,
+            _redact_sensitive_text(exc),
+        )
+
+
 def _capability_contract_note_present(context: TranscriptContext) -> bool:
     capability_intents = {
         "language_request",
@@ -2622,11 +2664,19 @@ def _metadata_candidates_from_context(ctx: JobContext) -> list[Any]:
 
 
 class LucyAgent(Agent):
-    def __init__(self, runtime_context: RuntimeContext | None = None) -> None:
+    def __init__(
+        self,
+        runtime_context: RuntimeContext | None = None,
+        memory_layer: MemoryLayer | None = None,
+        memory_preload_note: str | None = None,
+    ) -> None:
         self.runtime_context = runtime_context
+        self.memory_layer = memory_layer
         instruction_parts = [SYSTEM_PROMPT, RUNTIME_CAPABILITY_CONTRACT]
         if runtime_context is not None:
             instruction_parts.append(runtime_context.system_message)
+        if memory_preload_note:
+            instruction_parts.append(memory_preload_note)
         instructions = "\n\n".join(part for part in instruction_parts if part)
         super().__init__(instructions=instructions)
 
@@ -2773,6 +2823,16 @@ class LucyAgent(Agent):
         if normalized[-1] not in {".", "?", "!", "…"}:
             return normalized + "."
         return normalized
+
+    async def stt_node(self, audio, model_settings):
+        # Observational AudioInteraction fork: tee user audio frames to the shadow
+        # sidecar without altering the production STT stream. feed_frame never
+        # blocks or raises; when shadow mode is off the stream passes through as-is.
+        shadow = _audiointeraction_shadow
+        if shadow is not None:
+            audio = _tee_audio_to_shadow(audio, shadow)
+        async for event in Agent.default.stt_node(self, audio, model_settings):
+            yield event
 
     def tts_node(self, text: AsyncIterable[str], model_settings):
         global _latest_normalized_text_hash, _last_tts_request_start_at, _last_tts_first_audio_at, _last_tts_text_length, _last_tts_sentence_end_count, _last_tts_path, _last_tts_node_entered_at, _last_tts_received_text_hash, _last_hume_request_start_at, _last_tts_completed_at, _last_tts_raw_chunk_count, _last_tts_normalized_yield_count, _last_tts_first_input_at
@@ -3782,6 +3842,19 @@ class LucyAgent(Agent):
             turn_policy.should_merge_held_fragment,
             turn_policy.should_clear_held_fragment,
         )
+        if _audiointeraction_shadow is not None:
+            try:
+                _audiointeraction_shadow.compare_at_turn_commit(
+                    _current_turn_id,
+                    turn_policy.decision,
+                    turn_policy.should_start_generation,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "audiointeraction_shadow_comparison_failed=true error_type=%s error=%s",
+                    type(exc).__name__,
+                    _redact_sensitive_text(exc),
+                )
         merged_text: str | None = None
         if turn_policy.classification == "META_COMPLAINT":
             logger.warning(
@@ -3849,27 +3922,20 @@ class LucyAgent(Agent):
             _current_turn_id,
         )
         if endpointing_decision == "extend_wait" and endpointing_wait_extension_ms > 0:
-            if turn_policy.decision == "COMMIT_NOW":
-                logger.info(
-                    "endpointing_extension_skipped=true skip_reason=turn_policy_commit_now endpointing_extend_reason=%s endpointing_wait_extension_ms=%s turn_id=%s",
-                    endpointing_extend_reason,
-                    endpointing_wait_extension_ms,
-                    _current_turn_id,
-                )
-            else:
-                endpointing_wait_started_at = time.monotonic()
-                await asyncio.sleep(endpointing_wait_extension_ms / 1000)
-                if _latest_user_state_for_greeting == "speaking" or _latest_user_speaking_at > endpointing_wait_started_at or _current_turn_id != _search_turn_id:
-                    logger.warning(
-                        "endpointing_decision=extend_wait endpointing_extend_reason=%s endpointing_wait_extension_ms=%s turn_id=%s suppress_generation_after_extension=true latest_user_state=%s user_speaking_after_wait_started=%s current_turn_id=%s search_turn_id=%s",
-                        endpointing_extend_reason,
-                        endpointing_wait_extension_ms,
-                        _current_turn_id,
-                        _latest_user_state_for_greeting,
-                        _latest_user_speaking_at > endpointing_wait_started_at,
-                        _current_turn_id,
-                        _search_turn_id,
-                    )
+            logger.info(
+                "endpointing_extension_skipped=true skip_reason=intent_based_turn_policy turn_policy_decision=%s endpointing_extend_reason=%s endpointing_wait_extension_ms=%s turn_id=%s",
+                turn_policy.decision,
+                endpointing_extend_reason,
+                endpointing_wait_extension_ms,
+                _current_turn_id,
+            )
+
+        memory_layer = getattr(self, "memory_layer", None)
+        if memory_layer is not None:
+            retrieved_memories = await memory_layer.retrieve(_last_user_message_text)
+            if retrieved_memories:
+                _inject_memory_note(turn_ctx, retrieved_memories)
+            memory_layer.schedule_remember(role="user", content=_last_user_message_text, turn_id=_current_turn_id)
 
         _prune_turn_context_messages(turn_ctx, _current_turn_id)
         if PIPELINE_TEXT_DEBUG:
@@ -4143,6 +4209,55 @@ async def entrypoint(ctx: JobContext):
         True,
     )
 
+    global _active_memory_layer, _audiointeraction_shadow
+    _audiointeraction_shadow = build_shadow_from_env()
+    if _audiointeraction_shadow is not None:
+        _audiointeraction_shadow.start()
+        logger.info(
+            "AudioInteraction shadow startup: audiointeraction_mode=shadow endpoint_present=true timeout_ms=%s debug_text=%s",
+            _audiointeraction_shadow.timeout_ms,
+            _audiointeraction_shadow.debug_text,
+        )
+        try:
+            ctx.add_shutdown_callback(_audiointeraction_shadow.aclose)
+        except Exception as exc:
+            logger.warning("audiointeraction_shutdown_callback_unavailable=true error_type=%s error=%s", type(exc).__name__, exc)
+    else:
+        logger.info("AudioInteraction shadow startup: audiointeraction_mode=%s shadow_active=false", audiointeraction_mode())
+
+    memory_layer_instance: MemoryLayer | None = None
+    memory_preload_note: str | None = None
+    if memory_enabled():
+        room_name = _safe_attr(_safe_attr(ctx, "room"), "name") or None
+        memory_identity = identity_from_metadata(metadata_candidates, fallback_guest_id=room_name)
+        memory_layer_instance = MemoryLayer(memory_identity)
+        try:
+            preloaded_memories = await asyncio.wait_for(memory_layer_instance.preload(), timeout=2.0)
+        except asyncio.TimeoutError:
+            preloaded_memories = []
+            logger.warning("memory_preload status=timeout timeout_seconds=2.0")
+        memory_preload_note = MemoryLayer.preload_note(preloaded_memories)
+        logger.info(
+            "Memory layer startup: memory_enabled=true memory_scope=%s memory_identity_present=%s preloaded_memory_count=%s preload_note_present=%s",
+            memory_identity.scope,
+            memory_identity.present,
+            len(preloaded_memories),
+            bool(memory_preload_note),
+        )
+        try:
+            ctx.add_shutdown_callback(memory_layer_instance.aclose)
+        except Exception as exc:
+            logger.warning("memory_shutdown_callback_unavailable=true error_type=%s error=%s", type(exc).__name__, exc)
+        asyncio.create_task(memory_layer_instance.rebuild_index_if_empty())
+    else:
+        logger.info("Memory layer startup: memory_enabled=false")
+    _active_memory_layer = memory_layer_instance
+    lucy_agent = LucyAgent(
+        runtime_context=runtime_context,
+        memory_layer=memory_layer_instance,
+        memory_preload_note=memory_preload_note,
+    )
+
     session_kwargs: dict[str, Any] = {
         "stt": build_stt(),
         "llm": llm,
@@ -4249,11 +4364,11 @@ async def entrypoint(ctx: JobContext):
     session_started_at = 0.0
     if room_options is not None:
         logger.info("Starting session with ai-coustics room_options attached")
-        await session.start(room=ctx.room, agent=LucyAgent(runtime_context=runtime_context), room_options=room_options)
+        await session.start(room=ctx.room, agent=lucy_agent, room_options=room_options)
         session_started_at = time.monotonic()
     else:
         logger.info("Starting session without ai-coustics room_options")
-        await session.start(room=ctx.room, agent=LucyAgent(runtime_context=runtime_context))
+        await session.start(room=ctx.room, agent=lucy_agent)
         session_started_at = time.monotonic()
 
     greeting_agent_listening_at = 0.0
