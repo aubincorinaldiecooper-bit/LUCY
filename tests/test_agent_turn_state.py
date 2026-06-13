@@ -450,6 +450,9 @@ class OnUserTurnCompletedRegressionTests(unittest.IsolatedAsyncioTestCase):
                 "_held_turn_fragment_classification",
                 "_held_turn_fragment_incomplete",
                 "_current_turn_policy_decision",
+                "_latest_user_state_for_greeting",
+                "_latest_stt_partial_at",
+                "_latest_stt_final_at",
             )
         }
 
@@ -487,9 +490,9 @@ class OnUserTurnCompletedRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(prune.called)
         self.assertEqual(agent._current_turn_policy_decision, "COMMIT_NOW")
 
-    async def test_on_user_turn_completed_low_information_filler_does_not_raise(self):
-        prune, _ = await self._run_turn("Yeah.")
-        self.assertTrue(prune.called)
+    async def test_on_user_turn_completed_low_information_filler_skips_generation(self):
+        with self.assertRaises(agent.StopResponse):
+            await self._run_turn("Yeah.")
         self.assertEqual(agent._current_turn_policy_decision, "IGNORE_LOW_INFORMATION_FILLER")
 
     async def test_on_user_turn_completed_pruning_invoked_with_message_list(self):
@@ -554,23 +557,47 @@ class OnUserTurnCompletedRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(agent._current_turn_policy_decision, "COMMIT_NOW")
         self.assertEqual(sleep_calls, [])
 
-    async def test_hold_for_continuation_sleeps_only_reply_deadline_not_endpointing_extension(self):
-        lucy = object.__new__(agent.LucyAgent)
-        lucy.runtime_context = None
-        turn_ctx = self.TurnCtx([self.Message("system", "prompt"), self.Message("user", "I was thinking because")])
-        new_message = turn_ctx.messages[-1]
-        async def fake_interpret(transcript, **kwargs):
-            return agent.detect_transcript_context(transcript)
-        sleep_calls = []
-        async def fake_sleep(delay):
-            sleep_calls.append(delay)
-        with patch.object(agent, "interpret_transcript_context", side_effect=fake_interpret), \
-             patch.object(agent, "_endpointing_decision_for_transcript", return_value=("extend_wait", "short_fragment", 900)), \
-             patch.object(agent.asyncio, "sleep", side_effect=fake_sleep):
-            await lucy.on_user_turn_completed(turn_ctx, new_message)
+    async def test_held_fragment_commits_after_deadline_when_user_stays_silent(self):
+        with patch.object(agent, "TURN_HOLD_FRAGMENT_REPLY_DEADLINE_SECONDS", 0.0):
+            prune, _ = await self._run_turn("I was thinking because")
+        self.assertTrue(prune.called)
         self.assertEqual(agent._current_turn_policy_decision, "HOLD_FOR_CONTINUATION")
-        self.assertEqual(sleep_calls, [max(0.0, agent.TURN_HOLD_FRAGMENT_REPLY_DEADLINE_SECONDS)])
-        self.assertNotIn(0.9, sleep_calls)
+        self.assertEqual(agent._held_turn_fragment_text, "")
+
+    async def test_held_fragment_yields_when_user_resumes_before_deadline(self):
+        async def fake_sleep(delay):
+            agent._latest_user_state_for_greeting = "speaking"
+
+        with patch.object(agent, "TURN_HOLD_FRAGMENT_REPLY_DEADLINE_SECONDS", 1.0), \
+             patch.object(agent.asyncio, "sleep", side_effect=fake_sleep):
+            with self.assertRaises(agent.StopResponse):
+                await self._run_turn("I was thinking about my brother because")
+        self.assertEqual(agent._current_turn_policy_decision, "HOLD_FOR_CONTINUATION")
+        self.assertEqual(agent._held_turn_fragment_text, "I was thinking about my brother because")
+
+    async def test_held_fragment_merges_with_continuation_after_yielding(self):
+        agent._held_turn_fragment_text = "I was thinking about my brother because"
+        agent._held_turn_fragment_created_at = 100.0
+        agent._held_turn_fragment_classification = "INCOMPLETE_THOUGHT"
+        agent._held_turn_fragment_incomplete = True
+        with patch("agent.time.monotonic", return_value=103.0):
+            prune, turn_ctx = await self._run_turn("my brother said it hurt")
+        self.assertTrue(prune.called)
+        self.assertEqual(agent._current_turn_policy_decision, "MERGE_WITH_HELD_FRAGMENT")
+        user_messages = [message for message in turn_ctx.messages if message.role == "user"]
+        self.assertEqual(user_messages[-1].content, ["I was thinking about my brother because my brother said it hurt"])
+
+    async def test_action_turn_injects_response_mode_note(self):
+        prune, turn_ctx = await self._run_turn("What time is it?")
+        self.assertTrue(prune.called)
+        developer_notes = [message.content for message in turn_ctx.messages if message.role == "developer"]
+        self.assertTrue(any("Internal response mode note" in note for note in developer_notes))
+
+    async def test_conversation_turn_does_not_inject_response_mode_note(self):
+        prune, turn_ctx = await self._run_turn("I felt really hurt by that.")
+        self.assertTrue(prune.called)
+        developer_notes = [message.content for message in turn_ctx.messages if message.role == "developer"]
+        self.assertFalse(any("Internal response mode note" in note for note in developer_notes))
 
     def test_no_stale_fragment_state_references_in_agent_source(self):
         with open(agent.__file__, "r", encoding="utf-8") as source_file:
