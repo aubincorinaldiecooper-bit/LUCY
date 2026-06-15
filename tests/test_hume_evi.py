@@ -6,6 +6,24 @@ import hume_evi_bridge
 import server
 
 
+class _FakeRoom:
+    """Minimal stand-in; the real rtc.Room raises if touched before connect()."""
+
+
+class _FakeJobContext:
+    """Records connect() so tests can assert the room is connected first."""
+
+    def __init__(self, calls, *, connect_error=None):
+        self._calls = calls
+        self._connect_error = connect_error
+        self.room = _FakeRoom()
+
+    async def connect(self):
+        self._calls.append("connect")
+        if self._connect_error is not None:
+            raise self._connect_error
+
+
 class HumeEVIBridgeConfigTests(unittest.TestCase):
     def test_voice_engine_defaults_current(self):
         with patch.dict(os.environ, {}, clear=True):
@@ -60,6 +78,64 @@ class VoiceEngineSelectorBootstrapTests(unittest.TestCase):
 
         with patch.dict(os.environ, {"VOICE_ENGINE": "not-a-real-engine"}):
             self.assertEqual(agent.voice_engine(), "current")
+
+
+class HumeEVIBootstrapOrderTests(unittest.IsolatedAsyncioTestCase):
+    """Regression coverage for: cannot access local participant before connecting.
+
+    The EVI bridge publishes a track / subscribes to audio, which requires a
+    connected room. The cascaded pipeline connects via AgentSession.start(); the
+    EVI path has no session, so the entrypoint helper must connect first.
+    """
+
+    async def test_room_connected_before_bridge_runs(self):
+        import agent
+
+        calls = []
+
+        async def fake_bridge(room):
+            calls.append("bridge")
+
+        ctx = _FakeJobContext(calls)
+        with patch.object(agent, "run_hume_evi_bridge", fake_bridge):
+            await agent._run_hume_evi_voice_engine(ctx)
+
+        self.assertEqual(calls, ["connect", "bridge"])
+
+    async def test_bridge_not_run_when_connect_fails(self):
+        import agent
+
+        calls = []
+
+        async def fake_bridge(room):
+            calls.append("bridge")
+
+        ctx = _FakeJobContext(calls, connect_error=Exception("connect boom"))
+        with patch.object(agent, "run_hume_evi_bridge", fake_bridge):
+            with self.assertRaisesRegex(Exception, "connect boom"):
+                await agent._run_hume_evi_voice_engine(ctx)
+
+        self.assertEqual(calls, ["connect"])
+
+    async def test_bootstrap_failure_is_logged_clearly(self):
+        import agent
+
+        calls = []
+
+        async def fake_bridge(room):
+            calls.append("bridge")
+            raise RuntimeError("HUME_API_KEY")
+
+        ctx = _FakeJobContext(calls)
+        with patch.object(agent, "run_hume_evi_bridge", fake_bridge):
+            with self.assertLogs(agent.logger, level="ERROR") as captured:
+                with self.assertRaises(RuntimeError):
+                    await agent._run_hume_evi_voice_engine(ctx)
+
+        self.assertTrue(
+            any("voice_engine_bootstrap_failed=true" in line and "engine=hume_evi" in line for line in captured.output),
+            captured.output,
+        )
 
 
 class HumeCLMEndpointHelperTests(unittest.TestCase):

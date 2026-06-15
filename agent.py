@@ -5110,6 +5110,30 @@ def _attach_optional_interruption_diagnostics(session: AgentSession) -> None:
 
 
 
+async def _run_hume_evi_voice_engine(ctx: JobContext) -> None:
+    """Connect the LiveKit room, then hand room audio to the Hume EVI bridge.
+
+    The bridge publishes an output track and subscribes to remote audio, both of
+    which require a connected room/local participant. The cascaded pipeline gets
+    this connect for free via ``AgentSession.start()``; the EVI path has no
+    session, so it must connect explicitly before bridging. Bootstrap failures
+    are logged with a clear, parseable line (no secrets) before re-raising so the
+    job fails visibly rather than via an opaque traceback.
+    """
+    logger.info("voice_engine_selected=hume_evi current_pipeline_disabled=true livekit_room_layer=true")
+    try:
+        await ctx.connect()
+        logger.info("voice_engine_room_connected=true engine=hume_evi")
+        await run_hume_evi_bridge(ctx.room)
+    except Exception as exc:
+        logger.error(
+            "voice_engine_bootstrap_failed=true engine=hume_evi error_type=%s error=%s",
+            type(exc).__name__,
+            exc,
+        )
+        raise
+
+
 async def entrypoint(ctx: JobContext):
     job_started_at = time.monotonic()
     logger.info(
@@ -5340,16 +5364,7 @@ async def entrypoint(ctx: JobContext):
     selected_voice_engine = voice_engine()
     logger.info("voice_engine_selected=%s", selected_voice_engine)
     if selected_voice_engine == "hume_evi":
-        logger.info("voice_engine_selected=hume_evi current_pipeline_disabled=true livekit_room_layer=true")
-        try:
-            await run_hume_evi_bridge(ctx.room)
-        except Exception as exc:
-            logger.error(
-                "voice_engine_bootstrap_failed=true engine=hume_evi error_type=%s error=%s",
-                type(exc).__name__,
-                exc,
-            )
-            raise
+        await _run_hume_evi_voice_engine(ctx)
         return
 
     lucy_agent = LucyAgent(
