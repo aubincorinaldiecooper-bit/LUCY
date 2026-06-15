@@ -5,20 +5,23 @@ import json
 import logging
 import os
 import time
+import uuid
 from email.utils import parseaddr
 from html.parser import HTMLParser
-from typing import Any
+from typing import Any, AsyncIterable
 from uuid import uuid4
 
+import aiohttp
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI, Request
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from livekit import api
 from pydantic import BaseModel
 
 from agentmail_client import AgentMailError, reply_to_email
 from companion_email import CompanionEmailError, generate_companion_email_response
+from memory_layer import MemoryIdentity, MemoryLayer, memory_enabled
 
 load_dotenv()
 
@@ -62,6 +65,168 @@ SUPPORTED_AGENTMAIL_EVENTS = {
     "message.received.unauthenticated",
 }
 SVIX_TOLERANCE_SECONDS = 5 * 60
+
+OPENROUTER_DEFAULT_MODEL = "openai/gpt-4o-mini"
+HUME_CLM_MAX_MESSAGES = 24
+
+
+def _safe_bool_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _clm_authorize(request: Request) -> None:
+    expected = (os.getenv("HUME_CLM_BEARER_TOKEN") or "").strip()
+    if not expected:
+        logger.error("hume_clm_request_rejected=true reason=missing_hume_clm_bearer_token")
+        raise HTTPException(status_code=503, detail="HUME_CLM_BEARER_TOKEN is not configured")
+    authorization = request.headers.get("authorization") or ""
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not hmac.compare_digest(token.strip(), expected):
+        logger.warning("hume_clm_request_rejected=true reason=invalid_bearer_token")
+        raise HTTPException(status_code=401, detail="Invalid bearer token")
+
+
+def _extract_hume_message_content(message: dict[str, Any]) -> tuple[str, str] | None:
+    nested = message.get("message") if isinstance(message.get("message"), dict) else message
+    role = str(nested.get("role") or message.get("role") or "").strip().lower()
+    if role not in {"system", "developer", "user", "assistant", "tool"}:
+        msg_type = str(message.get("type") or "").lower()
+        if msg_type.startswith("user"):
+            role = "user"
+        elif msg_type.startswith("assistant"):
+            role = "assistant"
+    content = nested.get("content") if isinstance(nested, dict) else None
+    if isinstance(content, list):
+        text_parts = []
+        for part in content:
+            if isinstance(part, str):
+                text_parts.append(part)
+            elif isinstance(part, dict) and isinstance(part.get("text"), str):
+                text_parts.append(part["text"])
+        content = " ".join(text_parts)
+    if not role or not isinstance(content, str) or not content.strip():
+        return None
+    return role, content.strip()
+
+
+def _extract_hume_clm_messages(payload: dict[str, Any]) -> list[dict[str, str]]:
+    raw_messages = payload.get("messages")
+    if not isinstance(raw_messages, list):
+        raw_messages = []
+    messages: list[dict[str, str]] = []
+    for raw in raw_messages[-HUME_CLM_MAX_MESSAGES:]:
+        if not isinstance(raw, dict):
+            continue
+        extracted = _extract_hume_message_content(raw)
+        if extracted is None:
+            continue
+        role, content = extracted
+        if role == "developer":
+            role = "system"
+        messages.append({"role": role, "content": content})
+    return messages
+
+
+def _latest_user_message(messages: list[dict[str, str]]) -> str:
+    for message in reversed(messages):
+        if message.get("role") == "user":
+            return message.get("content", "")
+    return ""
+
+
+def _openrouter_model_for_hume(payload: dict[str, Any]) -> str:
+    configured = os.getenv("OPENROUTER_MODEL", OPENROUTER_DEFAULT_MODEL)
+    hint = str(payload.get("model") or payload.get("custom_language_model_id") or "").strip()
+    if hint and _safe_bool_env("HUME_CLM_HONOR_MODEL_HINT", False):
+        return hint
+    return configured
+
+
+async def _hume_clm_memory_note(custom_session_id: str | None, query: str) -> str | None:
+    if not memory_enabled() or not custom_session_id or not query.strip():
+        return None
+    layer = MemoryLayer(MemoryIdentity(guest_id=custom_session_id), session_id=custom_session_id)
+    try:
+        memories = await layer.retrieve(query)
+        return MemoryLayer.preload_note(memories)
+    except Exception as exc:
+        logger.warning("hume_clm_memory_retrieval_failed=true error_type=%s", type(exc).__name__)
+        return None
+    finally:
+        await layer.aclose()
+
+
+def _sse_error_chunk(request_id: str, message: str) -> str:
+    payload = {
+        "id": request_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": "error",
+        "choices": [{"index": 0, "delta": {"content": message}, "finish_reason": None}],
+    }
+    return f"data: {json.dumps(payload)}\n\n"
+
+
+async def _stream_openrouter_for_hume(payload: dict[str, Any], custom_session_id: str | None) -> AsyncIterable[str]:
+    started_at = time.monotonic()
+    request_id = f"hume-clm-{uuid.uuid4().hex[:12]}"
+    messages = _extract_hume_clm_messages(payload)
+    latest_user = _latest_user_message(messages)
+    memory_note = await _hume_clm_memory_note(custom_session_id, latest_user)
+    system_prompt = (os.getenv("SYSTEM_PROMPT") or "You are Arche, a concise, calm voice companion.").strip()
+    upstream_messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
+    if memory_note:
+        upstream_messages.append({"role": "system", "content": memory_note})
+    upstream_messages.extend(messages)
+    model = _openrouter_model_for_hume(payload)
+    logger.info(
+        "hume_clm_response_started=true request_id=%s model=%s message_count=%s memory_note_present=%s custom_session_id_present=%s",
+        request_id,
+        model,
+        len(messages),
+        bool(memory_note),
+        bool(custom_session_id),
+    )
+    api_key = (os.getenv("OPENROUTER_API_KEY") or "").strip()
+    if not api_key:
+        logger.error("hume_clm_response_error=true request_id=%s reason=missing_openrouter_api_key", request_id)
+        yield _sse_error_chunk(request_id, "I can't reach my language model configuration yet.")
+        yield "data: [DONE]\n\n"
+        return
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": os.getenv("OPENROUTER_SITE_URL", "https://lucy-production-c960.up.railway.app"),
+        "X-Title": os.getenv("OPENROUTER_APP_TITLE", "LUCY Hume CLM"),
+    }
+    body = {"model": model, "messages": upstream_messages, "stream": True}
+    try:
+        timeout = aiohttp.ClientTimeout(total=None, sock_connect=20, sock_read=None)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=body) as response:
+                if response.status >= 400:
+                    error_preview = (await response.text())[:300]
+                    logger.error("hume_clm_response_error=true request_id=%s status=%s error_preview=%s", request_id, response.status, error_preview)
+                    yield _sse_error_chunk(request_id, "I hit a language-model error there.")
+                    yield "data: [DONE]\n\n"
+                    return
+                async for chunk in response.content:
+                    if chunk:
+                        yield chunk.decode("utf-8", errors="ignore")
+    except Exception as exc:
+        logger.error("hume_clm_response_error=true request_id=%s error_type=%s", request_id, type(exc).__name__)
+        yield _sse_error_chunk(request_id, "I hit a connection issue there.")
+        yield "data: [DONE]\n\n"
+        return
+    logger.info(
+        "hume_clm_response_completed=true request_id=%s duration_seconds=%.3f",
+        request_id,
+        time.monotonic() - started_at,
+    )
+
 
 
 def _get_header(request: Request, name: str) -> str | None:
@@ -403,6 +568,29 @@ async def agentmail_webhook(
         logger.exception("AgentMail webhook handler failed event_type=%s", event_type)
 
     return JSONResponse({"ok": True})
+
+
+@app.post("/hume/clm/chat/completions")
+async def hume_clm_chat_completions(request: Request):
+    _clm_authorize(request)
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Expected JSON object")
+    custom_session_id = request.query_params.get("custom_session_id") or payload.get("custom_session_id")
+    if not isinstance(custom_session_id, str):
+        custom_session_id = None
+    messages = _extract_hume_clm_messages(payload)
+    logger.info(
+        "hume_clm_request_received=true message_count=%s custom_session_id_present=%s model_hint_present=%s",
+        len(messages),
+        bool(custom_session_id),
+        bool(payload.get("model") or payload.get("custom_language_model_id")),
+    )
+    return StreamingResponse(
+        _stream_openrouter_for_hume(payload, custom_session_id),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 class SessionRequest(BaseModel):

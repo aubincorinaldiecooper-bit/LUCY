@@ -4330,6 +4330,13 @@ async def entrypoint(ctx: JobContext):
     else:
         logger.info("Memory layer startup: memory_enabled=false")
     _active_memory_layer = memory_layer_instance
+    selected_voice_engine = voice_engine()
+    logger.info("voice_engine_selected=%s", selected_voice_engine)
+    if selected_voice_engine == "hume_evi":
+        logger.info("voice_engine_selected=hume_evi current_pipeline_disabled=true livekit_room_layer=true")
+        await run_hume_evi_bridge(ctx.room)
+        return
+
     lucy_agent = LucyAgent(
         runtime_context=runtime_context,
         memory_layer=memory_layer_instance,
