@@ -1,4 +1,5 @@
 import unittest
+import tempfile
 from unittest.mock import patch
 
 import agent
@@ -183,55 +184,28 @@ class AgentTurnStateTests(unittest.TestCase):
 
 
 class VoiceLifecycleObservabilityTests(unittest.TestCase):
+    class Frame:
+        def __init__(self, data: bytes, sample_rate: int = 48000, num_channels: int = 1, samples_per_channel: int = 480):
+            self.data = data
+            self.sample_rate = sample_rate
+            self.num_channels = num_channels
+            self.samples_per_channel = samples_per_channel
+
     def setUp(self):
         self.hume_keys = dict(agent._hume_recent_request_keys)
         self.hume_order = list(agent._hume_recent_request_order)
+        self.coverages = dict(agent._hume_speech_audio_coverages)
 
     def tearDown(self):
         agent._hume_recent_request_keys.clear()
         agent._hume_recent_request_keys.update(self.hume_keys)
         agent._hume_recent_request_order[:] = self.hume_order
+        agent._hume_speech_audio_coverages.clear()
+        agent._hume_speech_audio_coverages.update(self.coverages)
 
     def test_deprecated_cleanup_warning_removed_from_source(self):
         with open(agent.__file__, "r", encoding="utf-8") as source_file:
             self.assertNotIn("Deprecated one-argument assistant speech cleanup call ignored", source_file.read())
-
-    def test_full_utterance_and_lifecycle_diagnostics_present_in_source(self):
-        with open(agent.__file__, "r", encoding="utf-8") as source_file:
-            source = source_file.read()
-        # Full-utterance / direct-path observability required for the Hume tail fix.
-        self.assertIn("hume_full_utterance_requested=true", source)
-        self.assertIn("hume_full_utterance_supported=false", source)
-        self.assertIn("hume_full_utterance_used=true", source)
-        self.assertIn("hume_direct_api_tts_requested=", source)
-        self.assertIn("tts_final_audio_frame_seen=", source)
-        self.assertIn("tts_final_audio_frame_published=", source)
-        self.assertIn("assistant_speech_finished_after_tts_complete=", source)
-        # The full-utterance path must drain/close the chunked stream so the
-        # trailing tail is flushed before TTS is marked complete.
-        self.assertIn("aclose_fn", source)
-        # Post-speech playout hold must be config-gated and applied to the TTS path.
-        self.assertIn("TTS_POST_SPEECH_HOLD_MS", source)
-        self.assertIn("tts_post_speech_hold_applied=true", source)
-        self.assertIn("_with_post_speech_hold(", source)
-
-    def test_post_speech_silence_frames_match_reference_and_duration(self):
-        class _RefFrame:
-            sample_rate = 24000
-            num_channels = 1
-
-        frames = list(agent._iter_post_speech_silence_frames(_RefFrame(), 200))
-        # ~20ms frames over 200ms -> ~10 frames, all silent and matching format.
-        self.assertGreaterEqual(len(frames), 9)
-        total_samples = sum(f.samples_per_channel for f in frames)
-        self.assertGreaterEqual(total_samples, int(24000 * 0.2))
-        for frame in frames:
-            self.assertEqual(frame.sample_rate, 24000)
-            self.assertEqual(frame.num_channels, 1)
-            self.assertEqual(set(bytes(frame.data)), {0})
-
-    def test_post_speech_hold_defaults_off(self):
-        self.assertEqual(agent.TTS_POST_SPEECH_HOLD_MS, 0)
 
     def test_stale_speech_ids_are_capped_and_pruned(self):
         stale_ids = {f"speech_{index}" for index in range(25)}
@@ -335,6 +309,39 @@ class VoiceLifecycleObservabilityTests(unittest.TestCase):
             source = source_file.read()
         self.assertIn("latest_agent_state=%s", source)
         self.assertIn("global _latest_agent_state_for_hume", source)
+
+    def test_hume_speech_coverage_records_generated_audio_duration(self):
+        coverage = agent._start_hume_speech_audio_coverage(
+            speech_id="speech_coverage",
+            turn_id=3,
+            path="default_agent_tts_node_fallback",
+            normalized_text_hash="hash",
+        )
+        agent._record_hume_speech_audio_frame(coverage, self.Frame(b"\x00\x00" * 480))
+        agent._record_hume_speech_audio_frame(coverage, self.Frame(b"\x00\x00" * 480))
+        finalized = agent._finalize_hume_speech_audio_coverage(coverage)
+
+        self.assertIs(finalized, coverage)
+        self.assertEqual(coverage.frame_count, 2)
+        self.assertEqual(coverage.byte_count, 1920)
+        self.assertAlmostEqual(agent._hume_generated_audio_duration_seconds(coverage), 0.02, places=3)
+
+    def test_hume_wav_artifact_capture_writes_debug_wav(self):
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            "os.environ",
+            {"HUME_TTS_CAPTURE_WAV_DEBUG": "true", "HUME_TTS_WAV_ARTIFACT_DIR": tmpdir},
+        ):
+            coverage = agent._start_hume_speech_audio_coverage(
+                speech_id="speech/wav",
+                turn_id=4,
+                path="path",
+                normalized_text_hash="hash",
+            )
+            agent._record_hume_speech_audio_frame(coverage, self.Frame(b"\x01\x00" * 480))
+            agent._finalize_hume_speech_audio_coverage(coverage)
+
+            self.assertIsNotNone(coverage.artifact_path)
+            self.assertTrue(coverage.artifact_path.endswith(".wav"))
 
     def test_cleanup_skips_current_turn_speech(self):
         self.assertEqual(

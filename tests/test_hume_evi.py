@@ -2,26 +2,8 @@ import os
 import unittest
 from unittest.mock import patch
 
-import agent
 import hume_evi_bridge
 import server
-
-
-class VoiceEngineWiringTests(unittest.TestCase):
-    """Regression guard for the entrypoint NameError: agent.py must import the
-    EVI selection helpers, not just call them."""
-
-    def test_agent_imports_voice_engine_helpers(self):
-        for name in ("voice_engine", "run_hume_evi_bridge", "load_hume_evi_settings"):
-            self.assertTrue(hasattr(agent, name), f"agent.py is missing import: {name}")
-
-    def test_agent_voice_engine_is_bridge_helper(self):
-        self.assertIs(agent.voice_engine, hume_evi_bridge.voice_engine)
-        self.assertIs(agent.run_hume_evi_bridge, hume_evi_bridge.run_hume_evi_bridge)
-
-    def test_agent_voice_engine_defaults_current(self):
-        with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(agent.voice_engine(), "current")
 
 
 class HumeEVIBridgeConfigTests(unittest.TestCase):

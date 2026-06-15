@@ -35,7 +35,6 @@ from internet_search import (
     search_timeout_seconds,
 )
 from audiointeraction_shadow import AudioInteractionShadow, audiointeraction_mode, build_shadow_from_env
-from hume_evi_bridge import load_hume_evi_settings, run_hume_evi_bridge, voice_engine
 from interaction_state import TURN_KIND_ACTION, InteractionStateMachine, classify_turn_kind
 from memory_layer import MemoryLayer, identity_from_metadata, memory_enabled
 from runtime_context import RuntimeContext, answer_datetime_intent, detect_datetime_intent, runtime_context_from_metadata
@@ -141,6 +140,7 @@ _direct_hume_request_counter = 0
 _hume_recent_request_keys: dict[str, int] = {}
 _hume_recent_request_order: list[str] = []
 _HUME_RECENT_REQUEST_KEY_LIMIT = 80
+_hume_speech_audio_coverages: dict[str, "HumeSpeechAudioCoverage"] = {}
 _last_llm_start_at = 0.0
 _last_llm_first_token_at: float | None = None
 _last_llm_complete_at = 0.0
@@ -410,6 +410,163 @@ def _record_hume_request_metadata(
             old = _hume_recent_request_order.pop(0)
             _hume_recent_request_keys.pop(old, None)
     return key, duplicate, previous_count + (1 if register else 0)
+
+
+def _hume_wav_artifact_capture_enabled() -> bool:
+    return env_bool("HUME_TTS_CAPTURE_WAV_DEBUG", False) or env_bool("HUME_TTS_WAV_ARTIFACT_CAPTURE_ENABLED", False)
+
+
+def _hume_wav_artifact_max_bytes() -> int:
+    raw = os.getenv("HUME_TTS_WAV_ARTIFACT_MAX_BYTES", "12000000")
+    try:
+        return max(1024, min(50_000_000, int(raw)))
+    except Exception:
+        return 12_000_000
+
+
+def _safe_artifact_token(value: str) -> str:
+    token = re.sub(r"[^A-Za-z0-9_.-]+", "_", value or "unknown").strip("._")
+    return token[:80] or "unknown"
+
+
+def _audio_frame_for_coverage(value: object) -> object | None:
+    frame = getattr(value, "frame", None)
+    return frame if frame is not None else value
+
+
+def _audio_frame_pcm_and_metadata(value: object) -> tuple[bytes, int, int, int]:
+    frame = _audio_frame_for_coverage(value)
+    if frame is None:
+        return b"", 0, 0, 0
+    data = getattr(frame, "data", b"")
+    try:
+        pcm = bytes(data)
+    except Exception:
+        return b"", 0, 0, 0
+    try:
+        sample_rate = int(getattr(frame, "sample_rate", 0) or 0)
+    except Exception:
+        sample_rate = 0
+    try:
+        num_channels = int(getattr(frame, "num_channels", 0) or getattr(frame, "channels", 0) or 0)
+    except Exception:
+        num_channels = 0
+    try:
+        samples_per_channel = int(getattr(frame, "samples_per_channel", 0) or 0)
+    except Exception:
+        samples_per_channel = 0
+    if samples_per_channel <= 0 and num_channels > 0:
+        samples_per_channel = len(pcm) // max(1, 2 * num_channels)
+    return pcm, sample_rate, num_channels, samples_per_channel
+
+
+def _start_hume_speech_audio_coverage(*, speech_id: str, turn_id: int, path: str, normalized_text_hash: str) -> HumeSpeechAudioCoverage:
+    coverage = HumeSpeechAudioCoverage(
+        speech_id=speech_id or "n/a",
+        turn_id=turn_id,
+        path=path,
+        normalized_text_hash=normalized_text_hash or "n/a",
+        started_at=time.monotonic(),
+        capture_chunks=[] if _hume_wav_artifact_capture_enabled() else None,
+    )
+    logger.info(
+        "hume_speech_coverage_started=true turn_id=%s speech_id=%s tts_path=%s normalized_text_hash=%s wav_artifact_capture_enabled=%s",
+        coverage.turn_id,
+        coverage.speech_id,
+        coverage.path,
+        coverage.normalized_text_hash,
+        coverage.capture_chunks is not None,
+    )
+    return coverage
+
+
+def _record_hume_speech_audio_frame(coverage: HumeSpeechAudioCoverage | None, value: object) -> None:
+    if coverage is None:
+        return
+    pcm, sample_rate, num_channels, samples_per_channel = _audio_frame_pcm_and_metadata(value)
+    if not pcm:
+        return
+    now = time.monotonic()
+    coverage.frame_count += 1
+    coverage.byte_count += len(pcm)
+    coverage.sample_count += max(0, samples_per_channel)
+    if sample_rate > 0:
+        coverage.sample_rate = sample_rate
+    if num_channels > 0:
+        coverage.num_channels = num_channels
+    if coverage.first_frame_at is None:
+        coverage.first_frame_at = now
+    coverage.last_frame_at = now
+    if coverage.capture_chunks is not None and not coverage.capture_truncated:
+        max_bytes = _hume_wav_artifact_max_bytes()
+        captured_so_far = sum(len(chunk) for chunk in coverage.capture_chunks)
+        if captured_so_far + len(pcm) <= max_bytes:
+            coverage.capture_chunks.append(pcm)
+        else:
+            coverage.capture_truncated = True
+
+
+def _hume_generated_audio_duration_seconds(coverage: HumeSpeechAudioCoverage | None) -> float | None:
+    if coverage is None or coverage.sample_rate <= 0:
+        return None
+    return coverage.sample_count / coverage.sample_rate
+
+
+def _write_hume_wav_artifact(coverage: HumeSpeechAudioCoverage) -> str | None:
+    if not coverage.capture_chunks:
+        return None
+    sample_rate = coverage.sample_rate or 48000
+    num_channels = coverage.num_channels or 1
+    artifact_dir = os.getenv("HUME_TTS_WAV_ARTIFACT_DIR", "/tmp/lucy_hume_tts_artifacts")
+    os.makedirs(artifact_dir, exist_ok=True)
+    filename = (
+        f"{int(time.time())}_turn-{coverage.turn_id}_speech-{_safe_artifact_token(coverage.speech_id)}_"
+        f"{_safe_artifact_token(coverage.path)}_{_safe_artifact_token(coverage.normalized_text_hash)}.wav"
+    )
+    artifact_path = os.path.join(artifact_dir, filename)
+    with wave.open(artifact_path, "wb") as wav:
+        wav.setnchannels(num_channels)
+        wav.setsampwidth(2)
+        wav.setframerate(sample_rate)
+        wav.writeframes(b"".join(coverage.capture_chunks))
+    coverage.artifact_path = artifact_path
+    return artifact_path
+
+
+def _finalize_hume_speech_audio_coverage(coverage: HumeSpeechAudioCoverage | None, *, error_type: str = "none") -> HumeSpeechAudioCoverage | None:
+    if coverage is None:
+        return None
+    artifact_path = None
+    if coverage.capture_chunks is not None:
+        try:
+            artifact_path = _write_hume_wav_artifact(coverage)
+        except Exception as exc:
+            logger.warning(
+                "hume_wav_artifact_capture_failed=true speech_id=%s error_type=%s error=%s",
+                coverage.speech_id,
+                type(exc).__name__,
+                _redact_sensitive_text(exc),
+            )
+    generated_duration = _hume_generated_audio_duration_seconds(coverage)
+    logger.info(
+        "hume_speech_coverage_completed=true turn_id=%s speech_id=%s tts_path=%s normalized_text_hash=%s generated_frame_count=%s generated_audio_bytes=%s generated_sample_rate=%s generated_channels=%s generated_audio_duration_seconds=%s first_generated_audio_seconds=%s last_generated_audio_seconds=%s wav_artifact_capture_enabled=%s wav_artifact_path=%s wav_artifact_truncated=%s error_type=%s",
+        coverage.turn_id,
+        coverage.speech_id,
+        coverage.path,
+        coverage.normalized_text_hash,
+        coverage.frame_count,
+        coverage.byte_count,
+        coverage.sample_rate or "unknown",
+        coverage.num_channels or "unknown",
+        _fmt_seconds(generated_duration),
+        _fmt_seconds((coverage.first_frame_at - coverage.started_at) if coverage.first_frame_at is not None else None),
+        _fmt_seconds((coverage.last_frame_at - coverage.started_at) if coverage.last_frame_at is not None else None),
+        coverage.capture_chunks is not None,
+        artifact_path or "none",
+        coverage.capture_truncated,
+        error_type,
+    )
+    return coverage
 
 
 def _assistant_cleanup_action(
@@ -940,6 +1097,7 @@ def attach_session_diagnostics(session: AgentSession) -> None:
             active_speech_handles.pop(speech_id, None)
             speech_start_times.pop(speech_id, None)
             speech_latency_audits.pop(speech_id, None)
+            _hume_speech_audio_coverages.pop(speech_id, None)
             assistant_speech_turn_ids.pop(speech_id, None)
             assistant_speech_llm_turn_ids.pop(speech_id, None)
             hume_request_count_at_speech_finish.setdefault(speech_id, _hume_tts_request_counter)
@@ -987,6 +1145,7 @@ def attach_session_diagnostics(session: AgentSession) -> None:
         active_speech_handles.clear()
         speech_start_times.clear()
         speech_latency_audits.clear()
+        _hume_speech_audio_coverages.clear()
         assistant_speech_turn_ids.clear()
         assistant_speech_llm_turn_ids.clear()
         suppressed_speech_ids.clear()
@@ -1011,6 +1170,16 @@ def attach_session_diagnostics(session: AgentSession) -> None:
         speech_llm_turn_id = _llm_turn_id if _llm_turn_id > 0 else speech_turn_id
         now = time.monotonic()
         speech_created_at[speech_id] = now
+        pending_hume_coverage = _hume_speech_audio_coverages.pop("n/a", None)
+        if pending_hume_coverage is not None and speech_id not in _hume_speech_audio_coverages:
+            pending_hume_coverage.speech_id = speech_id
+            _hume_speech_audio_coverages[speech_id] = pending_hume_coverage
+            logger.info(
+                "hume_speech_coverage_assigned_to_speech=true turn_id=%s speech_id=%s previous_speech_id=n/a tts_path=%s",
+                speech_turn_id,
+                speech_id,
+                pending_hume_coverage.path,
+            )
 
         if latest_user_state == "speaking":
             attempted_method = "none"
@@ -1232,18 +1401,6 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                     was_stale,
                     was_active,
                 )
-                tts_completed_at = _last_tts_completed_at
-                finished_after_tts_complete = bool(tts_completed_at > 0 and finished_at >= tts_completed_at)
-                logger.info(
-                    "Assistant speech lifecycle ordering: speech_id=%s assistant_speech_finished_after_tts_complete=%s tts_completed_at=%s speech_finished_at=%s tts_complete_to_finish_seconds=%s interrupted=%s tts_path=%s",
-                    done_id,
-                    str(finished_after_tts_complete).lower(),
-                    _fmt_seconds(tts_completed_at) if tts_completed_at > 0 else "n/a",
-                    _fmt_seconds(finished_at),
-                    f"{finished_at - tts_completed_at:.3f}" if tts_completed_at > 0 else "n/a",
-                    interrupted,
-                    _last_tts_path or "n/a",
-                )
                 interrupted_normalized = str(interrupted).strip().lower()
                 if was_active and active_speech_handles:
                     logger.error(
@@ -1275,6 +1432,24 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                     latest_agent_state,
                     latest_user_state,
                 )
+                hume_coverage = _hume_speech_audio_coverages.pop(done_id, None)
+                if hume_coverage is not None:
+                    generated_duration = _hume_generated_audio_duration_seconds(hume_coverage)
+                    playout_duration = speech_duration_seconds if speech_duration_seconds >= 0 else None
+                    logger.info(
+                        "hume_speech_playout_coverage=true speech_id=%s turn_id=%s tts_path=%s generated_audio_duration_seconds=%s assistant_playout_duration_seconds=%s generated_minus_playout_seconds=%s generated_frame_count=%s generated_audio_bytes=%s interrupted=%s was_suppressed=%s wav_artifact_path=%s",
+                        done_id,
+                        done_speech_turn_id or "unknown",
+                        hume_coverage.path,
+                        _fmt_seconds(generated_duration),
+                        _fmt_seconds(playout_duration),
+                        _fmt_seconds((generated_duration - playout_duration) if generated_duration is not None and playout_duration is not None else None),
+                        hume_coverage.frame_count,
+                        hume_coverage.byte_count,
+                        interrupted,
+                        was_suppressed,
+                        hume_coverage.artifact_path or "none",
+                    )
                 logger.info(
                     "Assistant handoff timing: speech_id=%s speech_duration_seconds=%.3f agent_speaking_to_finished_seconds=%.3f finish_to_agent_listening_seconds=%.3f interrupted=%s was_suppressed=%s active_count=%s",
                     done_id,
@@ -1629,10 +1804,6 @@ ENDPOINTING_WAIT_EXTENSION_MIN_MS = env_int_clamped("ENDPOINTING_WAIT_EXTENSION_
 ENDPOINTING_WAIT_EXTENSION_MAX_MS = env_int_clamped("ENDPOINTING_WAIT_EXTENSION_MAX_MS", 1200, 100, 5000)
 TURN_HOLD_FRAGMENT_REPLY_DEADLINE_SECONDS = float(os.getenv("TURN_HOLD_FRAGMENT_REPLY_DEADLINE_SECONDS", "2.5") or "2.5")
 TURN_HOLD_FRAGMENT_MERGE_WINDOW_SECONDS = float(os.getenv("TURN_HOLD_FRAGMENT_MERGE_WINDOW_SECONDS", os.getenv("TURN_FRAGMENT_TTL_SECONDS", "7")) or "7")
-# Post-speech playout hold: append trailing silent audio frames after the final
-# TTS frame so the client finishes rendering the last word/breath before the
-# speaking->listening transition tears playout down. Config-gated (0 = off).
-TTS_POST_SPEECH_HOLD_MS = env_int_clamped("TTS_POST_SPEECH_HOLD_MS", 0, 0, 2000)
 
 
 def _pcm16_to_audio_frames(pcm_data: bytes, sample_rate: int, channels: int) -> list[rtc.AudioFrame]:
@@ -2201,6 +2372,732 @@ async def health() -> JSONResponse:
     return JSONResponse({"status": "ok"})
 
 
+
+def _safe_metadata_preview(value: Any) -> str:
+    if value is None:
+        return "none"
+    return _redact_sensitive_text(value)[:500]
+
+
+def _metadata_keys(value: Any) -> list[str]:
+    if isinstance(value, dict):
+        return sorted(str(key) for key in value.keys())
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except Exception:
+            return []
+        if isinstance(parsed, dict):
+            return sorted(str(key) for key in parsed.keys())
+    return []
+
+
+def _metadata_debug_entries_from_context(ctx: JobContext) -> list[tuple[str, Any]]:
+    entries: list[tuple[str, Any]] = []
+    for attr_name in ("job", "room"):
+        obj = _safe_attr(ctx, attr_name)
+        metadata = _safe_attr(obj, "metadata")
+        entries.append((f"{attr_name}.metadata", metadata))
+
+    job = _safe_attr(ctx, "job")
+    for attr_name in ("participant", "participant_info"):
+        participant = _safe_attr(job, attr_name)
+        metadata = _safe_attr(participant, "metadata")
+        entries.append((f"job.{attr_name}.metadata", metadata))
+
+    room = _safe_attr(ctx, "room")
+    remote_participants = _safe_attr(room, "remote_participants")
+    if isinstance(remote_participants, dict):
+        for participant_id, participant in remote_participants.items():
+            metadata = _safe_attr(participant, "metadata")
+            entries.append((f"room.remote_participants.{participant_id}.metadata", metadata))
+    return entries
+
+
+def _chat_ctx_items(chat_ctx: object) -> list[object]:
+    """Return a safe, concrete message list from LiveKit chat context shapes."""
+    if chat_ctx is None:
+        return []
+    messages = getattr(chat_ctx, "messages", None)
+    if callable(messages):
+        try:
+            messages = messages()
+        except Exception:
+            messages = None
+    if messages is None:
+        messages = chat_ctx
+    try:
+        return list(messages)  # type: ignore[arg-type]
+    except Exception:
+        return []
+
+
+def _extract_latest_user_text_from_chat_ctx(chat_ctx: object) -> str:
+    iterable = _chat_ctx_items(chat_ctx)
+    if not iterable:
+        return _last_user_message_text
+    for message in reversed(iterable):
+        role = str(getattr(message, "role", "")).lower()
+        if role and role != "user":
+            continue
+        text = _extract_text_for_debug(message).strip()
+        if text:
+            return text
+    return _last_user_message_text
+
+
+
+def _recent_turn_previews_from_chat_ctx(chat_ctx: object, limit: int = 5) -> list[str]:
+    iterable = _chat_ctx_items(chat_ctx)
+    if not iterable:
+        return []
+    previews: list[str] = []
+    for message in iterable[-limit:]:
+        role = str(getattr(message, "role", "unknown"))
+        text = _extract_text_for_debug(message).strip()
+        if not text:
+            continue
+        previews.append(f"{role}: {_redact_sensitive_text(text)[:240]}")
+    return previews
+
+
+@dataclass(frozen=True)
+class TurnPolicyResult:
+    decision: str
+    classification: str
+    confidence: float
+    reason: str
+    should_start_generation: bool
+    should_merge_held_fragment: bool
+    should_clear_held_fragment: bool
+
+
+@dataclass
+class HumeSpeechAudioCoverage:
+    speech_id: str
+    turn_id: int
+    path: str
+    normalized_text_hash: str
+    started_at: float
+    frame_count: int = 0
+    byte_count: int = 0
+    sample_count: int = 0
+    sample_rate: int = 0
+    num_channels: int = 0
+    first_frame_at: float | None = None
+    last_frame_at: float | None = None
+    capture_chunks: list[bytes] | None = None
+    capture_truncated: bool = False
+    artifact_path: str | None = None
+
+
+def _normalized_words(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9']+", clean_transcript(text or "").lower())
+
+
+def _semantic_overlap(left: str, right: str) -> float:
+    stop = {"the", "a", "an", "and", "or", "but", "so", "like", "i", "you", "it", "that", "this", "to", "of", "in", "on", "for", "with", "me", "my", "is", "was", "are", "were"}
+    left_words = {word for word in _normalized_words(left) if word not in stop and len(word) > 2}
+    right_words = {word for word in _normalized_words(right) if word not in stop and len(word) > 2}
+    if not left_words or not right_words:
+        return 0.0
+    return len(left_words & right_words) / max(1, min(len(left_words), len(right_words)))
+
+
+def _classify_turn_transcript(text: str, context: TranscriptContext | None = None) -> tuple[str, float, str]:
+    cleaned = clean_transcript(text or "").strip()
+    lowered = cleaned.lower().replace("’", "'")
+    words = _normalized_words(cleaned)
+    word_count = len(words)
+    if not cleaned:
+        return "UNCLEAR_AUDIO", 0.2, "empty_transcript"
+    if context is not None and context.detected_intent == "unclear_fragment" and context.confidence < 0.5:
+        return "UNCLEAR_AUDIO", 0.55, "transcript_context_unclear_low_confidence"
+    if re.search(r"\b(interrupt|interrupted|not answering|didn't answer|did not answer|answer me|why aren't you|why are you|lag|lagged|slow|silence|silent|stuck|repeat|repeating|again|heard me|listening)\b", lowered):
+        return "META_COMPLAINT", 0.86, "system_or_latency_complaint"
+    if re.search(r"\b(i feel|i felt|i'm feeling|i am feeling|i hate|i love|i miss|i'm scared|i am scared|i'm worried|i am worried|it hurt|that hurt|got under my skin|annoyed|upset|sad|angry|afraid|lonely|tired|overwhelmed|stressed)\b", lowered):
+        return "EMOTIONAL_STATEMENT", 0.88, "emotional_meaning"
+    if context is not None and context.detected_intent in {"date_time_question", "tool_request_search", "tool_request_email", "tool_request_document", "calculation_request", "counting_request", "timer_request", "stop_or_cancel_request"}:
+        return "COMPLETE_THOUGHT", 0.86, f"actionable_intent:{context.detected_intent}"
+    if word_count <= 2 and lowered.rstrip(".!?") in {"yeah", "yes", "no", "okay", "ok", "right", "sure", "thanks", "thank you"}:
+        return "LOW_INFORMATION_FILLER", 0.78, "backchannel_or_ack"
+    if lowered.endswith(",") or re.search(r"\b(and|because|when|if|but|so|like|while|although|since|then)$", lowered.rstrip(".,!?")):
+        return "INCOMPLETE_THOUGHT", 0.82, "dangling_clause_or_connector"
+    if word_count < 4 and context is not None and context.ambiguity_detected and context.clarification_suggested:
+        return "INCOMPLETE_THOUGHT", 0.72, "short_ambiguous_fragment"
+    if word_count >= 4 or cleaned.endswith((".", "?", "!")):
+        return "COMPLETE_THOUGHT", 0.8, "complete_shape"
+    if word_count <= 3:
+        return "INCOMPLETE_THOUGHT", 0.58, "short_without_clear_completion"
+    return "COMPLETE_THOUGHT", 0.65, "default_complete"
+
+
+def _make_turn_policy_decision(text: str, context: TranscriptContext | None = None, *, held_text: str = "", held_created_at: float = 0.0, now: float | None = None) -> TurnPolicyResult:
+    now = now if now is not None else time.monotonic()
+    classification, confidence, reason = _classify_turn_transcript(text, context)
+    held_age = (now - held_created_at) if held_text and held_created_at > 0 else None
+    has_mergeable_held = bool(held_text and held_age is not None and held_age <= TURN_HOLD_FRAGMENT_MERGE_WINDOW_SECONDS)
+    if classification == "UNCLEAR_AUDIO":
+        return TurnPolicyResult("ASK_FOR_AUDIO_CLARIFICATION", classification, confidence, reason, True, False, True)
+    if classification == "META_COMPLAINT":
+        return TurnPolicyResult("RECOVER_FROM_SILENCE", classification, confidence, reason, True, False, True)
+    if classification == "LOW_INFORMATION_FILLER":
+        return TurnPolicyResult("IGNORE_LOW_INFORMATION_FILLER", classification, confidence, reason, False, False, False)
+    if has_mergeable_held:
+        if _semantic_overlap(held_text, text) >= 0.2 or classification == "INCOMPLETE_THOUGHT":
+            return TurnPolicyResult("MERGE_WITH_HELD_FRAGMENT", classification, confidence, "semantic_continuation", True, True, True)
+        return TurnPolicyResult("FLUSH_HELD_AND_COMMIT_NEW", classification, confidence, "new_topic_or_unrelated_to_held_fragment", True, False, True)
+    if classification == "INCOMPLETE_THOUGHT":
+        return TurnPolicyResult("HOLD_FOR_CONTINUATION", classification, confidence, reason, False, False, False)
+    return TurnPolicyResult("COMMIT_NOW", classification, confidence, reason, True, False, True)
+
+
+def _fallback_requires_user_repeat(reason: str, classification: str) -> bool:
+    return classification == "UNCLEAR_AUDIO" or reason in {"audio_unclear", "stt_unclear"}
+
+
+def _fallback_text_for_reason(reason: str, classification: str) -> str:
+    if _fallback_requires_user_repeat(reason, classification):
+        return "I caught part of that, but not cleanly — could you say the last bit again?"
+    if classification == "META_COMPLAINT":
+        return "You’re right — I lagged there."
+    if classification == "EMOTIONAL_STATEMENT":
+        return "I’m with you."
+    if reason in {"first_token_timeout", "total_timeout_no_text", "provider_error", "empty_stream"}:
+        return "One second — I’m catching up."
+    return LLM_FALLBACK_RESPONSE
+
+
+def _is_transport_api_connection_error(error: object) -> bool:
+    current: object | None = error
+    for _ in range(4):
+        if current is None:
+            return False
+        name = type(current).__name__.lower()
+        if "apiconnectionerror" in name or "connection" in name and "error" in name:
+            return True
+        current = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
+    return False
+
+
+def _should_retry_openrouter_connection_error(error: object, *, first_token_seen: bool, chunk_count: int, text_length: int, llm_turn_id: int, tts_started_for_turn: bool) -> tuple[bool, str]:
+    if not _is_transport_api_connection_error(error):
+        return False, "not_transport_api_connection_error"
+    if first_token_seen:
+        return False, "first_token_seen"
+    if chunk_count > 0:
+        return False, "chunks_already_received"
+    if text_length > 0:
+        return False, "text_already_received"
+    if llm_turn_id != _current_turn_id:
+        return False, "stale_turn"
+    if tts_started_for_turn:
+        return False, "tts_already_started"
+    return True, "eligible"
+
+
+def _word_count(text: str) -> int:
+    return len(re.findall(r"\b[\w']+\b", text))
+
+
+def _generic_fallback_suppression_reason(fallback_turn_id: int, fallback_started_at: float) -> str | None:
+    if (
+        _latest_user_state_for_greeting == "speaking"
+        or _current_turn_id != fallback_turn_id
+        or _latest_user_speaking_at > fallback_started_at
+        or (_latest_stt_partial_at > fallback_started_at and _latest_stt_partial_at > _latest_stt_final_at)
+    ):
+        return "user_speaking_or_newer_turn_pending"
+    return None
+
+
+def _endpointing_wait_extension_ms() -> int:
+    lower = min(ENDPOINTING_WAIT_EXTENSION_MIN_MS, ENDPOINTING_WAIT_EXTENSION_MAX_MS)
+    upper = max(ENDPOINTING_WAIT_EXTENSION_MIN_MS, ENDPOINTING_WAIT_EXTENSION_MAX_MS)
+    return max(lower, min(upper, 900))
+
+
+def _is_clear_short_commit(text: str) -> bool:
+    cleaned = clean_transcript(text).strip().lower()
+    normalized = cleaned.rstrip(".!?").strip()
+    if not normalized:
+        return False
+    if cleaned.endswith("?"):
+        return True
+    if normalized in {"yes", "no", "yeah", "yep", "nope", "okay", "ok", "stop", "send it"}:
+        return True
+    if re.search(r"\b(what time is it|what day is it|what'?s today|count to|search that|look that up|stop|send it)\b", normalized):
+        return True
+    return False
+
+
+def _is_stale_llm_turn(llm_turn_id: int) -> bool:
+    return _current_turn_id != llm_turn_id
+
+
+def _endpointing_decision_for_transcript(text: str, context: TranscriptContext | None = None) -> tuple[str, str, int]:
+    cleaned = clean_transcript(text or "")
+    normalized = cleaned.strip().lower().replace("’", "'")
+    stripped = normalized.rstrip()
+    if _is_clear_short_commit(cleaned):
+        return "commit", "none", 0
+    if stripped.endswith(","):
+        return "extend_wait", "trailing_comma", _endpointing_wait_extension_ms()
+    stripped_no_punct = stripped.rstrip(".!?").strip()
+    filler_phrases = ("so", "like", "i mean", "you know", "because", "and")
+    if stripped_no_punct in filler_phrases or any(stripped_no_punct.endswith(f" {phrase}") for phrase in filler_phrases):
+        return "extend_wait", "filler_phrase", _endpointing_wait_extension_ms()
+    if stripped_no_punct.startswith("now") and _word_count(stripped_no_punct) <= 3:
+        return "extend_wait", "filler_phrase", _endpointing_wait_extension_ms()
+    if context is not None:
+        if context.detected_intent == "unclear_fragment":
+            return "extend_wait", "unclear_fragment", _endpointing_wait_extension_ms()
+        if context.ambiguity_detected and context.clarification_suggested:
+            return "extend_wait", "unclear_fragment", _endpointing_wait_extension_ms()
+    if _word_count(stripped_no_punct) < 4:
+        return "extend_wait", "short_fragment", _endpointing_wait_extension_ms()
+    return "commit", "none", 0
+
+
+def _is_system_or_developer_message(message: object) -> bool:
+    role = str(getattr(message, "role", "")).strip().lower()
+    return role in {"system", "developer"}
+
+
+def _prune_turn_context_messages(turn_ctx: object, turn_id: int | None = None) -> tuple[int, int, int]:
+    messages_owner = turn_ctx
+    messages = getattr(turn_ctx, "messages", None)
+    if callable(messages):
+        try:
+            messages = messages()
+        except Exception:
+            messages = None
+    if messages is None:
+        if isinstance(turn_ctx, list):
+            messages = turn_ctx
+        else:
+            try:
+                messages = list(turn_ctx)  # type: ignore[arg-type]
+            except Exception:
+                logger.info(
+                    "context_pruned: turn_id=%s total_messages=%s kept_messages=%s dropped_messages=%s context_window_turns=%s reason=messages_unavailable",
+                    turn_id or _current_turn_id,
+                    0,
+                    0,
+                    0,
+                    CONTEXT_WINDOW_TURNS,
+                )
+                return 0, 0, 0
+            messages_owner = None
+    try:
+        message_list = list(messages)
+    except Exception as exc:
+        logger.info(
+            "context_pruned: turn_id=%s total_messages=%s kept_messages=%s dropped_messages=%s context_window_turns=%s reason=messages_unavailable error=%s",
+            turn_id or _current_turn_id,
+            0,
+            0,
+            0,
+            CONTEXT_WINDOW_TURNS,
+            _redact_sensitive_text(exc),
+        )
+        return 0, 0, 0
+
+    total_messages = len(message_list)
+    max_non_system_messages = CONTEXT_WINDOW_TURNS * 2
+    non_system_messages = [message for message in message_list if not _is_system_or_developer_message(message)]
+    if len(non_system_messages) <= max_non_system_messages:
+        logger.info(
+            "context_pruned: turn_id=%s total_messages=%s kept_messages=%s dropped_messages=0 context_window_turns=%s",
+            turn_id or _current_turn_id,
+            total_messages,
+            total_messages,
+            CONTEXT_WINDOW_TURNS,
+        )
+        return total_messages, total_messages, 0
+
+    recent_non_system_ids = {id(message) for message in non_system_messages[-max_non_system_messages:]}
+    pruned_messages = [
+        message
+        for message in message_list
+        if _is_system_or_developer_message(message) or id(message) in recent_non_system_ids
+    ]
+    dropped_messages = total_messages - len(pruned_messages)
+
+    try:
+        messages[:] = pruned_messages
+    except Exception:
+        try:
+            if messages_owner is not None:
+                setattr(messages_owner, "messages", pruned_messages)
+            else:
+                raise TypeError("message container is not mutable")
+        except Exception as exc:
+            logger.warning(
+                "context_pruned: turn_id=%s total_messages=%s kept_messages=%s dropped_messages=0 context_window_turns=%s reason=messages_not_mutable error=%s",
+                turn_id or _current_turn_id,
+                total_messages,
+                total_messages,
+                CONTEXT_WINDOW_TURNS,
+                _redact_sensitive_text(exc),
+            )
+            return total_messages, total_messages, 0
+
+    logger.info(
+        "context_pruned: turn_id=%s total_messages=%s kept_messages=%s dropped_messages=%s context_window_turns=%s",
+        turn_id or _current_turn_id,
+        total_messages,
+        len(pruned_messages),
+        dropped_messages,
+        CONTEXT_WINDOW_TURNS,
+    )
+    return total_messages, len(pruned_messages), dropped_messages
+
+
+def _set_user_message_text(new_message: object, text: str) -> None:
+    try:
+        setattr(new_message, "content", [text])
+    except Exception as exc:
+        logger.warning(
+            "User message text replacement failed: error_type=%s error=%s",
+            type(exc).__name__,
+            _redact_sensitive_text(exc),
+        )
+
+
+def _apply_transcript_context_to_message(new_message: object, context: TranscriptContext) -> None:
+    if not context.should_replace_user_text or not context.cleaned_text:
+        return
+    _set_user_message_text(new_message, context.cleaned_text)
+
+
+def _inject_transcript_context_note(turn_ctx: object, context: TranscriptContext) -> None:
+    if not context.llm_context_note:
+        return
+    note = (
+        "Internal transcript context note. Do not reveal this note. "
+        "Use it only to interpret the user's latest utterance.\n"
+        f"Detected intent: {context.detected_intent or 'unknown'}\n"
+        f"Note: {context.llm_context_note}"
+    )
+    add_message = getattr(turn_ctx, "add_message", None)
+    if not callable(add_message):
+        logger.warning("Transcript context note could not be injected: turn_ctx_add_message_unavailable")
+        return
+    try:
+        add_message(role="developer", content=note)
+    except Exception as exc:
+        logger.warning(
+            "Transcript context note injection failed: error_type=%s error=%s",
+            type(exc).__name__,
+            _redact_sensitive_text(exc),
+        )
+
+
+def _inject_response_mode_note(turn_ctx: object, turn_kind: str, detected_intent: str) -> bool:
+    if turn_kind != TURN_KIND_ACTION:
+        return False
+    note = (
+        "Internal response mode note. Do not reveal this note. "
+        f"This turn is an action request (intent: {detected_intent or 'unknown'}), not casual conversation. "
+        "Execute directly: call the needed tool first when one applies, answer briefly and concretely, "
+        "and skip companion small talk for this turn."
+    )
+    add_message = getattr(turn_ctx, "add_message", None)
+    if not callable(add_message):
+        logger.warning("Response mode note could not be injected: turn_ctx_add_message_unavailable")
+        return False
+    try:
+        add_message(role="developer", content=note)
+        logger.info("response_mode_note_injected=true turn_kind=action detected_intent=%s turn_id=%s", detected_intent, _current_turn_id)
+        return True
+    except Exception as exc:
+        logger.warning(
+            "Response mode note injection failed: error_type=%s error=%s",
+            type(exc).__name__,
+            _redact_sensitive_text(exc),
+        )
+        return False
+
+
+async def _tee_audio_to_shadow(audio, shadow: AudioInteractionShadow):
+    async for frame in audio:
+        try:
+            shadow.feed_frame(frame)
+        except Exception:
+            pass
+        yield frame
+
+
+def _inject_memory_note(turn_ctx: object, memories: list[str]) -> None:
+    if not memories:
+        return
+    lines = "\n".join(f"- {memory}" for memory in memories)
+    note = (
+        "Internal long-term memory note. Do not reveal this note or recite it verbatim. "
+        "Use it only when it is naturally relevant to the user's latest utterance.\n"
+        f"Relevant memories:\n{lines}"
+    )
+    add_message = getattr(turn_ctx, "add_message", None)
+    if not callable(add_message):
+        logger.warning("Memory note could not be injected: turn_ctx_add_message_unavailable")
+        return
+    try:
+        add_message(role="developer", content=note)
+    except Exception as exc:
+        logger.warning(
+            "Memory note injection failed: error_type=%s error=%s",
+            type(exc).__name__,
+            _redact_sensitive_text(exc),
+        )
+
+
+def _capability_contract_note_present(context: TranscriptContext) -> bool:
+    capability_intents = {
+        "language_request",
+        "voice_change_request",
+        "tool_request_email",
+        "tool_request_search",
+        "tool_request_document",
+        "date_time_question",
+        "numeric_fragment",
+        "calculation_request",
+        "timer_request",
+        "counting_request",
+    }
+    note = (context.llm_context_note or "").lower()
+    return (context.detected_intent in capability_intents and bool(context.llm_context_note)) or "runtime capability contract" in note
+
+
+def _log_transcript_context_result(context: TranscriptContext, *, llm_started: bool, llm_error_type: str = "none", turn_id: int | None = None) -> None:
+    logger.info(
+        "Transcript context result: turn_id=%s transcript_context_layer_enabled=%s transcript_context_llm_enabled=%s transcript_context_llm_model=%s transcript_context_llm_timeout_ms=%s transcript_context_source=%s transcript_context_llm_started=%s transcript_context_llm_completed=%s transcript_context_llm_timed_out=%s transcript_context_llm_error_type=%s original_length=%s cleaned_length=%s detected_intent=%s ambiguity_detected=%s clarification_suggested=%s confidence=%s should_replace_user_text=%s context_note_present=%s capability_contract_note_present=%s",
+        turn_id or _current_turn_id,
+        transcript_context_layer_enabled(),
+        transcript_context_llm_enabled(),
+        transcript_context_llm_model(),
+        transcript_context_llm_timeout_ms(),
+        context.source,
+        llm_started,
+        context.source == "llm",
+        context.source == "deterministic_timeout_fallback",
+        llm_error_type,
+        len(context.original_text),
+        len(context.cleaned_text),
+        context.detected_intent or "none",
+        context.ambiguity_detected,
+        context.clarification_suggested,
+        f"{context.confidence:.2f}",
+        context.should_replace_user_text,
+        bool(context.llm_context_note),
+        _capability_contract_note_present(context),
+    )
+    if transcript_context_debug():
+        logger.info(
+            "Transcript context debug: original_preview=%s cleaned_preview=%s note_preview=%s",
+            _redact_sensitive_text(context.original_text)[:200],
+            _redact_sensitive_text(context.cleaned_text)[:200],
+            _redact_sensitive_text(context.llm_context_note or "")[:200],
+        )
+
+
+def _search_policy_for_intent(intent: str | None, clarification_suggested: bool) -> tuple[bool, str]:
+    normalized = (intent or "unknown").strip().lower()
+    blocked_intents = {
+        "unclear_fragment",
+        "numeric_fragment",
+        "language_request",
+        "counting_request",
+        "calculation_request",
+        "pronunciation_correction",
+        "voice_change_request",
+        "date_time_question",
+    }
+    if normalized == "tool_request_search":
+        if clarification_suggested:
+            return False, "blocked_unclear_fragment"
+        return True, "clear_search_intent"
+    if normalized in blocked_intents:
+        return False, "blocked_non_lookup_intent" if normalized != "unclear_fragment" else "blocked_unclear_fragment"
+    return True, "llm_tool_call"
+
+
+def _metadata_candidates_from_context(ctx: JobContext) -> list[Any]:
+    candidates: list[Any] = []
+    for attr_name in ("job", "room"):
+        obj = _safe_attr(ctx, attr_name)
+        metadata = _safe_attr(obj, "metadata")
+        if metadata:
+            candidates.append(metadata)
+
+    job = _safe_attr(ctx, "job")
+    for attr_name in ("participant", "participant_info"):  # wrapper versions differ
+        participant = _safe_attr(job, attr_name)
+        metadata = _safe_attr(participant, "metadata")
+        if metadata:
+            candidates.append(metadata)
+
+    room = _safe_attr(ctx, "room")
+    remote_participants = _safe_attr(room, "remote_participants")
+    if isinstance(remote_participants, dict):
+        for participant in remote_participants.values():
+            metadata = _safe_attr(participant, "metadata")
+            if metadata:
+                candidates.append(metadata)
+
+    return candidates
+
+
+class LucyAgent(Agent):
+    def __init__(
+        self,
+        runtime_context: RuntimeContext | None = None,
+        memory_layer: MemoryLayer | None = None,
+        memory_preload_note: str | None = None,
+    ) -> None:
+        self.runtime_context = runtime_context
+        self.memory_layer = memory_layer
+        instruction_parts = [SYSTEM_PROMPT, RUNTIME_CAPABILITY_CONTRACT]
+        if runtime_context is not None:
+            instruction_parts.append(runtime_context.system_message)
+        if memory_preload_note:
+            instruction_parts.append(memory_preload_note)
+        instructions = "\n\n".join(part for part in instruction_parts if part)
+        super().__init__(instructions=instructions)
+
+    @function_tool(name="internet_search", description=SEARCH_TOOL_DESCRIPTION)
+    async def internet_search_tool(self, query: str, max_results: int = 5) -> str:
+        """Search the internet with Exa for current or external information."""
+        provider = search_provider()
+        disabled_reason = search_disabled_reason()
+        runtime_context = self.runtime_context
+        turn_id = _current_turn_id
+        search_allowed = _current_turn_search_allowed
+        search_allowed_reason = _current_turn_search_allowed_reason
+        current_date = runtime_context.current_date if runtime_context else None
+        current_datetime_iso = runtime_context.current_datetime_iso if runtime_context else None
+        session_timezone = runtime_context.session_timezone if runtime_context else None
+        _, freshness_applied = build_effective_search_query(query, current_date=current_date)
+        try:
+            requested_max_results = max(1, int(max_results or search_max_results()))
+        except Exception:
+            requested_max_results = search_max_results()
+        capped_max_results = min(requested_max_results, search_max_results())
+        logger.info(
+            "search_tool_called turn_id=%s search_turn_id=%s search_provider=%s search_query_original=%s search_current_date=%s search_current_datetime_iso=%s search_timezone=%s search_freshness_applied=%s search_disabled_reason=%s search_pre_ack_spoken=%s requested_max_results=%s capped_max_results=%s search_allowed_for_turn=%s search_allowed_reason=%s detected_intent=%s",
+            turn_id,
+            turn_id,
+            provider,
+            _redact_sensitive_text(query),
+            current_date or "unknown",
+            current_datetime_iso or "unknown",
+            session_timezone or "unknown",
+            freshness_applied,
+            disabled_reason or "none",
+            False,
+            max_results,
+            capped_max_results,
+            search_allowed,
+            search_allowed_reason,
+            _current_turn_transcript_intent,
+        )
+        if not search_allowed:
+            output = "I need one more detail before searching. What exactly should I look up?"
+            logger.warning(
+                "search_blocked_by_turn_policy turn_id=%s search_allowed_for_turn=%s search_allowed_reason=%s detected_intent=%s search_query_original=%s",
+                turn_id,
+                search_allowed,
+                search_allowed_reason,
+                _current_turn_transcript_intent,
+                _redact_sensitive_text(query),
+            )
+            return output
+        if disabled_reason is not None:
+            logger.warning(
+                "search_disabled_reason=%s search_provider=%s search_query_original=%s search_current_date=%s search_current_datetime_iso=%s search_timezone=%s search_freshness_applied=%s search_specific_failure_response_used=%s",
+                disabled_reason,
+                provider,
+                _redact_sensitive_text(query),
+                current_date or "unknown",
+                current_datetime_iso or "unknown",
+                session_timezone or "unknown",
+                freshness_applied,
+                True,
+            )
+            output = f"{SEARCH_DISABLED_MESSAGE} Say: {search_failure_response()}"
+            _mark_search_wait_completed(failed=True, output=output, result_handoff_spoken=False, turn_id=turn_id)
+            return output
+
+        _mark_search_wait_started(pre_ack_spoken=False, turn_id=turn_id)
+        logger.info(
+            "search_wait_started turn_id=%s search_turn_id=%s search_in_progress=%s search_started_at=%s search_pre_ack_spoken=%s search_query_original=%s search_allowed_for_turn=%s search_allowed_reason=%s",
+            turn_id,
+            _search_turn_id,
+            _search_in_progress,
+            _search_started_at,
+            _search_pre_ack_spoken,
+            _redact_sensitive_text(query),
+            search_allowed,
+            search_allowed_reason,
+        )
+        results = await internet_search(
+            query=query,
+            max_results=capped_max_results,
+            current_date=current_date,
+            current_datetime_iso=current_datetime_iso,
+            session_timezone=session_timezone,
+        )
+        if not results:
+            output = f"{SEARCH_DISABLED_MESSAGE} Say: {search_failure_response()}"
+            completion_applied = _mark_search_wait_completed(failed=True, output=output, result_handoff_spoken=False, turn_id=turn_id)
+            if not completion_applied:
+                return "Search result ignored because a newer user turn started. Do not speak this stale result."
+            logger.info(
+                "search_result_count=0 turn_id=%s search_turn_id=%s search_provider=exa search_query_original=%s search_current_date=%s search_current_datetime_iso=%s search_timezone=%s search_freshness_applied=%s search_result_handoff_spoken=%s search_wait_completed search_in_progress=%s search_failed=%s search_specific_failure_response_used=%s search_latency_seconds=%.3f",
+                turn_id,
+                _search_turn_id,
+                _redact_sensitive_text(query),
+                current_date or "unknown",
+                current_datetime_iso or "unknown",
+                session_timezone or "unknown",
+                freshness_applied,
+                False,
+                _search_in_progress,
+                _search_failed,
+                True,
+                _search_wait_elapsed_seconds(),
+            )
+        else:
+            output = format_search_results_for_voice(results, current_date=current_date, freshness_applied=freshness_applied)
+            search_elapsed = _search_wait_elapsed_seconds()
+            if search_elapsed < SEARCH_BRIDGE_MIN_DELAY_SECONDS:
+                output = output.replace(
+                    "If you did not already say a lookup bridge before the tool call, say:",
+                    "Search returned quickly; do not say a separate lookup bridge. Start with the result handoff instead of:",
+                    1,
+                )
+            completion_applied = _mark_search_wait_completed(failed=False, output=output, result_handoff_spoken=False, turn_id=turn_id)
+            if not completion_applied:
+                return "Search result ignored because a newer user turn started. Do not speak this stale result."
+            logger.info(
+                "search_result_count=%s turn_id=%s search_turn_id=%s search_provider=exa search_query_original=%s search_current_date=%s search_current_datetime_iso=%s search_timezone=%s search_freshness_applied=%s search_result_dates=%s search_result_handoff_spoken=%s search_wait_completed search_in_progress=%s search_failed=%s search_specific_failure_response_used=%s search_latency_seconds=%.3f search_bridge_min_delay_seconds=%.3f",
+                len(results),
+                turn_id,
+                _search_turn_id,
+                _redact_sensitive_text(query),
+                current_date or "unknown",
+                current_datetime_iso or "unknown",
+                session_timezone or "unknown",
+                freshness_applied,
+                ",".join(result.published_date for result in results if result.published_date) or "none",
+                False,
+                _search_in_progress,
+                _search_failed,
+                False,
+                _search_wait_elapsed_seconds(),
+                SEARCH_BRIDGE_MIN_DELAY_SECONDS,
+            )
+        return output
 
 def _safe_metadata_preview(value: Any) -> str:
     if value is None:
@@ -2999,8 +3896,15 @@ class LucyAgent(Agent):
                 _last_tts_first_audio_at = None
                 _last_tts_path = None
                 frame_count = 0
+                coverage: HumeSpeechAudioCoverage | None = None
                 if TTS_PROVIDER == "hume":
                     _last_hume_request_start_at = start
+                    coverage = _start_hume_speech_audio_coverage(
+                        speech_id=_latest_current_speech_id_for_hume,
+                        turn_id=_current_turn_id,
+                        path="default_agent_tts_node_fallback",
+                        normalized_text_hash="normalization_false",
+                    )
                     dedupe_key, duplicate, seen_count = _record_hume_request_metadata(
                         path="default_agent_tts_node_fallback",
                         speech_id=_latest_current_speech_id_for_hume,
@@ -3025,9 +3929,13 @@ class LucyAgent(Agent):
                         if _last_tts_path is None:
                             _last_tts_path = "default_agent_tts_node_fallback"
                         frame_count += 1
+                        _record_hume_speech_audio_frame(coverage, out)
                         yield out
                     _last_tts_completed_at = time.monotonic()
                     if TTS_PROVIDER == "hume":
+                        finalized = _finalize_hume_speech_audio_coverage(coverage)
+                        if finalized is not None:
+                            _hume_speech_audio_coverages[finalized.speech_id] = finalized
                         logger.info(
                             "Hume TTS HTTP request completed: path=default_agent_tts_node_fallback frame_count_yielded=%s time_to_first_audio_seconds=%s total_tts_seconds=%.3f",
                             frame_count,
@@ -3036,6 +3944,7 @@ class LucyAgent(Agent):
                         )
                 except Exception as e:
                     if TTS_PROVIDER == "hume":
+                        _finalize_hume_speech_audio_coverage(coverage, error_type=type(e).__name__)
                         logger.error(
                             "Hume TTS HTTP request error: path=default_agent_tts_node_fallback error_type=%s error=%s frame_count_yielded=%s total_tts_seconds=%.3f",
                             type(e).__name__,
@@ -3045,7 +3954,7 @@ class LucyAgent(Agent):
                         )
                     raise
 
-            return _with_post_speech_hold(_default_tts_with_hume_logs())
+            return _default_tts_with_hume_logs()
 
         logger.info("Spoken text normalization enabled=true mode=buffered_full_segment")
 
@@ -3126,6 +4035,7 @@ class LucyAgent(Agent):
                     _last_hume_request_start_at = start
                     yielded = 0
                     first_audio = None
+                    coverage: HumeSpeechAudioCoverage | None = None
                     try:
                         sig = inspect.signature(synthesize_fn)
                         if "conn_options" in sig.parameters:
@@ -3139,6 +4049,12 @@ class LucyAgent(Agent):
                             speech_id=_latest_current_speech_id_for_hume,
                             normalized_text_hash=normalized_hash,
                             feeds_playout=True,
+                        )
+                        coverage = _start_hume_speech_audio_coverage(
+                            speech_id=_latest_current_speech_id_for_hume,
+                            turn_id=_current_turn_id,
+                            path="livekit_hume_plugin_synthesize_full_text",
+                            normalized_text_hash=normalized_hash,
                         )
                         logger.info(
                             "Hume TTS HTTP request starting: path=livekit_hume_plugin_synthesize_full_text text_hash=%s text_length=%s latest_agent_state=%s current_speech_id=%s hume_request_dedupe_key=%s hume_duplicate_request_detected=%s hume_request_seen_count=%s hume_request_feeds_playout=%s hume_retry=%s retry_reason=%s",
@@ -3167,29 +4083,17 @@ class LucyAgent(Agent):
                                 first_audio = time.monotonic()
                                 _last_tts_first_audio_at = first_audio
                             yielded += 1
+                            _record_hume_speech_audio_frame(coverage, frame)
                             yield frame
-                        # Drain/close the chunked stream so Hume's final frames
-                        # (including the trailing_silence tail) are fully flushed and
-                        # published before TTS is marked complete. Single full-text
-                        # synthesis means no sentence-tokenizer seam can clip the tail.
-                        aclose_fn = getattr(chunked_stream, "aclose", None)
-                        if callable(aclose_fn):
-                            try:
-                                await aclose_fn()
-                            except Exception:
-                                pass
                         _last_tts_completed_at = time.monotonic()
-                        final_frame_seen = yielded > 0
-                        logger.info(
-                            "Hume full-utterance final frame: tts_final_audio_frame_seen=%s tts_final_audio_frame_published=%s frame_count_yielded=%s path=livekit_hume_plugin_synthesize_full_text",
-                            str(final_frame_seen).lower(),
-                            str(final_frame_seen).lower(),
-                            yielded,
-                        )
+                        finalized = _finalize_hume_speech_audio_coverage(coverage)
+                        if finalized is not None:
+                            _hume_speech_audio_coverages[finalized.speech_id] = finalized
                         logger.info("Hume TTS HTTP request completed: path=livekit_hume_plugin_synthesize_full_text frame_count_yielded=%s time_to_first_audio_seconds=%.3f total_tts_seconds=%.3f", yielded, (first_audio-start) if first_audio else -1.0, _last_tts_completed_at-start)
                         logger.info("Hume full-utterance plugin result: hume_full_utterance_plugin_requested=%s hume_full_utterance_plugin_used=%s hume_full_utterance_plugin_fallback_reason=%s path=%s normalized_text_hash=%s text_length=%s sentence_end_count=%s frame_count_yielded=%s time_to_first_audio_seconds=%.3f total_tts_seconds=%.3f", True, True, "none", "livekit_hume_plugin_synthesize_full_text", normalized_hash, len(normalized_text), sentence_end_count, yielded, (first_audio-start) if first_audio else -1.0, time.monotonic()-start)
                         return
                     except Exception as e:
+                        _finalize_hume_speech_audio_coverage(coverage, error_type=type(e).__name__)
                         logger.error("Hume TTS HTTP request error: path=livekit_hume_plugin_synthesize_full_text error_type=%s error=%s frame_count_yielded=%s total_tts_seconds=%.3f", type(e).__name__, _redact_sensitive_text(e), yielded, time.monotonic()-start)
                         if yielded > 0:
                             logger.warning("Hume full-utterance plugin partial failure: hume_full_utterance_plugin_requested=%s hume_full_utterance_plugin_used=%s hume_full_utterance_plugin_fallback_reason=%s frame_count_yielded=%s", True, True, _redact_sensitive_text(e), yielded)
@@ -3211,8 +4115,15 @@ class LucyAgent(Agent):
             try:
                 hume_start = time.monotonic()
                 frame_count = 0
+                coverage: HumeSpeechAudioCoverage | None = None
                 if TTS_PROVIDER == "hume":
                     _last_hume_request_start_at = hume_start
+                    coverage = _start_hume_speech_audio_coverage(
+                        speech_id=_latest_current_speech_id_for_hume,
+                        turn_id=_current_turn_id,
+                        path="default_agent_tts_node_fallback",
+                        normalized_text_hash=normalized_hash,
+                    )
                     dedupe_key, duplicate, seen_count = _record_hume_request_metadata(
                         path="default_agent_tts_node_fallback",
                         speech_id=_latest_current_speech_id_for_hume,
@@ -3238,9 +4149,13 @@ class LucyAgent(Agent):
                     if _last_tts_path is None:
                         _last_tts_path = "default_agent_tts_node_fallback"
                     frame_count += 1
+                    _record_hume_speech_audio_frame(coverage, out)
                     yield out
                 _last_tts_completed_at = time.monotonic()
                 if TTS_PROVIDER == "hume":
+                    finalized = _finalize_hume_speech_audio_coverage(coverage)
+                    if finalized is not None:
+                        _hume_speech_audio_coverages[finalized.speech_id] = finalized
                     logger.info(
                         "Hume TTS HTTP request completed: path=default_agent_tts_node_fallback frame_count_yielded=%s time_to_first_audio_seconds=%s total_tts_seconds=%.3f",
                         frame_count,
@@ -3249,6 +4164,7 @@ class LucyAgent(Agent):
                     )
             except Exception as e:
                 if TTS_PROVIDER == "hume":
+                    _finalize_hume_speech_audio_coverage(coverage, error_type=type(e).__name__)
                     logger.error(
                         "Hume TTS HTTP request error: path=default_agent_tts_node_fallback error_type=%s error=%s tts_path=%s total_tts_seconds=%.3f",
                         type(e).__name__,
@@ -4321,7 +5237,6 @@ async def entrypoint(ctx: JobContext):
     logger.info("MISTRAL_STT_DIAGNOSTICS enabled=%s", MISTRAL_STT_DIAGNOSTICS)
     logger.info("HUME_FULL_UTTERANCE_TTS enabled=%s", HUME_FULL_UTTERANCE_TTS)
     logger.info("HUME_DIRECT_API_TTS enabled=%s", HUME_DIRECT_API_TTS)
-    logger.info("TTS_POST_SPEECH_HOLD_MS=%s tts_post_speech_hold_enabled=%s", TTS_POST_SPEECH_HOLD_MS, str(TTS_POST_SPEECH_HOLD_MS > 0).lower())
     logger.info(
         "Spoken text normalization latency guidance: spoken_text_normalization_enabled=%s spoken_text_normalization_mode=%s tts_input_buffering_mode=%s lowest_latency_setting=SPOKEN_TEXT_NORMALIZATION=false best_sentence_quality_setting=SPOKEN_TEXT_NORMALIZATION=true,mode=buffered_full_segment",
         SPOKEN_TEXT_NORMALIZATION,
@@ -4422,18 +5337,9 @@ async def entrypoint(ctx: JobContext):
     selected_voice_engine = voice_engine()
     logger.info("voice_engine_selected=%s", selected_voice_engine)
     if selected_voice_engine == "hume_evi":
-        try:
-            load_hume_evi_settings()
-        except Exception as exc:
-            logger.error(
-                "voice_engine_fallback=current voice_engine_requested=hume_evi reason=settings_validation_failed error_type=%s error=%s",
-                type(exc).__name__,
-                exc,
-            )
-        else:
-            logger.info("voice_engine_selected=hume_evi current_pipeline_disabled=true livekit_room_layer=true")
-            await run_hume_evi_bridge(ctx.room)
-            return
+        logger.info("voice_engine_selected=hume_evi current_pipeline_disabled=true livekit_room_layer=true")
+        await run_hume_evi_bridge(ctx.room)
+        return
 
     lucy_agent = LucyAgent(
         runtime_context=runtime_context,
