@@ -1629,6 +1629,10 @@ ENDPOINTING_WAIT_EXTENSION_MIN_MS = env_int_clamped("ENDPOINTING_WAIT_EXTENSION_
 ENDPOINTING_WAIT_EXTENSION_MAX_MS = env_int_clamped("ENDPOINTING_WAIT_EXTENSION_MAX_MS", 1200, 100, 5000)
 TURN_HOLD_FRAGMENT_REPLY_DEADLINE_SECONDS = float(os.getenv("TURN_HOLD_FRAGMENT_REPLY_DEADLINE_SECONDS", "2.5") or "2.5")
 TURN_HOLD_FRAGMENT_MERGE_WINDOW_SECONDS = float(os.getenv("TURN_HOLD_FRAGMENT_MERGE_WINDOW_SECONDS", os.getenv("TURN_FRAGMENT_TTL_SECONDS", "7")) or "7")
+# Post-speech playout hold: append trailing silent audio frames after the final
+# TTS frame so the client finishes rendering the last word/breath before the
+# speaking->listening transition tears playout down. Config-gated (0 = off).
+TTS_POST_SPEECH_HOLD_MS = env_int_clamped("TTS_POST_SPEECH_HOLD_MS", 0, 0, 2000)
 
 
 def _pcm16_to_audio_frames(pcm_data: bytes, sample_rate: int, channels: int) -> list[rtc.AudioFrame]:
@@ -1650,6 +1654,48 @@ def _pcm16_to_audio_frames(pcm_data: bytes, sample_rate: int, channels: int) -> 
         )
         frames.append(frame)
     return frames
+
+
+def _iter_post_speech_silence_frames(reference: "rtc.AudioFrame", hold_ms: int):
+    """Yield ~20ms silent frames matching the reference frame's format, totaling hold_ms."""
+    sample_rate = int(getattr(reference, "sample_rate", 0) or 24000)
+    num_channels = int(getattr(reference, "num_channels", 0) or 1)
+    frame_samples_per_channel = max(1, int(sample_rate * 0.02))
+    silence = b"\x00" * (frame_samples_per_channel * num_channels * 2)
+    total_samples = int(sample_rate * (hold_ms / 1000.0))
+    emitted = 0
+    while emitted < total_samples:
+        yield rtc.AudioFrame(
+            data=silence,
+            sample_rate=sample_rate,
+            num_channels=num_channels,
+            samples_per_channel=frame_samples_per_channel,
+        )
+        emitted += frame_samples_per_channel
+
+
+async def _with_post_speech_hold(source):
+    """Pass through TTS audio frames, then append a trailing silence pad (config-gated).
+
+    Keeps the published audio ending in silence so a client/WebRTC buffer drop at the
+    speaking->listening transition trims silence instead of the final word/breath.
+    """
+    last_frame = None
+    async for frame in source:
+        if isinstance(frame, rtc.AudioFrame):
+            last_frame = frame
+        yield frame
+    if TTS_POST_SPEECH_HOLD_MS > 0 and last_frame is not None:
+        appended = 0
+        for silence_frame in _iter_post_speech_silence_frames(last_frame, TTS_POST_SPEECH_HOLD_MS):
+            appended += 1
+            yield silence_frame
+        logger.info(
+            "Post-speech playout hold applied: tts_post_speech_hold_applied=true hold_ms=%s silent_frames_appended=%s tts_path=%s",
+            TTS_POST_SPEECH_HOLD_MS,
+            appended,
+            _last_tts_path or "n/a",
+        )
 
 
 def _safe_source_excerpt(obj: object, max_chars: int) -> str:
@@ -2999,7 +3045,7 @@ class LucyAgent(Agent):
                         )
                     raise
 
-            return _default_tts_with_hume_logs()
+            return _with_post_speech_hold(_default_tts_with_hume_logs())
 
         logger.info("Spoken text normalization enabled=true mode=buffered_full_segment")
 
@@ -3258,8 +3304,8 @@ class LucyAgent(Agent):
                         request_index,
                     )
 
-            return _direct_hume_or_fallback_stream()
-        return _direct_or_plugin_or_default()
+            return _with_post_speech_hold(_direct_hume_or_fallback_stream())
+        return _with_post_speech_hold(_direct_or_plugin_or_default())
 
     def llm_node(self, chat_ctx, tools, model_settings):
         datetime_user_text = _extract_latest_user_text_from_chat_ctx(chat_ctx)
@@ -4275,6 +4321,7 @@ async def entrypoint(ctx: JobContext):
     logger.info("MISTRAL_STT_DIAGNOSTICS enabled=%s", MISTRAL_STT_DIAGNOSTICS)
     logger.info("HUME_FULL_UTTERANCE_TTS enabled=%s", HUME_FULL_UTTERANCE_TTS)
     logger.info("HUME_DIRECT_API_TTS enabled=%s", HUME_DIRECT_API_TTS)
+    logger.info("TTS_POST_SPEECH_HOLD_MS=%s tts_post_speech_hold_enabled=%s", TTS_POST_SPEECH_HOLD_MS, str(TTS_POST_SPEECH_HOLD_MS > 0).lower())
     logger.info(
         "Spoken text normalization latency guidance: spoken_text_normalization_enabled=%s spoken_text_normalization_mode=%s tts_input_buffering_mode=%s lowest_latency_setting=SPOKEN_TEXT_NORMALIZATION=false best_sentence_quality_setting=SPOKEN_TEXT_NORMALIZATION=true,mode=buffered_full_segment",
         SPOKEN_TEXT_NORMALIZATION,

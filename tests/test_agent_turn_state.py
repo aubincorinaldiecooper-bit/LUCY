@@ -210,6 +210,28 @@ class VoiceLifecycleObservabilityTests(unittest.TestCase):
         # The full-utterance path must drain/close the chunked stream so the
         # trailing tail is flushed before TTS is marked complete.
         self.assertIn("aclose_fn", source)
+        # Post-speech playout hold must be config-gated and applied to the TTS path.
+        self.assertIn("TTS_POST_SPEECH_HOLD_MS", source)
+        self.assertIn("tts_post_speech_hold_applied=true", source)
+        self.assertIn("_with_post_speech_hold(", source)
+
+    def test_post_speech_silence_frames_match_reference_and_duration(self):
+        class _RefFrame:
+            sample_rate = 24000
+            num_channels = 1
+
+        frames = list(agent._iter_post_speech_silence_frames(_RefFrame(), 200))
+        # ~20ms frames over 200ms -> ~10 frames, all silent and matching format.
+        self.assertGreaterEqual(len(frames), 9)
+        total_samples = sum(f.samples_per_channel for f in frames)
+        self.assertGreaterEqual(total_samples, int(24000 * 0.2))
+        for frame in frames:
+            self.assertEqual(frame.sample_rate, 24000)
+            self.assertEqual(frame.num_channels, 1)
+            self.assertEqual(set(bytes(frame.data)), {0})
+
+    def test_post_speech_hold_defaults_off(self):
+        self.assertEqual(agent.TTS_POST_SPEECH_HOLD_MS, 0)
 
     def test_stale_speech_ids_are_capped_and_pruned(self):
         stale_ids = {f"speech_{index}" for index in range(25)}
