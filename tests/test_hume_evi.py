@@ -28,6 +28,40 @@ class HumeEVIBridgeConfigTests(unittest.TestCase):
             self.assertIn("evi_version=evi-3", settings.websocket_url)
 
 
+class VoiceEngineSelectorBootstrapTests(unittest.TestCase):
+    """Regression coverage for the entrypoint NameError: voice_engine is not defined."""
+
+    def test_agent_imports_voice_engine_selector(self):
+        import agent
+
+        self.assertTrue(callable(agent.voice_engine))
+        self.assertIs(agent.voice_engine, hume_evi_bridge.voice_engine)
+
+    def test_agent_imports_hume_evi_bridge_entrypoint(self):
+        import agent
+
+        self.assertTrue(callable(agent.run_hume_evi_bridge))
+        self.assertIs(agent.run_hume_evi_bridge, hume_evi_bridge.run_hume_evi_bridge)
+
+    def test_agent_selects_current_engine_by_default(self):
+        import agent
+
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(agent.voice_engine(), "current")
+
+    def test_agent_selects_hume_evi_through_config(self):
+        import agent
+
+        with patch.dict(os.environ, {"VOICE_ENGINE": "hume_evi"}):
+            self.assertEqual(agent.voice_engine(), "hume_evi")
+
+    def test_invalid_voice_engine_falls_back_to_current(self):
+        import agent
+
+        with patch.dict(os.environ, {"VOICE_ENGINE": "not-a-real-engine"}):
+            self.assertEqual(agent.voice_engine(), "current")
+
+
 class HumeCLMEndpointHelperTests(unittest.TestCase):
     def test_extract_hume_messages_discards_prosody_metadata(self):
         payload = {
