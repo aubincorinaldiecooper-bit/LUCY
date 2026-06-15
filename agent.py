@@ -1232,6 +1232,18 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                     was_stale,
                     was_active,
                 )
+                tts_completed_at = _last_tts_completed_at
+                finished_after_tts_complete = bool(tts_completed_at > 0 and finished_at >= tts_completed_at)
+                logger.info(
+                    "Assistant speech lifecycle ordering: speech_id=%s assistant_speech_finished_after_tts_complete=%s tts_completed_at=%s speech_finished_at=%s tts_complete_to_finish_seconds=%s interrupted=%s tts_path=%s",
+                    done_id,
+                    str(finished_after_tts_complete).lower(),
+                    _fmt_seconds(tts_completed_at) if tts_completed_at > 0 else "n/a",
+                    _fmt_seconds(finished_at),
+                    f"{finished_at - tts_completed_at:.3f}" if tts_completed_at > 0 else "n/a",
+                    interrupted,
+                    _last_tts_path or "n/a",
+                )
                 interrupted_normalized = str(interrupted).strip().lower()
                 if was_active and active_speech_handles:
                     logger.error(
@@ -3096,6 +3108,10 @@ class LucyAgent(Agent):
                             "none",
                         )
                         logger.info("Hume full-utterance mode: full_utterance_requested=%s full_utterance_supported=%s full_utterance_used=%s path=%s fallback_reason=%s", True, True, True, "livekit_hume_plugin_synthesize_full_text", "none")
+                        logger.info(
+                            "Hume full-utterance path engaged: hume_full_utterance_requested=true hume_full_utterance_supported=true hume_full_utterance_used=true hume_direct_api_tts_requested=%s path=livekit_hume_plugin_synthesize_full_text",
+                            str(HUME_DIRECT_API_TTS).lower(),
+                        )
                         _last_tts_path = "livekit_hume_plugin_synthesize_full_text"
                         async for event in chunked_stream:
                             frame = getattr(event, "frame", None)
@@ -3106,7 +3122,24 @@ class LucyAgent(Agent):
                                 _last_tts_first_audio_at = first_audio
                             yielded += 1
                             yield frame
+                        # Drain/close the chunked stream so Hume's final frames
+                        # (including the trailing_silence tail) are fully flushed and
+                        # published before TTS is marked complete. Single full-text
+                        # synthesis means no sentence-tokenizer seam can clip the tail.
+                        aclose_fn = getattr(chunked_stream, "aclose", None)
+                        if callable(aclose_fn):
+                            try:
+                                await aclose_fn()
+                            except Exception:
+                                pass
                         _last_tts_completed_at = time.monotonic()
+                        final_frame_seen = yielded > 0
+                        logger.info(
+                            "Hume full-utterance final frame: tts_final_audio_frame_seen=%s tts_final_audio_frame_published=%s frame_count_yielded=%s path=livekit_hume_plugin_synthesize_full_text",
+                            str(final_frame_seen).lower(),
+                            str(final_frame_seen).lower(),
+                            yielded,
+                        )
                         logger.info("Hume TTS HTTP request completed: path=livekit_hume_plugin_synthesize_full_text frame_count_yielded=%s time_to_first_audio_seconds=%.3f total_tts_seconds=%.3f", yielded, (first_audio-start) if first_audio else -1.0, _last_tts_completed_at-start)
                         logger.info("Hume full-utterance plugin result: hume_full_utterance_plugin_requested=%s hume_full_utterance_plugin_used=%s hume_full_utterance_plugin_fallback_reason=%s path=%s normalized_text_hash=%s text_length=%s sentence_end_count=%s frame_count_yielded=%s time_to_first_audio_seconds=%.3f total_tts_seconds=%.3f", True, True, "none", "livekit_hume_plugin_synthesize_full_text", normalized_hash, len(normalized_text), sentence_end_count, yielded, (first_audio-start) if first_audio else -1.0, time.monotonic()-start)
                         return
@@ -3117,9 +3150,17 @@ class LucyAgent(Agent):
                             return
                         logger.warning("Hume full-utterance plugin fallback: hume_full_utterance_plugin_requested=%s hume_full_utterance_plugin_used=%s hume_full_utterance_plugin_fallback_reason=%s path=%s", True, False, _redact_sensitive_text(e), "default_agent_tts_node_fallback")
                 else:
-                    logger.info("Hume full-utterance mode: full_utterance_requested=%s full_utterance_supported=%s full_utterance_used=%s path=%s fallback_reason=%s", True, False, False, "default_agent_tts_node_fallback", "activity_tts_synthesize_unavailable_or_empty_text")
+                    fu_reason = "empty_normalized_text" if not normalized_text else "activity_tts_synthesize_unavailable"
+                    logger.info("Hume full-utterance mode: full_utterance_requested=%s full_utterance_supported=%s full_utterance_used=%s path=%s fallback_reason=%s", True, False, False, "default_agent_tts_node_fallback", fu_reason)
+                    logger.warning(
+                        "Hume full-utterance path unavailable: hume_full_utterance_requested=true hume_full_utterance_supported=false hume_full_utterance_used=false hume_full_utterance_unsupported_reason=%s path=default_agent_tts_node_fallback",
+                        fu_reason,
+                    )
             elif TTS_PROVIDER == "hume":
                 logger.info("Hume full-utterance mode: full_utterance_requested=%s full_utterance_supported=%s full_utterance_used=%s path=%s fallback_reason=%s", False, False, False, "default_agent_tts_node_fallback", "not_requested")
+                logger.info(
+                    "Hume full-utterance path not requested: hume_full_utterance_requested=false hume_full_utterance_supported=unknown hume_full_utterance_used=false fallback_reason=not_requested path=default_agent_tts_node_fallback hint=set_HUME_FULL_UTTERANCE_TTS=true_to_bypass_default_tts_node_sentence_splitting",
+                )
 
             try:
                 hume_start = time.monotonic()
