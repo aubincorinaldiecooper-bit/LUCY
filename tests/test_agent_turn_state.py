@@ -196,6 +196,21 @@ class VoiceLifecycleObservabilityTests(unittest.TestCase):
         with open(agent.__file__, "r", encoding="utf-8") as source_file:
             self.assertNotIn("Deprecated one-argument assistant speech cleanup call ignored", source_file.read())
 
+    def test_full_utterance_and_lifecycle_diagnostics_present_in_source(self):
+        with open(agent.__file__, "r", encoding="utf-8") as source_file:
+            source = source_file.read()
+        # Full-utterance / direct-path observability required for the Hume tail fix.
+        self.assertIn("hume_full_utterance_requested=true", source)
+        self.assertIn("hume_full_utterance_supported=false", source)
+        self.assertIn("hume_full_utterance_used=true", source)
+        self.assertIn("hume_direct_api_tts_requested=", source)
+        self.assertIn("tts_final_audio_frame_seen=", source)
+        self.assertIn("tts_final_audio_frame_published=", source)
+        self.assertIn("assistant_speech_finished_after_tts_complete=", source)
+        # The full-utterance path must drain/close the chunked stream so the
+        # trailing tail is flushed before TTS is marked complete.
+        self.assertIn("aclose_fn", source)
+
     def test_stale_speech_ids_are_capped_and_pruned(self):
         stale_ids = {f"speech_{index}" for index in range(25)}
         stale_order = [f"speech_{index}" for index in range(25)]
