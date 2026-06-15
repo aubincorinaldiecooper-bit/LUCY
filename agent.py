@@ -35,6 +35,7 @@ from internet_search import (
     search_timeout_seconds,
 )
 from audiointeraction_shadow import AudioInteractionShadow, audiointeraction_mode, build_shadow_from_env
+from hume_evi_bridge import load_hume_evi_settings, run_hume_evi_bridge, voice_engine
 from interaction_state import TURN_KIND_ACTION, InteractionStateMachine, classify_turn_kind
 from memory_layer import MemoryLayer, identity_from_metadata, memory_enabled
 from runtime_context import RuntimeContext, answer_datetime_intent, detect_datetime_intent, runtime_context_from_metadata
@@ -4333,9 +4334,18 @@ async def entrypoint(ctx: JobContext):
     selected_voice_engine = voice_engine()
     logger.info("voice_engine_selected=%s", selected_voice_engine)
     if selected_voice_engine == "hume_evi":
-        logger.info("voice_engine_selected=hume_evi current_pipeline_disabled=true livekit_room_layer=true")
-        await run_hume_evi_bridge(ctx.room)
-        return
+        try:
+            load_hume_evi_settings()
+        except Exception as exc:
+            logger.error(
+                "voice_engine_fallback=current voice_engine_requested=hume_evi reason=settings_validation_failed error_type=%s error=%s",
+                type(exc).__name__,
+                exc,
+            )
+        else:
+            logger.info("voice_engine_selected=hume_evi current_pipeline_disabled=true livekit_room_layer=true")
+            await run_hume_evi_bridge(ctx.room)
+            return
 
     lucy_agent = LucyAgent(
         runtime_context=runtime_context,
