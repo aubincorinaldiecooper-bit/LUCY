@@ -129,6 +129,9 @@ if "SYSTEM_PROMPT" in os.environ:
 
 TTS_PROVIDER = os.getenv("TTS_PROVIDER", "deepgram").strip().lower()
 STT_PROVIDER = os.getenv("STT_PROVIDER", "mistral").strip().lower()
+# Active/session language Arche is configured to operate in. Logged at turn commit
+# so a transcript-language candidate can be compared against the intended language.
+SESSION_LANGUAGE = (os.getenv("SESSION_LANGUAGE") or os.getenv("DEEPGRAM_STT_LANGUAGE") or "en").strip() or "en"
 VAD_PROVIDER = os.getenv("VAD_PROVIDER", "ai_coustics").strip().lower()
 LIVEKIT_TURN_DETECTION_MODE = os.getenv("LIVEKIT_TURN_DETECTION_MODE", "vad").strip().lower()
 
@@ -186,6 +189,11 @@ _latest_user_speaking_at = 0.0
 _latest_stt_partial_at = 0.0
 _latest_stt_partial_text_hash = "empty"
 _latest_stt_final_at = 0.0
+# Latest STT-reported language candidate + confidence for the most recent final
+# transcript, carried into the turn-commit log so a committed turn can be proven
+# to have been (e.g.) Portuguese. "n/a" when the STT engine does not report it.
+_latest_stt_language = "n/a"
+_latest_stt_language_confidence = "n/a"
 _search_tool_called = False
 _search_in_progress = False
 _search_started_at = 0.0
@@ -1687,6 +1695,7 @@ def attach_session_diagnostics(session: AgentSession) -> None:
     def _on_user_input_transcribed(event: object) -> None:
         nonlocal stt_partial_count, stt_final_count, last_stt_any_at, last_stt_final_at, last_stt_preview, last_stt_final_preview
         global _latest_stt_partial_at, _latest_stt_partial_text_hash, _latest_stt_final_at
+        global _latest_stt_language, _latest_stt_language_confidence
         final = getattr(event, "final", getattr(event, "is_final", "n/a"))
         language = _safe_attr(event, "language", "n/a")
         speaker_id = getattr(event, "speaker_id", None)
@@ -1702,6 +1711,11 @@ def attach_session_diagnostics(session: AgentSession) -> None:
             last_stt_final_at = last_stt_any_at
             _latest_stt_final_at = last_stt_any_at
             last_stt_final_preview = last_stt_preview
+            # Carry the engine-reported language candidate/confidence (if any) to
+            # the turn-commit log. No new detection — just what STT already emits.
+            _latest_stt_language = str(language) if language not in (None, "") else "n/a"
+            stt_conf = _safe_attr(event, "language_confidence", _safe_attr(event, "confidence", None))
+            _latest_stt_language_confidence = f"{float(stt_conf):.2f}" if isinstance(stt_conf, (int, float)) else "n/a"
         else:
             stt_partial_count += 1
             _latest_stt_partial_at = last_stt_any_at
@@ -4990,7 +5004,7 @@ class LucyAgent(Agent):
         _current_turn_policy_decision = turn_policy.decision
         _current_turn_audio_unclear = turn_policy.classification == "UNCLEAR_AUDIO"
         logger.info(
-            "turn_policy_decision=%s transcript_classification=%s classification_confidence=%.2f classification_reason=%s should_start_generation=%s should_merge_held_fragment=%s should_clear_held_fragment=%s",
+            "turn_policy_decision=%s transcript_classification=%s classification_confidence=%.2f classification_reason=%s should_start_generation=%s should_merge_held_fragment=%s should_clear_held_fragment=%s commit_allowed=%s commit_block_reason=%s active_language=%s stt_language_candidate=%s stt_language_confidence=%s normalized_user_text=%s",
             turn_policy.decision,
             turn_policy.classification,
             turn_policy.confidence,
@@ -4998,6 +5012,12 @@ class LucyAgent(Agent):
             turn_policy.should_start_generation,
             turn_policy.should_merge_held_fragment,
             turn_policy.should_clear_held_fragment,
+            turn_policy.should_start_generation,
+            "none" if turn_policy.should_start_generation else f"{turn_policy.decision}:{turn_policy.reason}",
+            SESSION_LANGUAGE,
+            _latest_stt_language,
+            _latest_stt_language_confidence,
+            bool(getattr(policy_context, "should_replace_user_text", False)),
         )
         _interaction_state.set_turn_kind(
             classify_turn_kind(_current_turn_transcript_intent, turn_policy.classification, turn_policy.decision),
