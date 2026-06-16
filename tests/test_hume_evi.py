@@ -1,9 +1,21 @@
+import io
 import os
 import unittest
+import wave
 from unittest.mock import patch
 
 import hume_evi_bridge
 import server
+
+
+def _make_wav(pcm: bytes, sample_rate: int = 48000, channels: int = 1) -> bytes:
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav:
+        wav.setnchannels(channels)
+        wav.setsampwidth(2)
+        wav.setframerate(sample_rate)
+        wav.writeframes(pcm)
+    return buffer.getvalue()
 
 
 class _FakeRoom:
@@ -136,6 +148,50 @@ class HumeEVIBootstrapOrderTests(unittest.IsolatedAsyncioTestCase):
             any("voice_engine_bootstrap_failed=true" in line and "engine=hume_evi" in line for line in captured.output),
             captured.output,
         )
+
+
+class HumeEVIAudioOutputFramingTests(unittest.TestCase):
+    """Regression coverage for the assistant-audio clicking noise."""
+
+    def test_parse_wav_strips_header_and_reads_format(self):
+        pcm = bytes(range(0, 240)) * 8  # 1920 bytes of deterministic PCM
+        wav = _make_wav(pcm, sample_rate=48000, channels=1)
+
+        self.assertGreater(len(wav), len(pcm))  # header present
+        decoded, sample_rate, channels = hume_evi_bridge._parse_wav(wav)
+        self.assertEqual(decoded, pcm)  # header stripped, no leading garbage
+        self.assertEqual(sample_rate, 48000)
+        self.assertEqual(channels, 1)
+
+    def test_parse_wav_passes_through_raw_pcm(self):
+        raw = b"\x01\x02\x03\x04" * 10
+        decoded, sample_rate, channels = hume_evi_bridge._parse_wav(raw)
+        self.assertEqual(decoded, raw)
+        self.assertEqual(sample_rate, hume_evi_bridge.EVI_OUTPUT_SAMPLE_RATE)
+        self.assertEqual(channels, hume_evi_bridge.EVI_CHANNELS)
+
+    def test_take_full_frames_buffers_remainder_without_padding(self):
+        frame_bytes = 1920
+        buffer = bytearray()
+
+        buffer.extend(b"\xaa" * 1000)
+        self.assertEqual(hume_evi_bridge._take_full_frames(buffer, frame_bytes), [])
+        self.assertEqual(len(buffer), 1000)  # remainder kept, not zero-padded
+
+        buffer.extend(b"\xbb" * 1000)
+        frames = hume_evi_bridge._take_full_frames(buffer, frame_bytes)
+        self.assertEqual(len(frames), 1)
+        self.assertEqual(len(frames[0]), frame_bytes)
+        # The emitted frame is contiguous source bytes with no interior silence.
+        self.assertEqual(frames[0], (b"\xaa" * 1000 + b"\xbb" * 920))
+        self.assertEqual(len(buffer), 80)  # leftover carried to the next chunk
+
+    def test_take_full_frames_emits_multiple_frames(self):
+        frame_bytes = 1920
+        buffer = bytearray(b"\x00" * (frame_bytes * 3 + 5))
+        frames = hume_evi_bridge._take_full_frames(buffer, frame_bytes)
+        self.assertEqual(len(frames), 3)
+        self.assertEqual(len(buffer), 5)
 
 
 class HumeCLMEndpointHelperTests(unittest.TestCase):
