@@ -42,7 +42,9 @@ from interaction_state import ASSISTANT_THINKING, TOOL_CALL_PENDING, TURN_KIND_A
 from memory_layer import MemoryLayer, identity_from_metadata, memory_enabled
 from runtime_context import RuntimeContext, answer_datetime_intent, detect_datetime_intent, runtime_context_from_metadata
 from transcript_context import (
+    ContextDecision,
     TranscriptContext,
+    build_context_decision,
     clean_transcript,
     detect_transcript_context,
     interpret_transcript_context,
@@ -221,6 +223,13 @@ _current_turn_audio_unclear = False
 _barge_in_during_thinking_turn_id = 0
 _barge_in_started_at = 0.0
 _barge_in_confirmed_real = False
+# Context-policy state: a thin in-memory conversation ledger (not a memory system)
+# used only to inject recent VISIBLE turns and to carry a contextual intent
+# forward 1-2 turns. Suppressed/zero-audio/interrupted assistant turns are kept
+# but marked non-canonical so they never pollute future prompt context.
+_conversation_ledger: list[dict] = []
+_prior_context_decision: ContextDecision | None = None
+_current_context_dependency = "none"
 _interaction_state = InteractionStateMachine()
 _active_memory_layer: MemoryLayer | None = None
 _audiointeraction_shadow: AudioInteractionShadow | None = None
@@ -1670,6 +1679,15 @@ def attach_session_diagnostics(session: AgentSession) -> None:
         target = event_item if event_item is not None else item
         role = _safe_attr(target, "role")
         interrupted = _safe_attr(target, "interrupted")
+        # Phantom-message guard + ledger: record user/assistant turns, marking an
+        # interrupted or empty assistant turn as suppressed/non-canonical so it
+        # never gets injected as future context.
+        role_l = str(role).strip().lower()
+        if CONTEXT_POLICY_ENABLED and role_l in ("user", "assistant"):
+            ledger_text = _extract_text_for_debug(target)
+            interrupted_bool = str(interrupted).strip().lower() in {"true", "1", "yes"}
+            is_suppressed = role_l == "assistant" and (interrupted_bool or not ledger_text.strip())
+            _ledger_append(role_l, ledger_text, visible=not is_suppressed, suppressed=is_suppressed)
         if _active_memory_layer is not None and str(role).strip().lower() == "assistant":
             _active_memory_layer.schedule_remember(
                 role="assistant",
@@ -1823,6 +1841,31 @@ try:
     CONTEXT_COHERENCE_MIN_ASR_CONFIDENCE = max(0.0, min(1.0, float(os.getenv("CONTEXT_COHERENCE_MIN_ASR_CONFIDENCE", "0.45"))))
 except Exception:
     CONTEXT_COHERENCE_MIN_ASR_CONFIDENCE = 0.45
+# Context-policy layer: let the prior-context signals the system already detects
+# govern prompt injection, response posture, and timeout fallback. Reuses the
+# deterministic context classification + turn policy; adds no new model/memory.
+CONTEXT_POLICY_ENABLED = env_bool("CONTEXT_POLICY_ENABLED", True)
+CONTEXT_FORCE_LOCAL_INJECTION = env_bool("CONTEXT_FORCE_LOCAL_INJECTION", True)
+CONTEXT_INJECTION_TURNS = env_int_clamped("CONTEXT_INJECTION_TURNS", 5, 1, 20)
+CONTEXT_RESPONSE_POSTURE_ENABLED = env_bool("CONTEXT_RESPONSE_POSTURE_ENABLED", True)
+CONTEXT_AWARE_FALLBACK_ENABLED = env_bool("CONTEXT_AWARE_FALLBACK_ENABLED", True)
+CONTEXT_REFERENCE_CARRY_FORWARD_ENABLED = env_bool("CONTEXT_REFERENCE_CARRY_FORWARD_ENABLED", True)
+CONVERSATION_LEDGER_EXCLUDE_SUPPRESSED = env_bool("CONVERSATION_LEDGER_EXCLUDE_SUPPRESSED", True)
+LOG_PROMPT_CONTEXT_INJECTION = env_bool("LOG_PROMPT_CONTEXT_INJECTION", True)
+LLM_RETRY_ON_FIRST_TOKEN_TIMEOUT = env_bool("LLM_RETRY_ON_FIRST_TOKEN_TIMEOUT", True)
+LLM_FALLBACK_MODEL = (os.getenv("LLM_FALLBACK_MODEL") or "").strip()
+CONTEXT_AWARE_FALLBACK_TEXT = "I know you’re pointing back to what just happened — give me a second."
+
+
+def _context_aware_fallback_text(reason: str, context_dependency: str) -> str | None:
+    """Context-preserving fallback for a timeout on a context-dependent turn."""
+    if (
+        CONTEXT_AWARE_FALLBACK_ENABLED
+        and context_dependency == "high"
+        and reason in {"first_token_timeout", "total_timeout_no_text"}
+    ):
+        return CONTEXT_AWARE_FALLBACK_TEXT
+    return None
 
 
 def _assess_context_coherence(stt_language: str, stt_language_confidence: str, session_language: str) -> tuple[str, str, float]:
@@ -1848,6 +1891,73 @@ def _assess_context_coherence(stt_language: str, stt_language_confidence: str, s
     if 0.0 <= conf < CONTEXT_COHERENCE_MIN_ASR_CONFIDENCE:
         return "low_coherence", f"asr_low_confidence:{conf:.2f}", 0.7
     return "coherent", "ok", 0.6
+
+
+def _ledger_append(role: str, text: str, *, visible: bool, suppressed: bool) -> None:
+    """Record a turn in the thin conversation ledger.
+
+    canonical_for_context gates prompt injection: a turn is canonical only when it
+    is visible, not suppressed, and has real text. Non-canonical entries (stale,
+    zero-audio, interrupted, empty) are retained for audit but never injected.
+    """
+    canonical = bool(visible and not suppressed and (text or "").strip())
+    _conversation_ledger.append(
+        {
+            "role": role,
+            "text": text or "",
+            "visible_to_user": bool(visible),
+            "suppressed": bool(suppressed),
+            "canonical_for_context": canonical,
+        }
+    )
+    if len(_conversation_ledger) > 60:
+        del _conversation_ledger[:-60]
+
+
+def _ledger_recent_canonical(n: int) -> list[dict]:
+    if CONVERSATION_LEDGER_EXCLUDE_SUPPRESSED:
+        items = [entry for entry in _conversation_ledger if entry.get("canonical_for_context")]
+    else:
+        items = list(_conversation_ledger)
+    return items[-n:] if n > 0 else []
+
+
+def _ledger_visible_canonical_count() -> int:
+    return sum(1 for entry in _conversation_ledger if entry.get("canonical_for_context"))
+
+
+def _ledger_suppressed_count() -> int:
+    return sum(1 for entry in _conversation_ledger if entry.get("suppressed"))
+
+
+def _inject_context_window_note(turn_ctx: object, response_posture: str, recent: list[dict]) -> int:
+    """Force the recent visible exchange into the prompt for a context-dependent turn.
+
+    Returns the number of turns injected (0 when nothing was injected).
+    """
+    add_message = getattr(turn_ctx, "add_message", None)
+    if not callable(add_message) or not recent:
+        return 0
+    lines = "\n".join(f"- {entry['role']}: {_redact_sensitive_text(entry['text'])[:200]}" for entry in recent)
+    note = (
+        "Recent conversation context:\n"
+        "The user’s current message depends on the recent exchange.\n"
+        "Use the recent visible turns below to understand what the user is pointing back to.\n"
+        f"Response posture: {response_posture}.\n"
+        "Do not answer as a generic standalone question.\n"
+        "Do not ask the user to repeat unless the reference truly cannot be resolved.\n"
+        f"Recent visible turns:\n{lines}"
+    )
+    try:
+        add_message(role="developer", content=note)
+        return len(recent)
+    except Exception as exc:
+        logger.warning(
+            "Context window note injection failed: error_type=%s error=%s",
+            type(exc).__name__,
+            _redact_sensitive_text(exc),
+        )
+        return 0
 
 
 def _inject_coherence_note(turn_ctx: object, reason: str) -> bool:
@@ -4606,6 +4716,17 @@ class LucyAgent(Agent):
                         _current_turn_policy_classification,
                     )
                     fallback_text = "One second — I’m catching up."
+                context_aware_text = _context_aware_fallback_text(reason, _current_context_dependency)
+                fallback_context_aware = context_aware_text is not None
+                if context_aware_text is not None:
+                    fallback_text = context_aware_text
+                    requires_repeat = False
+                    logger.info(
+                        "fallback_context_aware=true fallback_reason=%s context_dependency=%s turn_id=%s",
+                        reason,
+                        _current_context_dependency,
+                        llm_turn_id,
+                    )
                 fallback_yielded = True
                 _last_llm_fallback_response_used = True
                 _last_generic_llm_fallback_used = True
@@ -4722,6 +4843,31 @@ class LucyAgent(Agent):
                                     continue
                                 _last_llm_stream_status = "first_token_timeout"
                                 _last_llm_timeout_stage = "first_token"
+                                # Optional one-shot re-request before speaking a fallback, so a
+                                # slow first token does not immediately surface as a stall. Reuses
+                                # the transport-retry recreation; only when nothing was emitted yet.
+                                if (
+                                    LLM_RETRY_ON_FIRST_TOKEN_TIMEOUT
+                                    and not openrouter_retry_attempted
+                                    and chunk_count == 0
+                                    and _current_turn_id == llm_turn_id
+                                ):
+                                    openrouter_retry_attempted = True
+                                    logger.warning(
+                                        "fallback_retry_attempted=true fallback_reason=first_token_timeout fallback_model_used=%s turn_id=%s",
+                                        LLM_FALLBACK_MODEL or "none",
+                                        llm_turn_id,
+                                    )
+                                    await _cancel_pending_next_chunk("first_token_timeout_retry")
+                                    await _close_llm_stream("first_token_timeout_retry")
+                                    stream = Agent.default.llm_node(self, chat_ctx, tools, model_settings)
+                                    it = stream.__aiter__()
+                                    pending_next_chunk_task = None
+                                    first_token_deadline = time.monotonic() + LLM_FIRST_TOKEN_TIMEOUT_SECONDS
+                                    total_deadline = time.monotonic() + LLM_TOTAL_TIMEOUT_SECONDS
+                                    _last_llm_stream_status = "started"
+                                    _last_llm_complete_at = 0.0
+                                    continue
                                 logger.error(
                                     "LLM first-token timeout: elapsed_seconds=%s openrouter_model=%s chunk_count=%s text_length=%s search_in_progress=%s search_tool_called=%s",
                                     _fmt_seconds(_last_llm_complete_at - start),
@@ -4979,6 +5125,7 @@ class LucyAgent(Agent):
     async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
         global _last_turn_committed_at, _last_llm_start_at, _last_llm_first_token_at, _last_llm_complete_at, _last_llm_stream_status, _last_llm_timeout_stage, _last_llm_fallback_response_used, _last_llm_completed_text, _last_llm_completed_text_hash, _last_llm_completed_at, _last_tts_received_text_hash, _last_user_message_text, _current_turn_id, _current_turn_transcript_intent, _current_turn_search_allowed, _current_turn_search_allowed_reason, _current_turn_policy_classification, _current_turn_policy_decision, _current_turn_audio_unclear, _held_turn_fragment_text, _held_turn_fragment_created_at, _held_turn_fragment_classification, _held_turn_fragment_incomplete
         global _barge_in_during_thinking_turn_id, _barge_in_started_at, _barge_in_confirmed_real
+        global _prior_context_decision, _current_context_dependency
         _current_turn_id = _next_turn_id()
         # New turn committed: clear any barge-in latch from the prior turn. A stale
         # prior reply is now covered by the existing _is_stale_llm_turn path.
@@ -5094,6 +5241,39 @@ class LucyAgent(Agent):
             coherence_confidence,
             response_posture,
         )
+        context_decision: ContextDecision | None = None
+        if CONTEXT_POLICY_ENABLED:
+            context_decision = build_context_decision(
+                text=_last_user_message_text,
+                base_intent=_current_turn_transcript_intent,
+                classification=turn_policy.classification,
+                ambiguity_detected=bool(getattr(policy_context, "ambiguity_detected", False)),
+                clarification_suggested=bool(getattr(policy_context, "clarification_suggested", False)),
+                confidence=float(getattr(policy_context, "confidence", 0.0) or 0.0),
+                prior_decision=_prior_context_decision if CONTEXT_REFERENCE_CARRY_FORWARD_ENABLED else None,
+            )
+            _current_context_dependency = context_decision.context_dependency
+            logger.info(
+                "context_decision_final_intent=%s context_dependency=%s response_posture=%s force_context_injection=%s context_decision_source=%s confidence=%.2f ambiguity_detected=%s clarification_suggested=%s reference_carry_forward_applied=%s turn_id=%s",
+                context_decision.final_intent,
+                context_decision.context_dependency,
+                context_decision.response_posture,
+                context_decision.force_context_injection,
+                context_decision.decision_source,
+                context_decision.confidence,
+                context_decision.ambiguity_detected,
+                context_decision.clarification_suggested,
+                context_decision.decision_source == "carry_forward",
+                _current_turn_id,
+            )
+            # Carry the contextual intent forward 1-2 turns; a clearly standalone
+            # turn (no dependency, not a carry-forward trigger) clears it.
+            if context_decision.context_dependency == "high":
+                _prior_context_decision = context_decision
+            else:
+                _prior_context_decision = None
+        else:
+            _current_context_dependency = "none"
         _interaction_state.set_turn_kind(
             classify_turn_kind(_current_turn_transcript_intent, turn_policy.classification, turn_policy.decision),
             detected_intent=_current_turn_transcript_intent,
@@ -5124,6 +5304,25 @@ class LucyAgent(Agent):
         _inject_response_mode_note(turn_ctx, _interaction_state.turn_kind, _current_turn_transcript_intent)
         if context_fit == "low_coherence":
             _inject_coherence_note(turn_ctx, coherence_reason)
+        if (
+            context_decision is not None
+            and CONTEXT_FORCE_LOCAL_INJECTION
+            and context_decision.force_context_injection
+        ):
+            recent = _ledger_recent_canonical(CONTEXT_INJECTION_TURNS)
+            posture = context_decision.response_posture if CONTEXT_RESPONSE_POSTURE_ENABLED else "answer"
+            injected_count = _inject_context_window_note(turn_ctx, posture, recent)
+            if LOG_PROMPT_CONTEXT_INJECTION:
+                logger.info(
+                    "prompt_context_injected=%s prompt_context_turn_count=%s suppressed_messages_excluded_count=%s reference_carry_forward_applied=%s canonical_history_visible_messages_count=%s response_posture=%s turn_id=%s",
+                    injected_count > 0,
+                    injected_count,
+                    _ledger_suppressed_count(),
+                    context_decision.decision_source == "carry_forward",
+                    _ledger_visible_canonical_count(),
+                    posture,
+                    _current_turn_id,
+                )
         merged_text: str | None = None
         if turn_policy.classification == "META_COMPLAINT":
             logger.warning(
