@@ -454,3 +454,167 @@ async def interpret_transcript_context(
         return with_source(deterministic, "deterministic_timeout_fallback")
     except Exception:
         return with_source(deterministic, "deterministic_llm_error_fallback")
+
+
+# ---------------------------------------------------------------------------
+# ContextDecision: a thin policy object built from existing context outputs.
+# It does not classify from scratch or add a new model; it maps the signals the
+# deterministic context layer + turn policy already produce into a single
+# decision that governs prompt injection, response posture, and fallback.
+# ---------------------------------------------------------------------------
+
+CONTEXT_DECISION_INTENTS = {
+    "reference_to_prior_context",
+    "meta_complaint",
+    "correction",
+    "user_evaluating_assistant",
+    "unknown",
+}
+
+RESPONSE_POSTURES = {
+    "answer",
+    "contextual_acknowledgment",
+    "missed_context_recovery",
+    "correction_received",
+    "unclear_reference_clarification",
+}
+
+_HIGH_DEPENDENCY_INTENTS = {
+    "reference_to_prior_context",
+    "meta_complaint",
+    "correction",
+    "user_evaluating_assistant",
+}
+
+_POSTURE_BY_INTENT = {
+    "reference_to_prior_context": "contextual_acknowledgment",
+    "user_evaluating_assistant": "contextual_acknowledgment",
+    "meta_complaint": "missed_context_recovery",
+    "correction": "correction_received",
+}
+
+# Short/vague/evaluative utterances that depend on the prior 1-2 turns to resolve.
+_CARRY_FORWARD_TRIGGERS = (
+    "why",
+    "do you know why",
+    "see",
+    "see what i mean",
+    "right",
+    "this time",
+    "that time",
+    "the last thing",
+    "you got it",
+    "you missed it",
+)
+
+
+@dataclass(slots=True)
+class ContextDecision:
+    final_intent: str
+    context_dependency: str  # "high" | "none"
+    response_posture: str
+    force_context_injection: bool
+    decision_source: str  # "deterministic" | "carry_forward" | "disabled"
+    confidence: float
+    ambiguity_detected: bool
+    clarification_suggested: bool
+
+
+def _normalize_for_match(text: str) -> str:
+    return (text or "").strip().lower().replace("’", "'")
+
+
+def is_carry_forward_trigger(text: str) -> bool:
+    """True for short/vague/evaluative utterances that lean on the recent exchange."""
+    normalized = _normalize_for_match(text).rstrip("?.! ")
+    if not normalized or len(normalized.split()) > 6:
+        return False
+    return any(normalized == trigger or normalized.startswith(trigger + " ") for trigger in _CARRY_FORWARD_TRIGGERS)
+
+
+def classify_context_intent(text: str, base_intent: str | None = None, classification: str | None = None) -> str:
+    """Map existing signals + light phrase cues onto a ContextDecision intent.
+
+    Order matters: a turn-policy META_COMPLAINT and explicit corrections win over
+    generic evaluative phrasing.
+    """
+    normalized = _normalize_for_match(text)
+    cls = (classification or "").strip().upper()
+    base = (base_intent or "").strip().lower()
+    if cls == "META_COMPLAINT":
+        return "meta_complaint"
+    if re.search(
+        r"\bno,|\bthat'?s not\b|\bi didn'?t say\b|\bi did not say\b|\bnot what i (said|meant)\b|"
+        r"\bthat'?s wrong\b|\bi meant\b|\bthe last thing\b|\bwrong\b",
+        normalized,
+    ):
+        return "correction"
+    if re.search(r"\b(you missed|did you miss|why did you miss|missed it|you got it wrong)\b", normalized):
+        return "meta_complaint"
+    if re.search(
+        r"\b(you got it|you'?re getting it|you are getting it|exactly|correct|nailed it|you understand|"
+        r"see what i mean|that'?s what i was testing)\b",
+        normalized,
+    ) or re.fullmatch(r"see\s*[?.!]*", normalized):
+        return "user_evaluating_assistant"
+    if base == "reference_to_prior_context":
+        return "reference_to_prior_context"
+    return "unknown"
+
+
+def build_context_decision(
+    *,
+    text: str,
+    base_intent: str | None = None,
+    classification: str | None = None,
+    ambiguity_detected: bool = False,
+    clarification_suggested: bool = False,
+    confidence: float = 0.0,
+    prior_decision: "ContextDecision | None" = None,
+) -> ContextDecision:
+    """Build the per-turn context decision from already-computed context signals.
+
+    A turn can be COMPLETE_THOUGHT and still depend on recent context: dependency
+    is derived from intent/reference cues, never downgraded by the turn-shape
+    classification.
+    """
+    intent = classify_context_intent(text, base_intent, classification)
+    source = "deterministic"
+
+    # Carry-forward: a vague/evaluative utterance inherits the prior contextual
+    # intent when the previous turn was itself context-dependent.
+    if (
+        intent == "unknown"
+        and prior_decision is not None
+        and prior_decision.context_dependency == "high"
+        and is_carry_forward_trigger(text)
+    ):
+        inherited = prior_decision.final_intent
+        intent = inherited if inherited in _HIGH_DEPENDENCY_INTENTS else "reference_to_prior_context"
+        source = "carry_forward"
+
+    if intent in _HIGH_DEPENDENCY_INTENTS:
+        dependency = "high"
+        force = True
+        posture = _POSTURE_BY_INTENT[intent]
+    elif ambiguity_detected and clarification_suggested:
+        # Do not answer as a generic standalone turn.
+        dependency = "high"
+        force = True
+        posture = "unclear_reference_clarification"
+    else:
+        dependency = "none"
+        force = False
+        posture = "answer"
+
+    return ContextDecision(
+        final_intent=intent,
+        context_dependency=dependency,
+        response_posture=posture,
+        force_context_injection=force,
+        decision_source=source,
+        confidence=float(confidence or 0.0),
+        ambiguity_detected=bool(ambiguity_detected),
+        clarification_suggested=bool(clarification_suggested),
+    )
+
