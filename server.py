@@ -213,8 +213,16 @@ async def _stream_openrouter_for_hume(payload: dict[str, Any], custom_session_id
                     yield _sse_error_chunk(request_id, "I hit a language-model error there.")
                     yield "data: [DONE]\n\n"
                     return
+                first_token_at: float | None = None
                 async for chunk in response.content:
                     if chunk:
+                        if first_token_at is None:
+                            first_token_at = time.monotonic()
+                            logger.info(
+                                "hume_clm_first_token_ms=%.1f request_id=%s",
+                                (first_token_at - started_at) * 1000.0,
+                                request_id,
+                            )
                         yield chunk.decode("utf-8", errors="ignore")
     except Exception as exc:
         logger.error("hume_clm_response_error=true request_id=%s error_type=%s", request_id, type(exc).__name__)
