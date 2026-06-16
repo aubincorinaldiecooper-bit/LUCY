@@ -1814,6 +1814,73 @@ MISTRAL_STT_DIAGNOSTICS = env_bool("MISTRAL_STT_DIAGNOSTICS", True)
 HUME_FULL_UTTERANCE_TTS = env_bool("HUME_FULL_UTTERANCE_TTS", False)
 LIVEKIT_TTS_SOURCE_INSPECTION = env_bool("LIVEKIT_TTS_SOURCE_INSPECTION", False)
 HUME_DIRECT_API_TTS = env_bool("HUME_DIRECT_API_TTS", False)
+# Context-coherence layer (Phase 1, deterministic): judge whether the committed
+# transcript plausibly fits the session before the main LLM responds. When low,
+# the response is shaped to acknowledge-and-attempt (never silenced/blocked).
+# Off by default; behavior is unchanged until enabled.
+CONTEXT_COHERENCE_ENABLED = env_bool("CONTEXT_COHERENCE_ENABLED", False)
+try:
+    CONTEXT_COHERENCE_MIN_ASR_CONFIDENCE = max(0.0, min(1.0, float(os.getenv("CONTEXT_COHERENCE_MIN_ASR_CONFIDENCE", "0.45"))))
+except Exception:
+    CONTEXT_COHERENCE_MIN_ASR_CONFIDENCE = 0.45
+
+
+def _assess_context_coherence(stt_language: str, stt_language_confidence: str, session_language: str) -> tuple[str, str, float]:
+    """Deterministic Phase-1 coherence check at turn commit.
+
+    Returns (context_fit, reason, confidence): context_fit is "coherent",
+    "low_coherence", or "unknown". Catches the cheap/obvious cases (a transcript
+    in a different language than the session, or very low ASR confidence) with no
+    added latency. Nuanced non-sequitur/topic-fit is deferred to the Tier-2 LLM
+    interpreter (Phase 2). Returns "unknown" when disabled so nothing downstream
+    changes.
+    """
+    if not CONTEXT_COHERENCE_ENABLED:
+        return "unknown", "disabled", 0.0
+    lang = (stt_language or "n/a").strip().lower()
+    session = (session_language or "en").strip().lower()
+    if lang not in ("", "n/a", "unknown") and not lang.startswith(session) and not session.startswith(lang):
+        return "low_coherence", f"language_mismatch:{lang}", 0.8
+    try:
+        conf = float(stt_language_confidence)
+    except (TypeError, ValueError):
+        conf = -1.0
+    if 0.0 <= conf < CONTEXT_COHERENCE_MIN_ASR_CONFIDENCE:
+        return "low_coherence", f"asr_low_confidence:{conf:.2f}", 0.7
+    return "coherent", "ok", 0.6
+
+
+def _inject_coherence_note(turn_ctx: object, reason: str) -> bool:
+    """Shape the next reply to acknowledge-and-attempt when the utterance may not fit.
+
+    Never blocks or silences the turn; it only nudges the main LLM to flag a
+    possible mishearing/language switch and continue.
+    """
+    note = (
+        "Internal context note. Do not reveal this note or quote it. "
+        f"The user's latest message may not fit the conversation so far (reason: {reason}). "
+        "You may have misheard them, or they may have switched languages. "
+        "Briefly acknowledge you might have misheard and offer your best understanding or a short check "
+        "(for example: \"I might've misheard — did you mean…?\"), then continue naturally in English. "
+        "Do not go silent and do not refuse to respond."
+    )
+    add_message = getattr(turn_ctx, "add_message", None)
+    if not callable(add_message):
+        logger.warning("Coherence note could not be injected: turn_ctx_add_message_unavailable")
+        return False
+    try:
+        add_message(role="developer", content=note)
+        logger.info("coherence_note_injected=true reason=%s turn_id=%s", reason, _current_turn_id)
+        return True
+    except Exception as exc:
+        logger.warning(
+            "Coherence note injection failed: error_type=%s error=%s",
+            type(exc).__name__,
+            _redact_sensitive_text(exc),
+        )
+        return False
+
+
 # Trailing silence (ms) appended after TTS audio so a client/WebRTC buffer drop at the
 # speaking->listening transition trims silence instead of the final word/breath.
 # 0 disables the hold (pure passthrough). Clamped to a sane ceiling.
@@ -5003,8 +5070,12 @@ class LucyAgent(Agent):
         _current_turn_policy_classification = turn_policy.classification
         _current_turn_policy_decision = turn_policy.decision
         _current_turn_audio_unclear = turn_policy.classification == "UNCLEAR_AUDIO"
+        context_fit, coherence_reason, coherence_confidence = _assess_context_coherence(
+            _latest_stt_language, _latest_stt_language_confidence, SESSION_LANGUAGE
+        )
+        response_posture = "acknowledge_and_attempt" if context_fit == "low_coherence" else "answer"
         logger.info(
-            "turn_policy_decision=%s transcript_classification=%s classification_confidence=%.2f classification_reason=%s should_start_generation=%s should_merge_held_fragment=%s should_clear_held_fragment=%s commit_allowed=%s commit_block_reason=%s active_language=%s stt_language_candidate=%s stt_language_confidence=%s normalized_user_text=%s",
+            "turn_policy_decision=%s transcript_classification=%s classification_confidence=%.2f classification_reason=%s should_start_generation=%s should_merge_held_fragment=%s should_clear_held_fragment=%s commit_allowed=%s commit_block_reason=%s active_language=%s stt_language_candidate=%s stt_language_confidence=%s normalized_user_text=%s context_fit=%s coherence_reason=%s coherence_confidence=%.2f response_posture=%s",
             turn_policy.decision,
             turn_policy.classification,
             turn_policy.confidence,
@@ -5018,6 +5089,10 @@ class LucyAgent(Agent):
             _latest_stt_language,
             _latest_stt_language_confidence,
             bool(getattr(policy_context, "should_replace_user_text", False)),
+            context_fit,
+            coherence_reason,
+            coherence_confidence,
+            response_posture,
         )
         _interaction_state.set_turn_kind(
             classify_turn_kind(_current_turn_transcript_intent, turn_policy.classification, turn_policy.decision),
@@ -5047,6 +5122,8 @@ class LucyAgent(Agent):
             )
             raise StopResponse()
         _inject_response_mode_note(turn_ctx, _interaction_state.turn_kind, _current_turn_transcript_intent)
+        if context_fit == "low_coherence":
+            _inject_coherence_note(turn_ctx, coherence_reason)
         merged_text: str | None = None
         if turn_policy.classification == "META_COMPLAINT":
             logger.warning(
