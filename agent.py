@@ -1753,6 +1753,10 @@ MISTRAL_STT_DIAGNOSTICS = env_bool("MISTRAL_STT_DIAGNOSTICS", True)
 HUME_FULL_UTTERANCE_TTS = env_bool("HUME_FULL_UTTERANCE_TTS", False)
 LIVEKIT_TTS_SOURCE_INSPECTION = env_bool("LIVEKIT_TTS_SOURCE_INSPECTION", False)
 HUME_DIRECT_API_TTS = env_bool("HUME_DIRECT_API_TTS", False)
+# Trailing silence (ms) appended after TTS audio so a client/WebRTC buffer drop at the
+# speaking->listening transition trims silence instead of the final word/breath.
+# 0 disables the hold (pure passthrough). Clamped to a sane ceiling.
+TTS_POST_SPEECH_HOLD_MS = env_int_clamped("TTS_POST_SPEECH_HOLD_MS", 0, 0, 5000)
 RUN_DB_MIGRATIONS_ON_STARTUP = env_bool("RUN_DB_MIGRATIONS_ON_STARTUP", False)
 ENABLE_FIXED_GREETING = env_bool("ENABLE_FIXED_GREETING", True)
 GREETING_TEXT = (os.getenv("GREETING_TEXT") or "Yo. What’s going on?").strip() or "Yo. What’s going on?"
