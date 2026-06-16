@@ -38,7 +38,7 @@ from internet_search import (
 )
 from audiointeraction_shadow import AudioInteractionShadow, audiointeraction_mode, build_shadow_from_env
 from hume_evi_bridge import run_hume_evi_bridge, voice_engine
-from interaction_state import TURN_KIND_ACTION, InteractionStateMachine, classify_turn_kind
+from interaction_state import ASSISTANT_THINKING, TOOL_CALL_PENDING, TURN_KIND_ACTION, InteractionStateMachine, classify_turn_kind
 from memory_layer import MemoryLayer, identity_from_metadata, memory_enabled
 from runtime_context import RuntimeContext, answer_datetime_intent, detect_datetime_intent, runtime_context_from_metadata
 from transcript_context import (
@@ -207,6 +207,12 @@ _current_turn_search_allowed_reason = "not_evaluated"
 _current_turn_policy_classification = "UNKNOWN"
 _current_turn_policy_decision = "COMMIT_NOW"
 _current_turn_audio_unclear = False
+# Handoff guard: tracks a user barge-in that begins while the assistant is still
+# thinking (no assistant audio yet), so a stale pending reply can be suppressed
+# before it reaches TTS. Only a sustained "real" utterance latches confirmed.
+_barge_in_during_thinking_turn_id = 0
+_barge_in_started_at = 0.0
+_barge_in_confirmed_real = False
 _interaction_state = InteractionStateMachine()
 _active_memory_layer: MemoryLayer | None = None
 _audiointeraction_shadow: AudioInteractionShadow | None = None
@@ -1578,6 +1584,7 @@ def attach_session_diagnostics(session: AgentSession) -> None:
     def _on_user_state_changed(state: object) -> None:
         nonlocal latest_user_state, latest_user_state_timestamp, pending_user_handoff_speech_id, last_user_speaking_at, last_user_listening_at
         global _latest_user_state_for_greeting, _latest_user_state_changed_at, _latest_user_speaking_at
+        global _barge_in_during_thinking_turn_id, _barge_in_started_at, _barge_in_confirmed_real
         latest_user_state = _extract_user_new_state(state)
         latest_user_state_timestamp = time.monotonic()
         _latest_user_state_for_greeting = latest_user_state
@@ -1588,9 +1595,49 @@ def attach_session_diagnostics(session: AgentSession) -> None:
         if latest_user_state == "listening":
             last_user_listening_at = latest_user_state_timestamp
         if latest_user_state == "speaking":
+            pre_state = _interaction_state.state
             _interaction_state.on_user_speech_started()
+            # Latch a barge-in that begins while the assistant is still thinking
+            # (no audio yet) so a stale pending reply can be suppressed before TTS.
+            # Once audio has started (ASSISTANT_SPEAKING) the normal interruption
+            # path owns it, so we do not latch then.
+            if LLM_TO_TTS_HANDOFF_GUARD_ENABLED and pre_state in (ASSISTANT_THINKING, TOOL_CALL_PENDING):
+                _barge_in_during_thinking_turn_id = _current_turn_id
+                _barge_in_started_at = latest_user_state_timestamp
+                _barge_in_confirmed_real = False
+                logger.info(
+                    "handoff_guard_barge_in_observed=true turn_id=%s pre_state=%s",
+                    _current_turn_id,
+                    pre_state,
+                )
         elif latest_user_state == "listening":
             _interaction_state.on_user_speech_stopped()
+            # Confirm the barge-in as a real utterance only if it was sustained;
+            # discard brief VAD blips so a cough never suppresses a wanted reply.
+            if (
+                LLM_TO_TTS_HANDOFF_GUARD_ENABLED
+                and _barge_in_during_thinking_turn_id == _current_turn_id
+                and _barge_in_started_at > 0
+            ):
+                speech_ms = (latest_user_state_timestamp - _barge_in_started_at) * 1000.0
+                if speech_ms >= HANDOFF_GUARD_MIN_SPEECH_MS:
+                    _barge_in_confirmed_real = True
+                    logger.info(
+                        "handoff_guard_barge_in_confirmed=true turn_id=%s speech_ms=%.0f min_ms=%s",
+                        _current_turn_id,
+                        speech_ms,
+                        HANDOFF_GUARD_MIN_SPEECH_MS,
+                    )
+                else:
+                    logger.info(
+                        "handoff_guard_barge_in_discarded=true turn_id=%s speech_ms=%.0f min_ms=%s reason=below_min_speech",
+                        _current_turn_id,
+                        speech_ms,
+                        HANDOFF_GUARD_MIN_SPEECH_MS,
+                    )
+                    _barge_in_during_thinking_turn_id = 0
+                    _barge_in_started_at = 0.0
+                    _barge_in_confirmed_real = False
         logger.info("User state changed: state=%s assistant_active_count=%s", state, len(active_speech_handles))
         if latest_user_state == "speaking" and pending_user_handoff_speech_id is not None:
             previous_speech_id = pending_user_handoff_speech_id
@@ -1804,6 +1851,31 @@ if "zoned out" in LLM_FALLBACK_RESPONSE.lower():
     logger.warning("generic fallback uses forbidden wording; replacing configured fallback generic_fallback_forbidden_phrase=true")
     LLM_FALLBACK_RESPONSE = "One second — I’m catching up."
 LLM_TO_TTS_HANDOFF_GUARD_ENABLED = env_bool("LLM_TO_TTS_HANDOFF_GUARD_ENABLED", False)
+# Minimum sustained barge-in speech (ms) during ASSISTANT_THINKING before the
+# handoff guard treats it as a real new utterance and suppresses the stale reply.
+# Filters coughs/VAD blips. Only consulted when the guard is enabled.
+HANDOFF_GUARD_MIN_SPEECH_MS = env_int_clamped("HANDOFF_GUARD_MIN_SPEECH_MS", 350, 0, 5000)
+
+
+def _handoff_guard_should_suppress(turn_id: int) -> tuple[bool, str]:
+    """Decide whether a pending reply for ``turn_id`` should be dropped before TTS.
+
+    Returns (suppress, reason). True only when the handoff guard is enabled and a
+    user barge-in began while the assistant was still thinking (no audio yet) for
+    this same turn, and that barge-in qualifies as a real utterance — either
+    already confirmed sustained on speech-stop, or still ongoing past the minimum
+    speech threshold. Brief VAD blips never qualify.
+    """
+    if not LLM_TO_TTS_HANDOFF_GUARD_ENABLED:
+        return False, "guard_disabled"
+    if _barge_in_during_thinking_turn_id == 0 or _barge_in_during_thinking_turn_id != turn_id:
+        return False, "no_barge_in_for_turn"
+    elapsed_ms = (time.monotonic() - _barge_in_started_at) * 1000.0 if _barge_in_started_at > 0 else 0.0
+    if _barge_in_confirmed_real or elapsed_ms >= HANDOFF_GUARD_MIN_SPEECH_MS:
+        return True, f"real_barge_in_during_thinking:elapsed_ms={elapsed_ms:.0f}:min_ms={HANDOFF_GUARD_MIN_SPEECH_MS}"
+    return False, f"barge_in_below_min_speech:elapsed_ms={elapsed_ms:.0f}:min_ms={HANDOFF_GUARD_MIN_SPEECH_MS}"
+
+
 CONTEXT_WINDOW_TURNS = env_int_clamped("CONTEXT_WINDOW_TURNS", 10, 4, 100)
 PREEMPTIVE_GENERATION_ENABLED = env_bool("PREEMPTIVE_GENERATION_ENABLED", False)
 SEARCH_BRIDGE_MIN_DELAY_SECONDS = float(os.getenv("SEARCH_BRIDGE_MIN_DELAY_SECONDS", "0.75") or "0.75")
@@ -3858,13 +3930,30 @@ class LucyAgent(Agent):
                 global _last_tts_received_text_hash, _last_tts_text_length, _last_tts_sentence_end_count, _last_tts_raw_chunk_count, _last_tts_normalized_yield_count, _last_tts_first_input_at
                 chunks: list[str] = []
                 count = 0
+                yielded_any = False
+                suppressed = False
                 try:
                     async for chunk in text:
                         count += 1
                         if _last_tts_first_input_at is None:
                             _last_tts_first_input_at = time.monotonic()
+                        # Before any audio is produced, drop the whole reply if the
+                        # user resumed with a real utterance during thinking. Once a
+                        # chunk has been yielded, the normal interruption path owns it.
+                        if not yielded_any and not suppressed:
+                            sup, sup_reason = _handoff_guard_should_suppress(_current_turn_id)
+                            if sup:
+                                suppressed = True
+                                logger.warning(
+                                    "stale_thinking_response_suppressed=true tts_path=passthrough turn_id=%s reason=%s",
+                                    _current_turn_id,
+                                    sup_reason,
+                                )
+                        if suppressed:
+                            continue  # drain the source so upstream closes, yield nothing
                         if isinstance(chunk, str):
                             chunks.append(chunk)
+                        yielded_any = True
                         yield chunk
                 finally:
                     raw_text = "".join(chunks)
@@ -3994,6 +4083,17 @@ class LucyAgent(Agent):
                     len(raw_text),
                     _last_llm_stream_status,
                     _redact_sensitive_text(raw_text)[:120],
+                )
+                sanitized = ""
+            handoff_suppress, handoff_reason = _handoff_guard_should_suppress(_current_turn_id)
+            if raw_text.strip() and sanitized and handoff_suppress:
+                # User resumed with a real utterance while Arche was still thinking
+                # and no audio had started; drop the stale reply before TTS.
+                logger.warning(
+                    "stale_thinking_response_suppressed=true tts_path=normalized turn_id=%s raw_total_length=%s reason=%s",
+                    _current_turn_id,
+                    len(raw_text),
+                    handoff_reason,
                 )
                 sanitized = ""
             normalized_text = self._normalize_spoken_text(sanitized)
@@ -4797,7 +4897,13 @@ class LucyAgent(Agent):
 
     async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
         global _last_turn_committed_at, _last_llm_start_at, _last_llm_first_token_at, _last_llm_complete_at, _last_llm_stream_status, _last_llm_timeout_stage, _last_llm_fallback_response_used, _last_llm_completed_text, _last_llm_completed_text_hash, _last_llm_completed_at, _last_tts_received_text_hash, _last_user_message_text, _current_turn_id, _current_turn_transcript_intent, _current_turn_search_allowed, _current_turn_search_allowed_reason, _current_turn_policy_classification, _current_turn_policy_decision, _current_turn_audio_unclear, _held_turn_fragment_text, _held_turn_fragment_created_at, _held_turn_fragment_classification, _held_turn_fragment_incomplete
+        global _barge_in_during_thinking_turn_id, _barge_in_started_at, _barge_in_confirmed_real
         _current_turn_id = _next_turn_id()
+        # New turn committed: clear any barge-in latch from the prior turn. A stale
+        # prior reply is now covered by the existing _is_stale_llm_turn path.
+        _barge_in_during_thinking_turn_id = 0
+        _barge_in_started_at = 0.0
+        _barge_in_confirmed_real = False
         _interaction_state.begin_turn(_current_turn_id)
         _reset_search_state_for_turn(_current_turn_id)
         _last_turn_committed_at = time.monotonic()
