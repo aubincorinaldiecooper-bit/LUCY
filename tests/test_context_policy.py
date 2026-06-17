@@ -107,6 +107,93 @@ class ConversationLedgerTests(unittest.TestCase):
         self.assertEqual(agent._ledger_recent_canonical(5), [])
 
 
+class LedgerOutcomeDowngradeTests(unittest.TestCase):
+    def setUp(self):
+        agent._conversation_ledger.clear()
+
+    def tearDown(self):
+        agent._conversation_ledger.clear()
+
+    def test_reason_zero_audio(self):
+        self.assertEqual(
+            agent._ledger_downgrade_reason_for_outcome(
+                was_suppressed=False, interrupted="false", generated_bytes=0, playout_seconds=1.2
+            ),
+            "zero_audio",
+        )
+
+    def test_reason_suppressed(self):
+        self.assertEqual(
+            agent._ledger_downgrade_reason_for_outcome(
+                was_suppressed=True, interrupted="false", generated_bytes=4096, playout_seconds=1.2
+            ),
+            "suppressed",
+        )
+
+    def test_reason_interrupted(self):
+        self.assertEqual(
+            agent._ledger_downgrade_reason_for_outcome(
+                was_suppressed=False, interrupted="true", generated_bytes=4096, playout_seconds=1.2
+            ),
+            "interrupted",
+        )
+
+    def test_reason_no_playout(self):
+        self.assertEqual(
+            agent._ledger_downgrade_reason_for_outcome(
+                was_suppressed=False, interrupted="false", generated_bytes=4096, playout_seconds=-1.0
+            ),
+            "no_playout",
+        )
+
+    def test_reason_audible_returns_none(self):
+        self.assertIsNone(
+            agent._ledger_downgrade_reason_for_outcome(
+                was_suppressed=False, interrupted="false", generated_bytes=4096, playout_seconds=1.2
+            )
+        )
+
+    def test_nonempty_text_zero_audio_is_downgraded_and_excluded(self):
+        agent._ledger_append("user", "the plan", visible=True, suppressed=False, turn_id=7)
+        agent._ledger_append("assistant", "Here is the plan.", visible=True, suppressed=False, turn_id=7, provisional=True)
+        # canonical until reconciliation
+        self.assertEqual(agent._ledger_visible_canonical_count(), 2)
+        strategy = agent._ledger_downgrade_for_outcome(turn_id=7, speech_id="AS_x", reason="zero_audio")
+        self.assertEqual(strategy, "turn_id_recent")
+        recent = agent._ledger_recent_canonical(5)
+        self.assertNotIn(("assistant", "Here is the plan."), [(e["role"], e["text"]) for e in recent])
+        self.assertIn(("user", "the plan"), [(e["role"], e["text"]) for e in recent])
+
+    def test_suppressed_outcome_is_downgraded(self):
+        agent._ledger_append("assistant", "stale reply", visible=True, suppressed=False, turn_id=3, provisional=True)
+        agent._ledger_downgrade_for_outcome(turn_id=3, speech_id=None, reason="suppressed")
+        self.assertEqual(agent._ledger_recent_canonical(5), [])
+
+    def test_successful_audible_remains_canonical(self):
+        agent._ledger_append("assistant", "audible reply", visible=True, suppressed=False, turn_id=9, provisional=True)
+        # No downgrade call (reason was None) -> stays canonical.
+        recent = agent._ledger_recent_canonical(5)
+        self.assertIn(("assistant", "audible reply"), [(e["role"], e["text"]) for e in recent])
+
+    def test_speech_id_match_is_preferred(self):
+        agent._ledger_append("assistant", "older same turn", visible=True, suppressed=False, turn_id=5, speech_id=None, provisional=True)
+        agent._ledger_append("assistant", "target by speech", visible=True, suppressed=False, turn_id=5, speech_id="AS_1", provisional=True)
+        strategy = agent._ledger_downgrade_for_outcome(turn_id=5, speech_id="AS_1", reason="zero_audio")
+        self.assertEqual(strategy, "speech_id")
+        texts = [(e["role"], e["text"]) for e in agent._ledger_recent_canonical(5)]
+        self.assertIn(("assistant", "older same turn"), texts)
+        self.assertNotIn(("assistant", "target by speech"), texts)
+
+    def test_no_safe_match_logs_failure_and_does_not_corrupt_other_turns(self):
+        agent._ledger_append("assistant", "turn 1 reply", visible=True, suppressed=False, turn_id=1, provisional=True)
+        with self.assertLogs(agent.logger, level="WARNING") as captured:
+            strategy = agent._ledger_downgrade_for_outcome(turn_id=0, speech_id=None, reason="zero_audio")
+        self.assertEqual(strategy, "failed")
+        self.assertTrue(any("ledger_downgrade_match_failed=true" in line for line in captured.output))
+        # Unrelated turn is untouched.
+        self.assertIn(("assistant", "turn 1 reply"), [(e["role"], e["text"]) for e in agent._ledger_recent_canonical(5)])
+
+
 class ContextAwareFallbackTests(unittest.TestCase):
     def test_context_aware_fallback_for_contextual_timeout(self):
         with patch.object(agent, "CONTEXT_AWARE_FALLBACK_ENABLED", True):

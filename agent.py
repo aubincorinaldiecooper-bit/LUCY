@@ -1486,6 +1486,29 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                     was_suppressed,
                     len(active_speech_handles),
                 )
+                # Outcome-driven ledger reconciliation: if this assistant turn was
+                # not actually audible, downgrade its provisional ledger entry so it
+                # cannot pollute future prompt context.
+                if CONTEXT_POLICY_ENABLED:
+                    generated_bytes = getattr(hume_coverage, "byte_count", None) if hume_coverage is not None else None
+                    downgrade_reason = _ledger_downgrade_reason_for_outcome(
+                        was_suppressed=was_suppressed or was_stale,
+                        interrupted=interrupted,
+                        generated_bytes=generated_bytes,
+                        playout_seconds=speech_duration_seconds,
+                    )
+                    if downgrade_reason is not None:
+                        _ledger_downgrade_for_outcome(
+                            turn_id=done_speech_turn_id or done_speech_llm_turn_id or 0,
+                            speech_id=done_id,
+                            reason=downgrade_reason,
+                        )
+                    else:
+                        logger.info(
+                            "ledger_outcome_downgrade_applied=false speech_id=%s ledger_entry_turn_id=%s",
+                            done_id,
+                            done_speech_turn_id or "n/a",
+                        )
                 start_count = hume_request_count_at_speech_start.get(done_id, -1)
                 finish_count = hume_request_count_at_speech_finish.get(done_id, _hume_tts_request_counter)
                 hume_requests_during = finish_count - start_count if start_count >= 0 and finish_count >= 0 else -1
@@ -1687,7 +1710,26 @@ def attach_session_diagnostics(session: AgentSession) -> None:
             ledger_text = _extract_text_for_debug(target)
             interrupted_bool = str(interrupted).strip().lower() in {"true", "1", "yes"}
             is_suppressed = role_l == "assistant" and (interrupted_bool or not ledger_text.strip())
-            _ledger_append(role_l, ledger_text, visible=not is_suppressed, suppressed=is_suppressed)
+            # speech_id is not exposed on the conversation item; assistant entries
+            # are matched later by turn_id. Assistant entries are provisional until
+            # the audio outcome is reconciled at speech-finished.
+            entry_speech_id = _safe_attr(target, "speech_id", None) or None
+            _ledger_append(
+                role_l,
+                ledger_text,
+                visible=not is_suppressed,
+                suppressed=is_suppressed,
+                turn_id=_current_turn_id,
+                speech_id=entry_speech_id,
+                provisional=role_l == "assistant",
+            )
+            if role_l == "assistant":
+                logger.info(
+                    "ledger_entry_provisional=true ledger_entry_speech_id=%s ledger_entry_turn_id=%s canonical_for_context=%s",
+                    entry_speech_id or "n/a",
+                    _current_turn_id,
+                    not is_suppressed and bool(ledger_text.strip()),
+                )
         if _active_memory_layer is not None and str(role).strip().lower() == "assistant":
             _active_memory_layer.schedule_remember(
                 role="assistant",
@@ -1893,33 +1935,110 @@ def _assess_context_coherence(stt_language: str, stt_language_confidence: str, s
     return "coherent", "ok", 0.6
 
 
-def _ledger_append(role: str, text: str, *, visible: bool, suppressed: bool) -> None:
+def _ledger_append(
+    role: str,
+    text: str,
+    *,
+    visible: bool,
+    suppressed: bool,
+    turn_id: int | None = None,
+    speech_id: str | None = None,
+    provisional: bool = False,
+) -> dict:
     """Record a turn in the thin conversation ledger.
 
     canonical_for_context gates prompt injection: a turn is canonical only when it
-    is visible, not suppressed, and has real text. Non-canonical entries (stale,
-    zero-audio, interrupted, empty) are retained for audit but never injected.
+    is visible, not suppressed, and has real text. Assistant entries are added
+    provisionally and may be downgraded later by the outcome reconciliation once
+    the true audio result is known. Returns the appended entry.
     """
     canonical = bool(visible and not suppressed and (text or "").strip())
-    _conversation_ledger.append(
-        {
-            "role": role,
-            "text": text or "",
-            "visible_to_user": bool(visible),
-            "suppressed": bool(suppressed),
-            "canonical_for_context": canonical,
-        }
-    )
+    entry = {
+        "role": role,
+        "text": text or "",
+        "visible_to_user": bool(visible),
+        "suppressed": bool(suppressed),
+        "canonical_for_context": canonical,
+        "turn_id": turn_id,
+        "speech_id": speech_id,
+        "provisional": bool(provisional),
+    }
+    _conversation_ledger.append(entry)
     if len(_conversation_ledger) > 60:
         del _conversation_ledger[:-60]
+    return entry
 
 
 def _ledger_recent_canonical(n: int) -> list[dict]:
     if CONVERSATION_LEDGER_EXCLUDE_SUPPRESSED:
-        items = [entry for entry in _conversation_ledger if entry.get("canonical_for_context")]
+        items = [
+            entry
+            for entry in _conversation_ledger
+            if entry.get("canonical_for_context") and entry.get("visible_to_user") and not entry.get("suppressed")
+        ]
     else:
         items = list(_conversation_ledger)
     return items[-n:] if n > 0 else []
+
+
+def _ledger_downgrade_reason_for_outcome(
+    *,
+    was_suppressed: bool,
+    interrupted: object,
+    generated_bytes: int | None,
+    playout_seconds: float | None,
+) -> str | None:
+    """Pick a downgrade reason from the true audio outcome, or None if audible."""
+    if was_suppressed:
+        return "suppressed"
+    if str(interrupted).strip().lower() in {"true", "1", "yes"}:
+        return "interrupted"
+    if generated_bytes == 0:
+        return "zero_audio"
+    if playout_seconds is not None and playout_seconds < 0:
+        return "no_playout"
+    return None
+
+
+def _ledger_downgrade_for_outcome(*, turn_id: int | None, speech_id: str | None, reason: str) -> str:
+    """Reconcile an assistant ledger entry against its true audio outcome.
+
+    Matching: prefer speech_id, else the most recent assistant entry for the same
+    turn_id. Never guesses across turns. Returns the match strategy used
+    ("speech_id" | "turn_id_recent" | "failed").
+    """
+    target = None
+    strategy = "failed"
+    if speech_id:
+        for entry in reversed(_conversation_ledger):
+            if entry.get("role") == "assistant" and entry.get("speech_id") == speech_id:
+                target, strategy = entry, "speech_id"
+                break
+    if target is None and turn_id:
+        for entry in reversed(_conversation_ledger):
+            if entry.get("role") == "assistant" and entry.get("turn_id") == turn_id:
+                target, strategy = entry, "turn_id_recent"
+                break
+    if target is None:
+        logger.warning(
+            "ledger_downgrade_match_failed=true ledger_downgrade_match_strategy=failed ledger_downgrade_reason=%s ledger_entry_speech_id=%s ledger_entry_turn_id=%s",
+            reason,
+            speech_id or "n/a",
+            turn_id if turn_id else "n/a",
+        )
+        return "failed"
+    target["visible_to_user"] = False
+    target["suppressed"] = True
+    target["canonical_for_context"] = False
+    target["provisional"] = False
+    logger.info(
+        "ledger_outcome_downgrade_applied=true ledger_downgrade_reason=%s ledger_downgrade_match_strategy=%s canonical_for_context=false ledger_entry_turn_id=%s ledger_entry_speech_id=%s",
+        reason,
+        strategy,
+        target.get("turn_id") if target.get("turn_id") else "n/a",
+        speech_id or "n/a",
+    )
+    return strategy
 
 
 def _ledger_visible_canonical_count() -> int:
@@ -1928,6 +2047,8 @@ def _ledger_visible_canonical_count() -> int:
 
 def _ledger_suppressed_count() -> int:
     return sum(1 for entry in _conversation_ledger if entry.get("suppressed"))
+
+
 
 
 def _inject_context_window_note(turn_ctx: object, response_posture: str, recent: list[dict]) -> int:
