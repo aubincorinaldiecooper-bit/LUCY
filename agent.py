@@ -21,6 +21,10 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from livekit.agents import Agent, AgentSession, InterruptionOptions, JobContext, StopResponse, TurnHandlingOptions, WorkerOptions, cli, function_tool, room_io
+try:  # livekit-agents >= 1.6.1 exposes the audio end-of-turn detector here
+    from livekit.agents import inference as _lk_inference
+except Exception:  # pragma: no cover - older SDKs
+    _lk_inference = None
 from livekit import rtc
 from livekit.plugins import ai_coustics, deepgram, hume, mistralai, openai, silero
 from internet_search import (
@@ -38,7 +42,15 @@ from internet_search import (
 )
 from audiointeraction_shadow import AudioInteractionShadow, audiointeraction_mode, build_shadow_from_env
 from hume_evi_bridge import run_hume_evi_bridge, voice_engine
-from interaction_state import ASSISTANT_THINKING, TOOL_CALL_PENDING, TURN_KIND_ACTION, InteractionStateMachine, classify_turn_kind
+from interaction_state import (
+    ASSISTANT_THINKING,
+    TOOL_CALL_PENDING,
+    TURN_KIND_ACTION,
+    AudioEnvironmentDecision,
+    InteractionStateMachine,
+    build_audio_environment_decision,
+    classify_turn_kind,
+)
 from memory_layer import MemoryLayer, identity_from_metadata, memory_enabled
 from runtime_context import RuntimeContext, answer_datetime_intent, detect_datetime_intent, runtime_context_from_metadata
 from transcript_context import (
@@ -136,6 +148,16 @@ STT_PROVIDER = os.getenv("STT_PROVIDER", "mistral").strip().lower()
 SESSION_LANGUAGE = (os.getenv("SESSION_LANGUAGE") or os.getenv("DEEPGRAM_STT_LANGUAGE") or "en").strip() or "en"
 VAD_PROVIDER = os.getenv("VAD_PROVIDER", "ai_coustics").strip().lower()
 LIVEKIT_TURN_DETECTION_MODE = os.getenv("LIVEKIT_TURN_DETECTION_MODE", "vad").strip().lower()
+# LiveKit audio end-of-turn detector (livekit-agents >= 1.6.1: inference.TurnDetector).
+# Feature-detected at build time; if unavailable we keep the existing vad/stt mode.
+LIVEKIT_TURN_DETECTOR_ENABLED = os.getenv("LIVEKIT_TURN_DETECTOR_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+LIVEKIT_TURN_DETECTOR_VERSION = (os.getenv("LIVEKIT_TURN_DETECTOR_VERSION", "auto") or "auto").strip().lower()
+LIVEKIT_TURN_DETECTOR_UNLIKELY_THRESHOLD = (os.getenv("LIVEKIT_TURN_DETECTOR_UNLIKELY_THRESHOLD") or "").strip()
+LIVEKIT_ENDPOINTING_DYNAMIC_ENABLED = os.getenv("LIVEKIT_ENDPOINTING_DYNAMIC_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+# Inbound audio enhancement (ai-coustics / QUAIL) applied before STT/VAD/turn detection.
+LIVEKIT_AUDIO_ENHANCEMENT_ENABLED = os.getenv("LIVEKIT_AUDIO_ENHANCEMENT_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+LIVEKIT_AUDIO_ENHANCEMENT_PROVIDER = (os.getenv("LIVEKIT_AUDIO_ENHANCEMENT_PROVIDER", "ai_coustics") or "ai_coustics").strip().lower()
+LIVEKIT_AUDIO_ENHANCEMENT_MODEL = (os.getenv("LIVEKIT_AUDIO_ENHANCEMENT_MODEL", "QUAIL_VF_S") or "QUAIL_VF_S").strip()
 
 _speech_counter = 0
 _hume_tts_request_counter = 0
@@ -230,6 +252,11 @@ _barge_in_confirmed_real = False
 _conversation_ledger: list[dict] = []
 _prior_context_decision: ContextDecision | None = None
 _current_context_dependency = "none"
+# Lightweight rolling audio-environment signals (monotonic timestamps), pruned to
+# a short window. Used only for AudioEnvironmentDecision / audio-status answers.
+_recent_user_speech_start_times: list[float] = []
+_recent_turn_candidate_times: list[float] = []
+_AUDIO_ENV_WINDOW_SECONDS = 12.0
 _interaction_state = InteractionStateMachine()
 _active_memory_layer: MemoryLayer | None = None
 _audiointeraction_shadow: AudioInteractionShadow | None = None
@@ -1636,6 +1663,7 @@ def attach_session_diagnostics(session: AgentSession) -> None:
             last_user_listening_at = latest_user_state_timestamp
         if latest_user_state == "speaking":
             pre_state = _interaction_state.state
+            _record_audio_env_event("speech_start", latest_user_state_timestamp)
             _interaction_state.on_user_speech_started()
             # Latch a barge-in that begins while the assistant is still thinking
             # (no audio yet) so a stale pending reply can be suppressed before TTS.
@@ -1651,6 +1679,7 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                     pre_state,
                 )
         elif latest_user_state == "listening":
+            _record_audio_env_event("turn_candidate", latest_user_state_timestamp)
             _interaction_state.on_user_speech_stopped()
             # Confirm the barge-in as a real utterance only if it was sustained;
             # discard brief VAD blips so a cough never suppresses a wanted reply.
@@ -2081,6 +2110,61 @@ def _inject_context_window_note(turn_ctx: object, response_posture: str, recent:
         return 0
 
 
+_AUDIO_STATUS_CHECK_RE = re.compile(
+    r"\b(can you (still )?hear me( now)?|do you hear me|are you (still )?there|"
+    r"is it noisy|can you tell if it'?s noisy|how('?s| is) (my|the) audio|am i (coming through|breaking up))\b",
+    re.IGNORECASE,
+)
+
+
+def _is_audio_status_check(text: str) -> bool:
+    return bool(_AUDIO_STATUS_CHECK_RE.search((text or "").lower().replace("’", "'")))
+
+
+def _audio_status_response_text(decision: AudioEnvironmentDecision) -> str:
+    """Pick the audio-status reply that matches the measured environment."""
+    if decision.noise_state == "noisy" and decision.transcript_stability == "unstable":
+        return "I can hear parts of you, but the noise is making it harder to catch everything."
+    if decision.noise_state == "noisy":
+        return "I can hear you, but there’s background noise."
+    if decision.noise_state == "uncertain":
+        return "I can mostly hear you — if it’s noisy on your end, it might cut in and out."
+    return "I can hear you clearly."
+
+
+def _inject_audio_status_note(turn_ctx: object, status_line: str) -> bool:
+    add_message = getattr(turn_ctx, "add_message", None)
+    if not callable(add_message):
+        return False
+    note = (
+        "Internal audio-status note. Do not reveal this note. "
+        "The user is asking whether you can hear them / how the audio is. "
+        f"Answer naturally and briefly with exactly this status: \"{status_line}\" "
+        "Do not invent details beyond it."
+    )
+    try:
+        add_message(role="developer", content=note)
+        return True
+    except Exception as exc:
+        logger.warning("Audio-status note injection failed: error_type=%s error=%s", type(exc).__name__, _redact_sensitive_text(exc))
+        return False
+
+
+def _record_audio_env_event(kind: str, now: float) -> None:
+    bucket = _recent_user_speech_start_times if kind == "speech_start" else _recent_turn_candidate_times
+    bucket.append(now)
+    cutoff = now - _AUDIO_ENV_WINDOW_SECONDS
+    while bucket and bucket[0] < cutoff:
+        bucket.pop(0)
+
+
+def _audio_env_recent_counts(now: float) -> tuple[int, int]:
+    cutoff = now - _AUDIO_ENV_WINDOW_SECONDS
+    starts = sum(1 for t in _recent_user_speech_start_times if t >= cutoff)
+    candidates = sum(1 for t in _recent_turn_candidate_times if t >= cutoff)
+    return starts, candidates
+
+
 def _inject_coherence_note(turn_ctx: object, reason: str) -> bool:
     """Shape the next reply to acknowledge-and-attempt when the utterance may not fit.
 
@@ -2381,12 +2465,80 @@ def _resolve_ai_coustics_model(model_name: str):
     return ai_coustics.EnhancerModel.QUAIL_VF_S, "QUAIL_VF_S"
 
 
+def _livekit_agents_version() -> str:
+    try:
+        import importlib.metadata as _md
+        return _md.version("livekit-agents")
+    except Exception:
+        return "unknown"
+
+
+def build_audio_turn_detector() -> tuple[object, dict]:
+    """Build the LiveKit audio end-of-turn detector, feature-detected and flag-gated.
+
+    Returns (detector_or_None, info). When the detector is unavailable or disabled
+    we return None and the caller keeps the existing vad/stt turn_detection mode,
+    so this is safe on SDKs without inference.TurnDetector.
+    """
+    info: dict = {
+        "available": _lk_inference is not None and hasattr(_lk_inference, "TurnDetector"),
+        "enabled": LIVEKIT_TURN_DETECTOR_ENABLED,
+        "class": "none",
+        "version": LIVEKIT_TURN_DETECTOR_VERSION,
+        "default_selection": "auto(sdk: v1 via LiveKit Inference, else v1-mini local)"
+        if LIVEKIT_TURN_DETECTOR_VERSION in ("", "auto")
+        else LIVEKIT_TURN_DETECTOR_VERSION,
+        "fallback_used": False,
+        "error": "none",
+    }
+    if not LIVEKIT_TURN_DETECTOR_ENABLED:
+        info["error"] = "disabled_by_config"
+        return None, info
+    if not info["available"]:
+        info["fallback_used"] = True
+        info["error"] = f"inference.TurnDetector unavailable in livekit-agents {_livekit_agents_version()} (needs >=1.6.1)"
+        return None, info
+    kwargs: dict = {}
+    if LIVEKIT_TURN_DETECTOR_VERSION not in ("", "auto"):
+        kwargs["version"] = LIVEKIT_TURN_DETECTOR_VERSION
+    if LIVEKIT_TURN_DETECTOR_UNLIKELY_THRESHOLD:
+        try:
+            kwargs["unlikely_threshold"] = float(LIVEKIT_TURN_DETECTOR_UNLIKELY_THRESHOLD)
+        except ValueError:
+            logger.warning("Invalid LIVEKIT_TURN_DETECTOR_UNLIKELY_THRESHOLD=%s; ignoring", LIVEKIT_TURN_DETECTOR_UNLIKELY_THRESHOLD)
+    try:
+        detector = _lk_inference.TurnDetector(**kwargs)
+        info["class"] = type(detector).__name__
+        return detector, info
+    except Exception as exc:
+        info["fallback_used"] = True
+        info["error"] = f"{type(exc).__name__}: {_redact_sensitive_text(exc)}"
+        logger.warning("LiveKit audio TurnDetector init failed; keeping vad/stt mode: %s", info["error"])
+        return None, info
+
+
 def build_room_options() -> room_io.RoomOptions | None:
-    if not AI_COUSTICS_ENABLED:
-        logger.info("ai-coustics disabled: AI_COUSTICS_ENABLED=false")
+    # Inbound audio enhancement is applied at the room audio_input stage, i.e.
+    # BEFORE STT / VAD / turn detection. AI_COUSTICS_ENABLED remains the master
+    # switch; LIVEKIT_AUDIO_ENHANCEMENT_* are the canonical config names.
+    enabled = LIVEKIT_AUDIO_ENHANCEMENT_ENABLED and AI_COUSTICS_ENABLED
+    model_name_cfg = LIVEKIT_AUDIO_ENHANCEMENT_MODEL or os.getenv("AI_COUSTICS_MODEL", "QUAIL_VF_S")
+    if not enabled:
+        logger.info(
+            "audio_enhancement_enabled=false audio_enhancement_provider=%s audio_enhancement_model=%s audio_enhancement_applied_stage=none audio_enhancement_error=disabled_by_config",
+            LIVEKIT_AUDIO_ENHANCEMENT_PROVIDER,
+            model_name_cfg,
+        )
+        return None
+    if LIVEKIT_AUDIO_ENHANCEMENT_PROVIDER not in ("ai_coustics", "ai-coustics"):
+        logger.warning(
+            "audio_enhancement_enabled=true audio_enhancement_provider=%s audio_enhancement_model=%s audio_enhancement_applied_stage=none audio_enhancement_error=unsupported_provider_only_ai_coustics_supported",
+            LIVEKIT_AUDIO_ENHANCEMENT_PROVIDER,
+            model_name_cfg,
+        )
         return None
 
-    selected_model, selected_model_name = _resolve_ai_coustics_model(os.getenv("AI_COUSTICS_MODEL", "QUAIL_VF_S"))
+    selected_model, selected_model_name = _resolve_ai_coustics_model(model_name_cfg)
     raw_level = os.getenv("AI_COUSTICS_ENHANCEMENT_LEVEL", "0.8")
     try:
         enhancement_level = float(raw_level)
@@ -2394,13 +2546,6 @@ def build_room_options() -> room_io.RoomOptions | None:
         logger.warning("Invalid AI_COUSTICS_ENHANCEMENT_LEVEL=%s. Falling back to 0.8", raw_level)
         enhancement_level = 0.8
     enhancement_level = max(0.0, min(1.0, enhancement_level))
-
-    logger.info(
-        "ai-coustics configuration: enabled=%s model=%s enhancement_level=%s",
-        True,
-        selected_model_name,
-        enhancement_level,
-    )
 
     try:
         if hasattr(ai_coustics, "ModelParameters"):
@@ -2412,7 +2557,19 @@ def build_room_options() -> room_io.RoomOptions | None:
     except TypeError as e:
         logger.warning("ai-coustics model_parameters unsupported in installed package, using model-only enhancement: %s", e)
         enhancer = ai_coustics.audio_enhancement(model=selected_model)
+    except Exception as e:
+        logger.error(
+            "audio_enhancement_enabled=true audio_enhancement_provider=ai_coustics audio_enhancement_model=%s audio_enhancement_applied_stage=failed audio_enhancement_error=%s",
+            selected_model_name,
+            f"{type(e).__name__}: {_redact_sensitive_text(e)}",
+        )
+        return None
 
+    logger.info(
+        "audio_enhancement_enabled=true audio_enhancement_provider=ai_coustics audio_enhancement_model=%s audio_enhancement_applied_stage=inbound_pre_stt_vad_turndetection enhancement_level=%s audio_enhancement_error=none",
+        selected_model_name,
+        enhancement_level,
+    )
     return room_io.RoomOptions(
         audio_input=room_io.AudioInputOptions(
             noise_cancellation=enhancer,
@@ -5425,6 +5582,29 @@ class LucyAgent(Agent):
         _inject_response_mode_note(turn_ctx, _interaction_state.turn_kind, _current_turn_transcript_intent)
         if context_fit == "low_coherence":
             _inject_coherence_note(turn_ctx, coherence_reason)
+        if _is_audio_status_check(_last_user_message_text):
+            _audio_now = time.monotonic()
+            _starts, _candidates = _audio_env_recent_counts(_audio_now)
+            audio_env = build_audio_environment_decision(
+                false_speech_start_count_recent=_starts,
+                candidate_turn_count_recent=_candidates,
+                short_noisy_fragment_detected=len(_last_user_message_text.split()) <= 3 and _current_turn_audio_unclear,
+                is_audio_status_check=True,
+            )
+            logger.info(
+                "audio_environment_decision noise_state=%s noise_confidence=%.2f speech_stability=%s transcript_stability=%s false_speech_start_count_recent=%s candidate_turn_count_recent=%s short_noisy_fragment_detected=%s action_hint=%s reason=%s turn_id=%s",
+                audio_env.noise_state,
+                audio_env.noise_confidence,
+                audio_env.speech_stability,
+                audio_env.transcript_stability,
+                audio_env.false_speech_start_count_recent,
+                audio_env.candidate_turn_count_recent,
+                audio_env.short_noisy_fragment_detected,
+                audio_env.action_hint,
+                audio_env.reason,
+                _current_turn_id,
+            )
+            _inject_audio_status_note(turn_ctx, _audio_status_response_text(audio_env))
         if (
             context_decision is not None
             and CONTEXT_FORCE_LOCAL_INJECTION
@@ -5908,11 +6088,28 @@ async def entrypoint(ctx: JobContext):
     }
 
     preemptive_generation_options = {"enabled": PREEMPTIVE_GENERATION_ENABLED}
+    _audio_turn_detector, _audio_turn_detector_info = build_audio_turn_detector()
+    logger.info(
+        "livekit_agents_version=%s livekit_turn_detector_available=%s livekit_turn_detector_enabled=%s turn_detector_class=%s turn_detector_version=%s turn_detector_default_selection=%s turn_detector_fallback_used=%s turn_detector_error=%s",
+        _livekit_agents_version(),
+        _audio_turn_detector_info["available"],
+        _audio_turn_detector_info["enabled"],
+        _audio_turn_detector_info["class"],
+        _audio_turn_detector_info["version"],
+        _audio_turn_detector_info["default_selection"],
+        _audio_turn_detector_info["fallback_used"],
+        _audio_turn_detector_info["error"],
+    )
+
+    def _td(default_mode: str):
+        return _audio_turn_detector if _audio_turn_detector is not None else default_mode
+
+    _td_active = _audio_turn_detector is not None
     resolved_turn_detection_mode = "unknown"
     if STT_PROVIDER == "deepgram_flux":
         if resolved_livekit_turn_detection_mode == "stt":
             session_kwargs["turn_handling"] = TurnHandlingOptions(
-                turn_detection="stt",
+                turn_detection=_td("stt"),
                 interruption=interruption_options,
                 preemptive_generation=preemptive_generation_options,
             )
@@ -5921,7 +6118,7 @@ async def entrypoint(ctx: JobContext):
         elif resolved_livekit_turn_detection_mode == "vad":
             try:
                 session_kwargs["turn_handling"] = TurnHandlingOptions(
-                    turn_detection="vad",
+                    turn_detection=_td("vad"),
                     interruption=interruption_options,
                     preemptive_generation=preemptive_generation_options,
                 )
@@ -5930,7 +6127,7 @@ async def entrypoint(ctx: JobContext):
             except Exception as e:
                 logger.warning("VAD turn_detection mode unavailable in this LiveKit version, falling back to stt: %s", e)
                 session_kwargs["turn_handling"] = TurnHandlingOptions(
-                    turn_detection="stt",
+                    turn_detection=_td("stt"),
                     interruption=interruption_options,
                     preemptive_generation=preemptive_generation_options,
                 )
@@ -5950,7 +6147,7 @@ async def entrypoint(ctx: JobContext):
         )
     elif STT_PROVIDER == "mistral":
         session_kwargs["turn_handling"] = TurnHandlingOptions(
-            turn_detection="vad",
+            turn_detection=_td("vad"),
             interruption=interruption_options,
             endpointing={
                 "mode": endpointing_mode,
@@ -5963,13 +6160,23 @@ async def entrypoint(ctx: JobContext):
         logger.info("Using Mistral VAD-only turn handling")
     else:
         session_kwargs["turn_handling"] = TurnHandlingOptions(
-            turn_detection="vad",
+            turn_detection=_td("vad"),
             interruption=interruption_options,
             preemptive_generation=preemptive_generation_options,
         )
         resolved_turn_detection_mode = "vad"
         logger.info("Using non-Flux VAD turn handling")
 
+    if _td_active:
+        resolved_turn_detection_mode = "livekit_audio_turn_detector"
+    logger.info(
+        "turn_detection_resolved=%s livekit_turn_detector_active=%s turn_detector_version_active=%s turn_detector_fallback_used=%s endpointing_dynamic_enabled=%s text_turn_detector_used=false",
+        resolved_turn_detection_mode,
+        _td_active,
+        _audio_turn_detector_info["version"] if _td_active else "n/a",
+        _audio_turn_detector_info["fallback_used"],
+        LIVEKIT_ENDPOINTING_DYNAMIC_ENABLED,
+    )
     session_kwargs["preemptive_generation"] = PREEMPTIVE_GENERATION_ENABLED
     logger.info(
         "Preemptive generation config: preemptive_generation_enabled=%s context_or_tools_mutate=%s",

@@ -23,6 +23,7 @@ Log lines to search in Railway:
 
 import logging
 import time
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +86,93 @@ EXPECTED_TRANSITIONS: dict[str, set[str]] = {
     USER_INTERRUPTING: {USER_TURN_CANDIDATE, USER_SPEAKING, LISTENING, COMMITTED_TURN, HOLDING_FRAGMENT, RECOVERY},
     RECOVERY: {ASSISTANT_THINKING, ASSISTANT_SPEAKING, LISTENING, USER_SPEAKING},
 }
+
+
+@dataclass(slots=True)
+class AudioEnvironmentDecision:
+    noise_state: str  # clean | noisy | uncertain
+    noise_confidence: float
+    speech_stability: str  # stable | unstable | unknown
+    transcript_stability: str  # stable | unstable | unknown
+    false_speech_start_count_recent: int
+    candidate_turn_count_recent: int
+    short_noisy_fragment_detected: bool
+    action_hint: str  # normal | hold | ask_repair | audio_status
+    reason: str
+
+
+def build_audio_environment_decision(
+    *,
+    false_speech_start_count_recent: int = 0,
+    candidate_turn_count_recent: int = 0,
+    short_noisy_fragment_detected: bool = False,
+    unstable_partial_transcripts: bool = False,
+    low_final_transcript_rate: bool = False,
+    snr_db: float | None = None,
+    is_audio_status_check: bool = False,
+) -> AudioEnvironmentDecision:
+    """Lightweight, deterministic audio/noise state from existing pipeline signals.
+
+    Heuristic by design (no biometric/speaker work): repeated false speech starts,
+    churn of turn candidates, short noisy fragments, and unstable/low transcripts
+    indicate a noisy or unstable environment. An explicit SNR reading, when
+    available, takes precedence.
+    """
+    instability = 0
+    if false_speech_start_count_recent >= 3:
+        instability += 1
+    if candidate_turn_count_recent >= 3:
+        instability += 1
+    if short_noisy_fragment_detected:
+        instability += 1
+    if unstable_partial_transcripts:
+        instability += 1
+    if low_final_transcript_rate:
+        instability += 1
+
+    speech_stability = "unstable" if (false_speech_start_count_recent >= 3 or candidate_turn_count_recent >= 4) else "stable"
+    transcript_stability = "unstable" if (unstable_partial_transcripts or low_final_transcript_rate) else "stable"
+
+    if snr_db is not None:
+        if snr_db >= 18.0:
+            noise_state, noise_confidence = "clean", 0.85
+        elif snr_db < 8.0:
+            noise_state, noise_confidence = "noisy", 0.85
+        else:
+            noise_state, noise_confidence = "uncertain", 0.5
+    elif instability >= 3:
+        noise_state, noise_confidence = "noisy", min(0.5 + 0.1 * instability, 0.9)
+    elif instability == 0:
+        noise_state, noise_confidence = "clean", 0.7
+    else:
+        noise_state, noise_confidence = "uncertain", 0.5
+
+    if is_audio_status_check:
+        action_hint = "audio_status"
+    elif noise_state == "noisy" and transcript_stability == "unstable":
+        action_hint = "ask_repair"
+    elif noise_state == "noisy":
+        action_hint = "hold"
+    else:
+        action_hint = "normal"
+
+    reason = (
+        f"instability={instability} false_starts={false_speech_start_count_recent} "
+        f"candidates={candidate_turn_count_recent} short_fragment={short_noisy_fragment_detected} "
+        f"unstable_partials={unstable_partial_transcripts} low_finals={low_final_transcript_rate} "
+        f"snr_db={'n/a' if snr_db is None else round(snr_db, 1)}"
+    )
+    return AudioEnvironmentDecision(
+        noise_state=noise_state,
+        noise_confidence=round(noise_confidence, 2),
+        speech_stability=speech_stability,
+        transcript_stability=transcript_stability,
+        false_speech_start_count_recent=false_speech_start_count_recent,
+        candidate_turn_count_recent=candidate_turn_count_recent,
+        short_noisy_fragment_detected=short_noisy_fragment_detected,
+        action_hint=action_hint,
+        reason=reason,
+    )
 
 
 def classify_turn_kind(detected_intent: str | None, policy_classification: str | None, policy_decision: str | None) -> str:
