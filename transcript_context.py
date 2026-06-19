@@ -87,26 +87,66 @@ def _int_env_ms(name: str, default: int, *, fallback_env: str | None = None) -> 
         return default
 
 
+def _timeout_with_source(candidates: list[tuple[str, str]], default_ms: int) -> tuple[int, str]:
+    """Resolve a classifier timeout by precedence, reporting which knob won.
+
+    candidates is an ordered list of (env_var_name, source_label); the first one
+    that is set to a valid value wins. Falls back to (default_ms, "default").
+    """
+    for env_name, source in candidates:
+        raw = os.getenv(env_name)
+        if raw is None:
+            continue
+        try:
+            return max(1, min(int(raw), 5000)), source
+        except Exception:
+            continue
+    return default_ms, "default"
+
+
+# Precedence for the normal-turn classifier timeout: the clear new var first,
+# then the legacy var, then the code default.
+def normal_context_classifier_timeout() -> tuple[int, str]:
+    return _timeout_with_source(
+        [
+            ("NORMAL_CONTEXT_CLASSIFIER_MAX_WAIT_MS", "normal_env"),
+            ("TRANSCRIPT_CONTEXT_LLM_TIMEOUT_MS", "legacy_env"),
+        ],
+        500,
+    )
+
+
+# Precedence for the tool-revalidation classifier timeout: the tool var first,
+# then the normal var, then the legacy var, then the code default.
+def tool_revalidation_context_classifier_timeout() -> tuple[int, str]:
+    return _timeout_with_source(
+        [
+            ("TOOL_REVALIDATION_CONTEXT_CLASSIFIER_MAX_WAIT_MS", "tool_env"),
+            ("NORMAL_CONTEXT_CLASSIFIER_MAX_WAIT_MS", "normal_env"),
+            ("TRANSCRIPT_CONTEXT_LLM_TIMEOUT_MS", "legacy_env"),
+        ],
+        1000,
+    )
+
+
 def normal_context_classifier_max_wait_ms() -> int:
     """How long to wait for the classifier on a normal (low-risk) turn.
 
-    A timeout here only loses optional enrichment, so the turn proceeds on the
-    deterministic result. Falls back to the legacy timeout env for compatibility.
+    Primary knob: NORMAL_CONTEXT_CLASSIFIER_MAX_WAIT_MS; legacy fallback:
+    TRANSCRIPT_CONTEXT_LLM_TIMEOUT_MS; then the code default. A timeout here only
+    loses optional enrichment, so the turn proceeds on the deterministic result.
     """
-    return _int_env_ms(
-        "NORMAL_CONTEXT_CLASSIFIER_MAX_WAIT_MS",
-        500,
-        fallback_env="TRANSCRIPT_CONTEXT_LLM_TIMEOUT_MS",
-    )
+    return normal_context_classifier_timeout()[0]
 
 
 def tool_revalidation_context_classifier_max_wait_ms() -> int:
     """How long to wait for the classifier on a high-risk tool/search handoff.
 
-    The user is already waiting on a tool result, so we can afford a longer wait
-    to classify the barge-in reliably rather than failing open.
+    Primary knob: TOOL_REVALIDATION_CONTEXT_CLASSIFIER_MAX_WAIT_MS; falls back to
+    the normal var, then the legacy var, then the code default. The user is
+    already waiting on a tool result, so we can afford a longer wait.
     """
-    return _int_env_ms("TOOL_REVALIDATION_CONTEXT_CLASSIFIER_MAX_WAIT_MS", 1000)
+    return tool_revalidation_context_classifier_timeout()[0]
 
 
 def require_context_resolution_for_tool_authority() -> bool:
@@ -482,6 +522,7 @@ async def interpret_transcript_context(
     *,
     recent_turns: Sequence[str] | None = None,
     runtime_context: str | None = None,
+    max_wait_ms: int | None = None,
     llm_caller: Callable[[TranscriptContext], Awaitable[TranscriptContext]] | None = None,
 ) -> TranscriptContext:
     deterministic = detect_transcript_context(text)
@@ -494,9 +535,13 @@ async def interpret_transcript_context(
             return await call_transcript_context_llm(ctx, recent_turns=recent_turns, runtime_context=runtime_context)
         caller = _default_caller
 
+    # Normal-turn path: NORMAL_CONTEXT_CLASSIFIER_MAX_WAIT_MS is the primary knob
+    # (legacy TRANSCRIPT_CONTEXT_LLM_TIMEOUT_MS remains a backward-compatible
+    # fallback inside normal_context_classifier_max_wait_ms()).
+    wait_ms = max_wait_ms if max_wait_ms is not None else normal_context_classifier_max_wait_ms()
     task = asyncio.create_task(caller(deterministic))
     try:
-        result = await asyncio.wait_for(task, timeout=transcript_context_llm_timeout_ms() / 1000)
+        result = await asyncio.wait_for(task, timeout=max(wait_ms / 1000, 0.01))
         return result
     except TimeoutError:
         task.cancel()
@@ -519,6 +564,9 @@ CONTEXT_RESOLUTION_SOURCES = {"llm", "deterministic", "timeout"}
 _DETERMINISTIC_UNSAFE_INTENTS = {None, "unknown", "unclear_fragment", "numeric_fragment"}
 
 
+CONTEXT_CLASSIFIER_PATHS = {"normal_turn", "tool_revalidation"}
+
+
 @dataclass(slots=True)
 class ContextResolution:
     context: TranscriptContext
@@ -526,6 +574,9 @@ class ContextResolution:
     resolution_source: str   # llm | deterministic | timeout
     timed_out: bool
     classifier_path: str = "deterministic"  # llm | deterministic | timeout
+    timeout_ms: int = 0      # the wait budget actually applied
+    timeout_source: str = "default"  # normal_env | tool_env | legacy_env | default | explicit
+    path: str = "normal_turn"  # normal_turn | tool_revalidation
 
 
 def deterministic_is_clearly_safe(context: TranscriptContext) -> bool:
@@ -543,6 +594,7 @@ async def resolve_transcript_context(
     *,
     recent_turns: Sequence[str] | None = None,
     runtime_context: str | None = None,
+    path: str = "normal_turn",
     max_wait_ms: int | None = None,
     high_risk: bool = False,
     llm_caller: Callable[[TranscriptContext], Awaitable[TranscriptContext]] | None = None,
@@ -553,14 +605,30 @@ async def resolve_transcript_context(
     deterministic evidence is clearly safe; the caller is expected to fail safe.
     For a normal turn, a timeout degrades to the deterministic result and the
     turn proceeds (timeouts protect latency, they do not grant authority).
+
+    The timeout is resolved by `path` precedence (normal vs tool revalidation) and
+    its source is reported so logs show which env knob won. An explicit
+    `max_wait_ms` overrides the precedence and is reported as source "explicit".
     """
     deterministic = detect_transcript_context(text)
     clearly_safe = deterministic_is_clearly_safe(deterministic)
 
+    if max_wait_ms is not None:
+        wait_ms, timeout_source = max_wait_ms, "explicit"
+    elif path == "tool_revalidation":
+        wait_ms, timeout_source = tool_revalidation_context_classifier_timeout()
+    else:
+        wait_ms, timeout_source = normal_context_classifier_timeout()
+
+    def _mk(ctx_out: TranscriptContext, resolution: str, source: str, timed_out: bool, classifier_path: str) -> ContextResolution:
+        return ContextResolution(
+            ctx_out, resolution, source, timed_out, classifier_path, wait_ms, timeout_source, path
+        )
+
     if not transcript_context_llm_enabled():
         if clearly_safe:
-            return ContextResolution(deterministic, "deterministic_safe", "deterministic", False, "deterministic")
-        return ContextResolution(
+            return _mk(deterministic, "deterministic_safe", "deterministic", False, "deterministic")
+        return _mk(
             deterministic,
             "unresolved" if high_risk else "deterministic_safe",
             "deterministic",
@@ -568,7 +636,6 @@ async def resolve_transcript_context(
             "deterministic",
         )
 
-    wait_ms = max_wait_ms if max_wait_ms is not None else normal_context_classifier_max_wait_ms()
     caller = llm_caller
     if caller is None:
         async def _default_caller(ctx: TranscriptContext) -> TranscriptContext:
@@ -578,18 +645,18 @@ async def resolve_transcript_context(
     task = asyncio.create_task(caller(deterministic))
     try:
         result = await asyncio.wait_for(task, timeout=max(wait_ms / 1000, 0.01))
-        return ContextResolution(result, "resolved", "llm", False, "llm")
+        return _mk(result, "resolved", "llm", False, "llm")
     except TimeoutError:
         task.cancel()
         ctx = with_source(deterministic, "deterministic_timeout_fallback")
         if clearly_safe:
-            return ContextResolution(ctx, "deterministic_safe", "timeout", True, "timeout")
-        return ContextResolution(ctx, "unresolved", "timeout", True, "timeout")
+            return _mk(ctx, "deterministic_safe", "timeout", True, "timeout")
+        return _mk(ctx, "unresolved", "timeout", True, "timeout")
     except Exception:
         ctx = with_source(deterministic, "deterministic_llm_error_fallback")
         if clearly_safe:
-            return ContextResolution(ctx, "deterministic_safe", "deterministic", False, "deterministic")
-        return ContextResolution(
+            return _mk(ctx, "deterministic_safe", "deterministic", False, "deterministic")
+        return _mk(
             ctx,
             "unresolved" if high_risk else "deterministic_safe",
             "deterministic",

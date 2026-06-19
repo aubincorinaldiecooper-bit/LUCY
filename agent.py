@@ -70,6 +70,7 @@ from transcript_context import (
     decide_tool_result_resume,
     detect_transcript_context,
     interpret_transcript_context,
+    normal_context_classifier_timeout,
     query_materially_changed,
     require_context_resolution_for_tool_authority,
     resolve_transcript_context,
@@ -468,7 +469,7 @@ async def _revalidate_pending_tool_result(
         newer_utterance,
         recent_turns=recent_turns,
         runtime_context=None,
-        max_wait_ms=tool_revalidation_context_classifier_max_wait_ms(),
+        path="tool_revalidation",
         high_risk=True,
     )
     resolution = resolution_info.resolution
@@ -476,7 +477,11 @@ async def _revalidate_pending_tool_result(
     classifier_path = resolution_info.classifier_path
     require_resolution = require_context_resolution_for_tool_authority()
     additive_min = tool_revalidation_additive_min_dependency()
-    revalidation_timeout_ms = tool_revalidation_context_classifier_max_wait_ms()
+    # Timeout + its winning env source are reported by the resolver so the log is
+    # unambiguous about which knob applied.
+    revalidation_timeout_ms = resolution_info.timeout_ms
+    timeout_source = resolution_info.timeout_source
+    context_classifier_path = resolution_info.path
     layer_enabled = transcript_context_layer_enabled()
     llm_enabled = transcript_context_llm_enabled()
     classifier_model = transcript_context_llm_model() if llm_enabled else "deterministic"
@@ -519,7 +524,9 @@ async def _revalidate_pending_tool_result(
         "transcript_context_layer_enabled=%s transcript_context_llm_enabled=%s "
         "tool_revalidation_classifier_path=%s tool_revalidation_classifier_model=%s "
         "tool_revalidation_timeout_ms=%s tool_revalidation_context_resolution=%s "
-        "tool_revalidation_resume_decision=%s turn_id=%s",
+        "tool_revalidation_resume_decision=%s "
+        "context_classifier_path=%s context_classifier_timeout_ms=%s "
+        "context_classifier_timeout_source=%s context_classifier_model=%s turn_id=%s",
         resolution,
         resolution_info.resolution_source,
         timed_out,
@@ -539,6 +546,10 @@ async def _revalidate_pending_tool_result(
         revalidation_timeout_ms,
         resolution,
         decision,
+        context_classifier_path,
+        revalidation_timeout_ms,
+        timeout_source,
+        classifier_model,
         _current_turn_id,
     )
     # Enforce, not just observe: only a compose decision grants the in-flight
@@ -3798,8 +3809,9 @@ def _capability_contract_note_present(context: TranscriptContext) -> bool:
 
 
 def _log_transcript_context_result(context: TranscriptContext, *, llm_started: bool, llm_error_type: str = "none", turn_id: int | None = None) -> None:
+    _normal_timeout_ms, _normal_timeout_source = normal_context_classifier_timeout()
     logger.info(
-        "Transcript context result: turn_id=%s transcript_context_layer_enabled=%s transcript_context_llm_enabled=%s transcript_context_llm_model=%s transcript_context_llm_timeout_ms=%s transcript_context_source=%s transcript_context_llm_started=%s transcript_context_llm_completed=%s transcript_context_llm_timed_out=%s transcript_context_llm_error_type=%s original_length=%s cleaned_length=%s detected_intent=%s ambiguity_detected=%s clarification_suggested=%s confidence=%s should_replace_user_text=%s context_note_present=%s capability_contract_note_present=%s",
+        "Transcript context result: turn_id=%s transcript_context_layer_enabled=%s transcript_context_llm_enabled=%s transcript_context_llm_model=%s transcript_context_llm_timeout_ms=%s transcript_context_source=%s transcript_context_llm_started=%s transcript_context_llm_completed=%s transcript_context_llm_timed_out=%s transcript_context_llm_error_type=%s original_length=%s cleaned_length=%s detected_intent=%s ambiguity_detected=%s clarification_suggested=%s confidence=%s should_replace_user_text=%s context_note_present=%s capability_contract_note_present=%s context_classifier_path=normal_turn context_classifier_timeout_ms=%s context_classifier_timeout_source=%s context_classifier_model=%s",
         turn_id or _current_turn_id,
         transcript_context_layer_enabled(),
         transcript_context_llm_enabled(),
@@ -3819,6 +3831,9 @@ def _log_transcript_context_result(context: TranscriptContext, *, llm_started: b
         context.should_replace_user_text,
         bool(context.llm_context_note),
         _capability_contract_note_present(context),
+        _normal_timeout_ms,
+        _normal_timeout_source,
+        transcript_context_llm_model() if transcript_context_llm_enabled() else "deterministic",
     )
     if transcript_context_debug():
         logger.info(
@@ -4505,8 +4520,9 @@ def _capability_contract_note_present(context: TranscriptContext) -> bool:
 
 
 def _log_transcript_context_result(context: TranscriptContext, *, llm_started: bool, llm_error_type: str = "none", turn_id: int | None = None) -> None:
+    _normal_timeout_ms, _normal_timeout_source = normal_context_classifier_timeout()
     logger.info(
-        "Transcript context result: turn_id=%s transcript_context_layer_enabled=%s transcript_context_llm_enabled=%s transcript_context_llm_model=%s transcript_context_llm_timeout_ms=%s transcript_context_source=%s transcript_context_llm_started=%s transcript_context_llm_completed=%s transcript_context_llm_timed_out=%s transcript_context_llm_error_type=%s original_length=%s cleaned_length=%s detected_intent=%s ambiguity_detected=%s clarification_suggested=%s confidence=%s should_replace_user_text=%s context_note_present=%s capability_contract_note_present=%s",
+        "Transcript context result: turn_id=%s transcript_context_layer_enabled=%s transcript_context_llm_enabled=%s transcript_context_llm_model=%s transcript_context_llm_timeout_ms=%s transcript_context_source=%s transcript_context_llm_started=%s transcript_context_llm_completed=%s transcript_context_llm_timed_out=%s transcript_context_llm_error_type=%s original_length=%s cleaned_length=%s detected_intent=%s ambiguity_detected=%s clarification_suggested=%s confidence=%s should_replace_user_text=%s context_note_present=%s capability_contract_note_present=%s context_classifier_path=normal_turn context_classifier_timeout_ms=%s context_classifier_timeout_source=%s context_classifier_model=%s",
         turn_id or _current_turn_id,
         transcript_context_layer_enabled(),
         transcript_context_llm_enabled(),
@@ -4526,6 +4542,9 @@ def _log_transcript_context_result(context: TranscriptContext, *, llm_started: b
         context.should_replace_user_text,
         bool(context.llm_context_note),
         _capability_contract_note_present(context),
+        _normal_timeout_ms,
+        _normal_timeout_source,
+        transcript_context_llm_model() if transcript_context_llm_enabled() else "deterministic",
     )
     if transcript_context_debug():
         logger.info(
