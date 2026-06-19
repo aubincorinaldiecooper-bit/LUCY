@@ -473,8 +473,13 @@ async def _revalidate_pending_tool_result(
     )
     resolution = resolution_info.resolution
     timed_out = resolution_info.timed_out
+    classifier_path = resolution_info.classifier_path
     require_resolution = require_context_resolution_for_tool_authority()
     additive_min = tool_revalidation_additive_min_dependency()
+    revalidation_timeout_ms = tool_revalidation_context_classifier_max_wait_ms()
+    layer_enabled = transcript_context_layer_enabled()
+    llm_enabled = transcript_context_llm_enabled()
+    classifier_model = transcript_context_llm_model() if llm_enabled else "deterministic"
 
     relationship, dependency, rel_conf = classify_tool_revalidation_relationship(
         original_query=original_query,
@@ -510,7 +515,11 @@ async def _revalidate_pending_tool_result(
         "context_handoff_allowed=%s context_handoff_blocked_reason=%s tool_revalidation_class=%s "
         "tool_revalidation_dependency=%s tool_revalidation_confidence=%.2f "
         "tool_revalidation_additive_min_dependency=%s tool_result_resume_decision=%s "
-        "query_materially_changed=%s result_available=%s turn_id=%s",
+        "query_materially_changed=%s result_available=%s "
+        "transcript_context_layer_enabled=%s transcript_context_llm_enabled=%s "
+        "tool_revalidation_classifier_path=%s tool_revalidation_classifier_model=%s "
+        "tool_revalidation_timeout_ms=%s tool_revalidation_context_resolution=%s "
+        "tool_revalidation_resume_decision=%s turn_id=%s",
         resolution,
         resolution_info.resolution_source,
         timed_out,
@@ -523,6 +532,13 @@ async def _revalidate_pending_tool_result(
         decision,
         materially_changed,
         result_available,
+        layer_enabled,
+        llm_enabled,
+        classifier_path,
+        classifier_model,
+        revalidation_timeout_ms,
+        resolution,
+        decision,
         _current_turn_id,
     )
     # Enforce, not just observe: only a compose decision grants the in-flight

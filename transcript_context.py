@@ -525,6 +525,7 @@ class ContextResolution:
     resolution: str          # resolved | unresolved | deterministic_safe
     resolution_source: str   # llm | deterministic | timeout
     timed_out: bool
+    classifier_path: str = "deterministic"  # llm | deterministic | timeout
 
 
 def deterministic_is_clearly_safe(context: TranscriptContext) -> bool:
@@ -558,12 +559,13 @@ async def resolve_transcript_context(
 
     if not transcript_context_llm_enabled():
         if clearly_safe:
-            return ContextResolution(deterministic, "deterministic_safe", "deterministic", False)
+            return ContextResolution(deterministic, "deterministic_safe", "deterministic", False, "deterministic")
         return ContextResolution(
             deterministic,
             "unresolved" if high_risk else "deterministic_safe",
             "deterministic",
             False,
+            "deterministic",
         )
 
     wait_ms = max_wait_ms if max_wait_ms is not None else normal_context_classifier_max_wait_ms()
@@ -576,22 +578,23 @@ async def resolve_transcript_context(
     task = asyncio.create_task(caller(deterministic))
     try:
         result = await asyncio.wait_for(task, timeout=max(wait_ms / 1000, 0.01))
-        return ContextResolution(result, "resolved", "llm", False)
+        return ContextResolution(result, "resolved", "llm", False, "llm")
     except TimeoutError:
         task.cancel()
         ctx = with_source(deterministic, "deterministic_timeout_fallback")
         if clearly_safe:
-            return ContextResolution(ctx, "deterministic_safe", "timeout", True)
-        return ContextResolution(ctx, "unresolved", "timeout", True)
+            return ContextResolution(ctx, "deterministic_safe", "timeout", True, "timeout")
+        return ContextResolution(ctx, "unresolved", "timeout", True, "timeout")
     except Exception:
         ctx = with_source(deterministic, "deterministic_llm_error_fallback")
         if clearly_safe:
-            return ContextResolution(ctx, "deterministic_safe", "deterministic", False)
+            return ContextResolution(ctx, "deterministic_safe", "deterministic", False, "deterministic")
         return ContextResolution(
             ctx,
             "unresolved" if high_risk else "deterministic_safe",
             "deterministic",
             False,
+            "deterministic",
         )
 
 

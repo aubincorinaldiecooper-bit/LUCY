@@ -107,6 +107,7 @@ class ResolutionTests(unittest.TestCase):
             )
         self.assertEqual(res.resolution, "unresolved")
         self.assertEqual(res.resolution_source, "timeout")
+        self.assertEqual(res.classifier_path, "timeout")
         self.assertTrue(res.timed_out)
 
     def test_llm_success_is_resolved(self):
@@ -120,6 +121,14 @@ class ResolutionTests(unittest.TestCase):
             )
         self.assertEqual(res.resolution, "resolved")
         self.assertEqual(res.resolution_source, "llm")
+        self.assertEqual(res.classifier_path, "llm")
+
+    def test_classifier_path_deterministic_when_llm_disabled(self):
+        with patch.object(tc, "transcript_context_llm_enabled", lambda: False), patch.object(
+            tc, "detect_transcript_context", lambda t: _ctx(confidence=0.92)
+        ):
+            res = self._run(resolve_transcript_context("look up the weather in paris", high_risk=True))
+        self.assertEqual(res.classifier_path, "deterministic")
 
 
 class RelationshipClassifierTests(unittest.TestCase):
