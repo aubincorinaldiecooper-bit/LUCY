@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import asyncio
 import inspect
@@ -127,8 +129,21 @@ if "SYSTEM_PROMPT" in os.environ:
 
 TTS_PROVIDER = os.getenv("TTS_PROVIDER", "deepgram").strip().lower()
 STT_PROVIDER = os.getenv("STT_PROVIDER", "mistral").strip().lower()
+# Active/session language Arche is configured to operate in. Logged at turn commit
+# so a transcript-language candidate can be compared against the intended language.
+SESSION_LANGUAGE = (os.getenv("SESSION_LANGUAGE") or os.getenv("DEEPGRAM_STT_LANGUAGE") or "en").strip() or "en"
 VAD_PROVIDER = os.getenv("VAD_PROVIDER", "ai_coustics").strip().lower()
 LIVEKIT_TURN_DETECTION_MODE = os.getenv("LIVEKIT_TURN_DETECTION_MODE", "vad").strip().lower()
+# LiveKit audio end-of-turn detector (livekit-agents >= 1.6.1: inference.TurnDetector).
+# Feature-detected at build time; if unavailable we keep the existing vad/stt mode.
+LIVEKIT_TURN_DETECTOR_ENABLED = os.getenv("LIVEKIT_TURN_DETECTOR_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+LIVEKIT_TURN_DETECTOR_VERSION = (os.getenv("LIVEKIT_TURN_DETECTOR_VERSION", "auto") or "auto").strip().lower()
+LIVEKIT_TURN_DETECTOR_UNLIKELY_THRESHOLD = (os.getenv("LIVEKIT_TURN_DETECTOR_UNLIKELY_THRESHOLD") or "").strip()
+LIVEKIT_ENDPOINTING_DYNAMIC_ENABLED = os.getenv("LIVEKIT_ENDPOINTING_DYNAMIC_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+# Inbound audio enhancement (ai-coustics / QUAIL) applied before STT/VAD/turn detection.
+LIVEKIT_AUDIO_ENHANCEMENT_ENABLED = os.getenv("LIVEKIT_AUDIO_ENHANCEMENT_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+LIVEKIT_AUDIO_ENHANCEMENT_PROVIDER = (os.getenv("LIVEKIT_AUDIO_ENHANCEMENT_PROVIDER", "ai_coustics") or "ai_coustics").strip().lower()
+LIVEKIT_AUDIO_ENHANCEMENT_MODEL = (os.getenv("LIVEKIT_AUDIO_ENHANCEMENT_MODEL", "QUAIL_VF_S") or "QUAIL_VF_S").strip()
 
 _speech_counter = 0
 _hume_tts_request_counter = 0
@@ -1358,6 +1373,87 @@ def attach_session_diagnostics(session: AgentSession) -> None:
             len(active_speech_handles),
         )
 
+        logger.info(
+            "assistant_speech_start_allowed=true assistant_speech_start_blocked_reason=none turn_id=%s speech_id=%s",
+            _current_turn_id,
+            speech_id,
+        )
+        assistant_speech_turn_ids[speech_id] = speech_turn_id
+        assistant_speech_llm_turn_ids[speech_id] = speech_llm_turn_id
+        active_speech_handles[speech_id] = resolved_handle
+        speech_start_times[speech_id] = now
+        assistant_speech_started_at[speech_id] = now
+        speech_latency_audits[speech_id] = _build_voice_latency_audit(
+            turn_id=_current_turn_id,
+            speech_id=speech_id,
+            user_speech_started_at=last_user_speaking_at,
+            user_speech_stopped_at=last_user_listening_at,
+            final_stt_received_at=last_stt_final_at,
+            user_turn_committed_at=_last_turn_committed_at,
+            llm_request_started_at=_last_llm_start_at,
+            llm_first_token_at=_last_llm_first_token_at,
+            llm_completed_at=_last_llm_complete_at,
+            tts_request_started_at=_last_tts_request_start_at,
+            tts_first_audio_at=_last_tts_first_audio_at,
+            tts_completed_at=_last_tts_completed_at,
+            assistant_playout_started_at=now,
+            assistant_playout_completed_at=None,
+        )
+        hume_request_count_at_speech_start[speech_id] = _hume_tts_request_counter
+        _latest_current_speech_id_for_hume = speech_id
+        _latest_active_assistant_count_for_hume = len(active_speech_handles)
+        if len(active_speech_handles) > 1:
+            logger.error(
+                "Assistant speech active_count invariant violated after registration: new_speech_id=%s active_count=%s active_speech_ids=%s",
+                speech_id,
+                len(active_speech_handles),
+                list(active_speech_handles.keys()),
+            )
+            _cleanup_active_assistant_speeches(speech_id, "post_registration_active_count_gt_one")
+            assistant_speech_turn_ids[speech_id] = speech_turn_id
+            assistant_speech_llm_turn_ids[speech_id] = speech_llm_turn_id
+            active_speech_handles[speech_id] = resolved_handle
+            speech_start_times[speech_id] = now
+            assistant_speech_started_at[speech_id] = now
+            speech_latency_audits[speech_id] = _build_voice_latency_audit(
+                turn_id=_current_turn_id,
+                speech_id=speech_id,
+                user_speech_started_at=last_user_speaking_at,
+                user_speech_stopped_at=last_user_listening_at,
+                final_stt_received_at=last_stt_final_at,
+                user_turn_committed_at=_last_turn_committed_at,
+                llm_request_started_at=_last_llm_start_at,
+                llm_first_token_at=_last_llm_first_token_at,
+                llm_completed_at=_last_llm_complete_at,
+                tts_request_started_at=_last_tts_request_start_at,
+                tts_first_audio_at=_last_tts_first_audio_at,
+                tts_completed_at=_last_tts_completed_at,
+                assistant_playout_started_at=now,
+                assistant_playout_completed_at=None,
+            )
+            hume_request_count_at_speech_start[speech_id] = _hume_tts_request_counter
+            _latest_current_speech_id_for_hume = speech_id
+            _latest_active_assistant_count_for_hume = len(active_speech_handles)
+
+        # Speech OBJECT created — do NOT mark the FSM as SPEAKING yet. Real audio
+        # playout is signalled separately by agent_state_changed -> "speaking",
+        # which is where the ASSISTANT_SPEAKING transition is driven.
+        _interaction_state.on_assistant_speech_created(speech_id)
+        logger.info(
+            "Assistant speech started: current_user_turn_id=%s speech_id=%s speech_turn_id=%s llm_turn_id=%s active_count=%s",
+            _current_turn_id,
+            speech_id,
+            speech_turn_id,
+            speech_llm_turn_id,
+            len(active_speech_handles),
+        )
+        logger.info(
+            "Assistant speech Hume request baseline: speech_id=%s hume_request_count_at_start=%s active_count=%s",
+            speech_id,
+            hume_request_count_at_speech_start[speech_id],
+            len(active_speech_handles),
+        )
+
         add_done_callback = getattr(resolved_handle, "add_done_callback", None)
         if callable(add_done_callback):
             def _on_done(done_event_or_handle: object) -> None:
@@ -1461,6 +1557,29 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                     was_suppressed,
                     len(active_speech_handles),
                 )
+                # Outcome-driven ledger reconciliation: if this assistant turn was
+                # not actually audible, downgrade its provisional ledger entry so it
+                # cannot pollute future prompt context.
+                if CONTEXT_POLICY_ENABLED:
+                    generated_bytes = getattr(hume_coverage, "byte_count", None) if hume_coverage is not None else None
+                    downgrade_reason = _ledger_downgrade_reason_for_outcome(
+                        was_suppressed=was_suppressed or was_stale,
+                        interrupted=interrupted,
+                        generated_bytes=generated_bytes,
+                        playout_seconds=speech_duration_seconds,
+                    )
+                    if downgrade_reason is not None:
+                        _ledger_downgrade_for_outcome(
+                            turn_id=done_speech_turn_id or done_speech_llm_turn_id or 0,
+                            speech_id=done_id,
+                            reason=downgrade_reason,
+                        )
+                    else:
+                        logger.info(
+                            "ledger_outcome_downgrade_applied=false speech_id=%s ledger_entry_turn_id=%s",
+                            done_id,
+                            done_speech_turn_id or "n/a",
+                        )
                 start_count = hume_request_count_at_speech_start.get(done_id, -1)
                 finish_count = hume_request_count_at_speech_finish.get(done_id, _hume_tts_request_counter)
                 hume_requests_during = finish_count - start_count if start_count >= 0 and finish_count >= 0 else -1
@@ -1554,6 +1673,9 @@ def attach_session_diagnostics(session: AgentSession) -> None:
         _latest_active_assistant_count_for_hume = len(active_speech_handles)
         if extracted_new_state == "speaking" and current_speech_id is not None:
             agent_speaking_at[current_speech_id] = latest_agent_state_timestamp
+            # Real audio playout is starting now (not at speech-object creation):
+            # this is where the FSM is allowed to enter ASSISTANT_SPEAKING.
+            _interaction_state.on_assistant_speech_started(current_speech_id)
         old_state = getattr(state, "old_state", None)
         old_state_normalized = str(old_state).strip().lower() if old_state is not None else ""
         if (
@@ -1571,6 +1693,15 @@ def attach_session_diagnostics(session: AgentSession) -> None:
         )
         if extracted_new_state == "listening" and not has_current_speech:
             _clear_active_handles("agent_returned_to_listening")
+            # Reconcile the FSM: a speech object that was created but never reached
+            # real audio playout (suppressed / zero-audio) leaves the FSM in an
+            # assistant-active state. Now that the agent is idle with no speech,
+            # return it to LISTENING so downstream logic does not believe the
+            # assistant is still thinking/speaking.
+            if _interaction_state.state in (ASSISTANT_THINKING, TOOL_CALL_PENDING, ASSISTANT_SPEAKING):
+                _interaction_state.transition(
+                    LISTENING, reason="agent_idle_no_active_speech_reconcile"
+                )
 
     @session.on("user_state_changed")
     def _on_user_state_changed(state: object) -> None:
@@ -1653,6 +1784,23 @@ def attach_session_diagnostics(session: AgentSession) -> None:
             last_stt_final_at = last_stt_any_at
             _latest_stt_final_at = last_stt_any_at
             last_stt_final_preview = last_stt_preview
+            # Carry the engine-reported language candidate/confidence (if any) to
+            # the turn-commit log. No new detection — just what STT already emits.
+            _latest_stt_language = str(language) if language not in (None, "") else "n/a"
+            stt_conf = _safe_attr(event, "language_confidence", _safe_attr(event, "confidence", None))
+            _latest_stt_language_confidence = f"{float(stt_conf):.2f}" if isinstance(stt_conf, (int, float)) else "n/a"
+            candidate_id = _record_stt_final_candidate(
+                transcript_str,
+                user_state=str(_latest_user_state_for_greeting or "unknown"),
+                partial_count=stt_partial_count,
+            )
+            logger.info(
+                "stt_final_candidate stt_segment_id=%s text_hash=%s user_state=%s transcript_length=%s",
+                candidate_id,
+                _text_hash(transcript_str.strip()),
+                _latest_user_state_for_greeting or "unknown",
+                len(transcript_str),
+            )
         else:
             stt_partial_count += 1
             _latest_stt_partial_at = last_stt_any_at
@@ -1758,6 +1906,307 @@ MISTRAL_STT_DIAGNOSTICS = env_bool("MISTRAL_STT_DIAGNOSTICS", True)
 HUME_FULL_UTTERANCE_TTS = env_bool("HUME_FULL_UTTERANCE_TTS", False)
 LIVEKIT_TTS_SOURCE_INSPECTION = env_bool("LIVEKIT_TTS_SOURCE_INSPECTION", False)
 HUME_DIRECT_API_TTS = env_bool("HUME_DIRECT_API_TTS", False)
+# Context-coherence layer (Phase 1, deterministic): judge whether the committed
+# transcript plausibly fits the session before the main LLM responds. When low,
+# the response is shaped to acknowledge-and-attempt (never silenced/blocked).
+# Off by default; behavior is unchanged until enabled.
+CONTEXT_COHERENCE_ENABLED = env_bool("CONTEXT_COHERENCE_ENABLED", False)
+try:
+    CONTEXT_COHERENCE_MIN_ASR_CONFIDENCE = max(0.0, min(1.0, float(os.getenv("CONTEXT_COHERENCE_MIN_ASR_CONFIDENCE", "0.45"))))
+except Exception:
+    CONTEXT_COHERENCE_MIN_ASR_CONFIDENCE = 0.45
+# Context-policy layer: let the prior-context signals the system already detects
+# govern prompt injection, response posture, and timeout fallback. Reuses the
+# deterministic context classification + turn policy; adds no new model/memory.
+CONTEXT_POLICY_ENABLED = env_bool("CONTEXT_POLICY_ENABLED", True)
+CONTEXT_FORCE_LOCAL_INJECTION = env_bool("CONTEXT_FORCE_LOCAL_INJECTION", True)
+CONTEXT_INJECTION_TURNS = env_int_clamped("CONTEXT_INJECTION_TURNS", 5, 1, 20)
+CONTEXT_RESPONSE_POSTURE_ENABLED = env_bool("CONTEXT_RESPONSE_POSTURE_ENABLED", True)
+CONTEXT_AWARE_FALLBACK_ENABLED = env_bool("CONTEXT_AWARE_FALLBACK_ENABLED", True)
+CONTEXT_REFERENCE_CARRY_FORWARD_ENABLED = env_bool("CONTEXT_REFERENCE_CARRY_FORWARD_ENABLED", True)
+CONVERSATION_LEDGER_EXCLUDE_SUPPRESSED = env_bool("CONVERSATION_LEDGER_EXCLUDE_SUPPRESSED", True)
+LOG_PROMPT_CONTEXT_INJECTION = env_bool("LOG_PROMPT_CONTEXT_INJECTION", True)
+LLM_RETRY_ON_FIRST_TOKEN_TIMEOUT = env_bool("LLM_RETRY_ON_FIRST_TOKEN_TIMEOUT", True)
+LLM_FALLBACK_MODEL = (os.getenv("LLM_FALLBACK_MODEL") or "").strip()
+CONTEXT_AWARE_FALLBACK_TEXT = "I know you’re pointing back to what just happened — give me a second."
+
+
+def _context_aware_fallback_text(reason: str, context_dependency: str) -> str | None:
+    """Context-preserving fallback for a timeout on a context-dependent turn."""
+    if (
+        CONTEXT_AWARE_FALLBACK_ENABLED
+        and context_dependency == "high"
+        and reason in {"first_token_timeout", "total_timeout_no_text"}
+    ):
+        return CONTEXT_AWARE_FALLBACK_TEXT
+    return None
+
+
+def _assess_context_coherence(stt_language: str, stt_language_confidence: str, session_language: str) -> tuple[str, str, float]:
+    """Deterministic Phase-1 coherence check at turn commit.
+
+    Returns (context_fit, reason, confidence): context_fit is "coherent",
+    "low_coherence", or "unknown". Catches the cheap/obvious cases (a transcript
+    in a different language than the session, or very low ASR confidence) with no
+    added latency. Nuanced non-sequitur/topic-fit is deferred to the Tier-2 LLM
+    interpreter (Phase 2). Returns "unknown" when disabled so nothing downstream
+    changes.
+    """
+    if not CONTEXT_COHERENCE_ENABLED:
+        return "unknown", "disabled", 0.0
+    lang = (stt_language or "n/a").strip().lower()
+    session = (session_language or "en").strip().lower()
+    if lang not in ("", "n/a", "unknown") and not lang.startswith(session) and not session.startswith(lang):
+        return "low_coherence", f"language_mismatch:{lang}", 0.8
+    try:
+        conf = float(stt_language_confidence)
+    except (TypeError, ValueError):
+        conf = -1.0
+    if 0.0 <= conf < CONTEXT_COHERENCE_MIN_ASR_CONFIDENCE:
+        return "low_coherence", f"asr_low_confidence:{conf:.2f}", 0.7
+    return "coherent", "ok", 0.6
+
+
+def _ledger_append(
+    role: str,
+    text: str,
+    *,
+    visible: bool,
+    suppressed: bool,
+    turn_id: int | None = None,
+    speech_id: str | None = None,
+    provisional: bool = False,
+    block_canonical: bool = False,
+    canonical_block_reason: str = "none",
+) -> dict:
+    """Record a turn in the thin conversation ledger.
+
+    canonical_for_context gates prompt injection: a turn is canonical only when it
+    is visible, not suppressed, has real text, and is not gated by a runtime
+    canonical block (e.g. an owner-less commit). Assistant entries are added
+    provisionally and may be downgraded later by the outcome reconciliation once
+    the true audio result is known. Returns the appended entry.
+    """
+    canonical = bool(visible and not suppressed and (text or "").strip()) and not block_canonical
+    entry = {
+        "role": role,
+        "text": text or "",
+        "visible_to_user": bool(visible),
+        "suppressed": bool(suppressed),
+        "canonical_for_context": canonical,
+        "canonical_block_reason": canonical_block_reason if block_canonical else "none",
+        "turn_id": turn_id,
+        "speech_id": speech_id,
+        "provisional": bool(provisional),
+    }
+    _conversation_ledger.append(entry)
+    if len(_conversation_ledger) > 60:
+        del _conversation_ledger[:-60]
+    return entry
+
+
+def _ledger_recent_canonical(n: int) -> list[dict]:
+    if CONVERSATION_LEDGER_EXCLUDE_SUPPRESSED:
+        items = [
+            entry
+            for entry in _conversation_ledger
+            if entry.get("canonical_for_context") and entry.get("visible_to_user") and not entry.get("suppressed")
+        ]
+    else:
+        items = list(_conversation_ledger)
+    return items[-n:] if n > 0 else []
+
+
+def _ledger_downgrade_reason_for_outcome(
+    *,
+    was_suppressed: bool,
+    interrupted: object,
+    generated_bytes: int | None,
+    playout_seconds: float | None,
+) -> str | None:
+    """Pick a downgrade reason from the true audio outcome, or None if audible."""
+    if was_suppressed:
+        return "suppressed"
+    if str(interrupted).strip().lower() in {"true", "1", "yes"}:
+        return "interrupted"
+    if generated_bytes == 0:
+        return "zero_audio"
+    if playout_seconds is not None and playout_seconds < 0:
+        return "no_playout"
+    return None
+
+
+def _ledger_downgrade_for_outcome(*, turn_id: int | None, speech_id: str | None, reason: str) -> str:
+    """Reconcile an assistant ledger entry against its true audio outcome.
+
+    Matching: prefer speech_id, else the most recent assistant entry for the same
+    turn_id. Never guesses across turns. Returns the match strategy used
+    ("speech_id" | "turn_id_recent" | "failed").
+    """
+    target = None
+    strategy = "failed"
+    if speech_id:
+        for entry in reversed(_conversation_ledger):
+            if entry.get("role") == "assistant" and entry.get("speech_id") == speech_id:
+                target, strategy = entry, "speech_id"
+                break
+    if target is None and turn_id:
+        for entry in reversed(_conversation_ledger):
+            if entry.get("role") == "assistant" and entry.get("turn_id") == turn_id:
+                target, strategy = entry, "turn_id_recent"
+                break
+    if target is None:
+        logger.warning(
+            "ledger_downgrade_match_failed=true ledger_downgrade_match_strategy=failed ledger_downgrade_reason=%s ledger_entry_speech_id=%s ledger_entry_turn_id=%s",
+            reason,
+            speech_id or "n/a",
+            turn_id if turn_id else "n/a",
+        )
+        return "failed"
+    target["visible_to_user"] = False
+    target["suppressed"] = True
+    target["canonical_for_context"] = False
+    target["provisional"] = False
+    logger.info(
+        "ledger_outcome_downgrade_applied=true ledger_downgrade_reason=%s ledger_downgrade_match_strategy=%s canonical_for_context=false ledger_entry_turn_id=%s ledger_entry_speech_id=%s",
+        reason,
+        strategy,
+        target.get("turn_id") if target.get("turn_id") else "n/a",
+        speech_id or "n/a",
+    )
+    return strategy
+
+
+def _ledger_visible_canonical_count() -> int:
+    return sum(1 for entry in _conversation_ledger if entry.get("canonical_for_context"))
+
+
+def _ledger_suppressed_count() -> int:
+    return sum(1 for entry in _conversation_ledger if entry.get("suppressed"))
+
+
+
+
+def _inject_context_window_note(turn_ctx: object, response_posture: str, recent: list[dict]) -> int:
+    """Force the recent visible exchange into the prompt for a context-dependent turn.
+
+    Returns the number of turns injected (0 when nothing was injected).
+    """
+    add_message = getattr(turn_ctx, "add_message", None)
+    if not callable(add_message) or not recent:
+        return 0
+    lines = "\n".join(f"- {entry['role']}: {_redact_sensitive_text(entry['text'])[:200]}" for entry in recent)
+    note = (
+        "Recent conversation context:\n"
+        "The user’s current message depends on the recent exchange.\n"
+        "Use the recent visible turns below to understand what the user is pointing back to.\n"
+        f"Response posture: {response_posture}.\n"
+        "Do not answer as a generic standalone question.\n"
+        "Do not ask the user to repeat unless the reference truly cannot be resolved.\n"
+        f"Recent visible turns:\n{lines}"
+    )
+    try:
+        add_message(role="developer", content=note)
+        return len(recent)
+    except Exception as exc:
+        logger.warning(
+            "Context window note injection failed: error_type=%s error=%s",
+            type(exc).__name__,
+            _redact_sensitive_text(exc),
+        )
+        return 0
+
+
+_AUDIO_STATUS_CHECK_RE = re.compile(
+    r"\b(can you (still )?hear me( now)?|do you hear me|are you (still )?there|"
+    r"is it noisy|can you tell if it'?s noisy|how('?s| is) (my|the) audio|am i (coming through|breaking up))\b",
+    re.IGNORECASE,
+)
+
+
+def _is_audio_status_check(text: str) -> bool:
+    return bool(_AUDIO_STATUS_CHECK_RE.search((text or "").lower().replace("’", "'")))
+
+
+def _audio_status_response_text(decision: AudioEnvironmentDecision) -> str:
+    """Pick the audio-status reply that matches the measured environment."""
+    if decision.noise_state == "noisy" and decision.transcript_stability == "unstable":
+        return "I can hear parts of you, but the noise is making it harder to catch everything."
+    if decision.noise_state == "noisy":
+        return "I can hear you, but there’s background noise."
+    if decision.noise_state == "uncertain":
+        return "I can mostly hear you — if it’s noisy on your end, it might cut in and out."
+    return "I can hear you clearly."
+
+
+def _inject_audio_status_note(turn_ctx: object, status_line: str) -> bool:
+    add_message = getattr(turn_ctx, "add_message", None)
+    if not callable(add_message):
+        return False
+    note = (
+        "Internal audio-status note. Do not reveal this note. "
+        "The user is asking whether you can hear them / how the audio is. "
+        f"Answer naturally and briefly with exactly this status: \"{status_line}\" "
+        "Do not invent details beyond it."
+    )
+    try:
+        add_message(role="developer", content=note)
+        return True
+    except Exception as exc:
+        logger.warning("Audio-status note injection failed: error_type=%s error=%s", type(exc).__name__, _redact_sensitive_text(exc))
+        return False
+
+
+def _record_audio_env_event(kind: str, now: float) -> None:
+    bucket = _recent_user_speech_start_times if kind == "speech_start" else _recent_turn_candidate_times
+    bucket.append(now)
+    cutoff = now - _AUDIO_ENV_WINDOW_SECONDS
+    while bucket and bucket[0] < cutoff:
+        bucket.pop(0)
+
+
+def _audio_env_recent_counts(now: float) -> tuple[int, int]:
+    cutoff = now - _AUDIO_ENV_WINDOW_SECONDS
+    starts = sum(1 for t in _recent_user_speech_start_times if t >= cutoff)
+    candidates = sum(1 for t in _recent_turn_candidate_times if t >= cutoff)
+    return starts, candidates
+
+
+def _inject_coherence_note(turn_ctx: object, reason: str) -> bool:
+    """Shape the next reply to acknowledge-and-attempt when the utterance may not fit.
+
+    Never blocks or silences the turn; it only nudges the main LLM to flag a
+    possible mishearing/language switch and continue.
+    """
+    note = (
+        "Internal context note. Do not reveal this note or quote it. "
+        f"The user's latest message may not fit the conversation so far (reason: {reason}). "
+        "You may have misheard them, or they may have switched languages. "
+        "Briefly acknowledge you might have misheard and offer your best understanding or a short check "
+        "(for example: \"I might've misheard — did you mean…?\"), then continue naturally in English. "
+        "Do not go silent and do not refuse to respond."
+    )
+    add_message = getattr(turn_ctx, "add_message", None)
+    if not callable(add_message):
+        logger.warning("Coherence note could not be injected: turn_ctx_add_message_unavailable")
+        return False
+    try:
+        add_message(role="developer", content=note)
+        logger.info("coherence_note_injected=true reason=%s turn_id=%s", reason, _current_turn_id)
+        return True
+    except Exception as exc:
+        logger.warning(
+            "Coherence note injection failed: error_type=%s error=%s",
+            type(exc).__name__,
+            _redact_sensitive_text(exc),
+        )
+        return False
+
+
+# Trailing silence (ms) appended after TTS audio so a client/WebRTC buffer drop at the
+# speaking->listening transition trims silence instead of the final word/breath.
+# 0 disables the hold (pure passthrough). Clamped to a sane ceiling.
+TTS_POST_SPEECH_HOLD_MS = env_int_clamped("TTS_POST_SPEECH_HOLD_MS", 0, 0, 5000)
 RUN_DB_MIGRATIONS_ON_STARTUP = env_bool("RUN_DB_MIGRATIONS_ON_STARTUP", False)
 ENABLE_FIXED_GREETING = env_bool("ENABLE_FIXED_GREETING", True)
 GREETING_TEXT = (os.getenv("GREETING_TEXT") or "Yo. What’s going on?").strip() or "Yo. What’s going on?"
@@ -1833,6 +2282,48 @@ def _pcm16_to_audio_frames(pcm_data: bytes, sample_rate: int, channels: int) -> 
         )
         frames.append(frame)
     return frames
+
+
+def _iter_post_speech_silence_frames(reference: "rtc.AudioFrame", hold_ms: int):
+    """Yield ~20ms silent frames matching the reference frame's format, totaling hold_ms."""
+    sample_rate = int(getattr(reference, "sample_rate", 0) or 24000)
+    num_channels = int(getattr(reference, "num_channels", 0) or 1)
+    frame_samples_per_channel = max(1, int(sample_rate * 0.02))
+    silence = b"\x00" * (frame_samples_per_channel * num_channels * 2)
+    total_samples = int(sample_rate * (hold_ms / 1000.0))
+    emitted = 0
+    while emitted < total_samples:
+        yield rtc.AudioFrame(
+            data=silence,
+            sample_rate=sample_rate,
+            num_channels=num_channels,
+            samples_per_channel=frame_samples_per_channel,
+        )
+        emitted += frame_samples_per_channel
+
+
+async def _with_post_speech_hold(source):
+    """Pass through TTS audio frames, then append a trailing silence pad (config-gated).
+
+    Keeps the published audio ending in silence so a client/WebRTC buffer drop at the
+    speaking->listening transition trims silence instead of the final word/breath.
+    """
+    last_frame = None
+    async for frame in source:
+        if isinstance(frame, rtc.AudioFrame):
+            last_frame = frame
+        yield frame
+    if TTS_POST_SPEECH_HOLD_MS > 0 and last_frame is not None:
+        appended = 0
+        for silence_frame in _iter_post_speech_silence_frames(last_frame, TTS_POST_SPEECH_HOLD_MS):
+            appended += 1
+            yield silence_frame
+        logger.info(
+            "Post-speech playout hold applied: tts_post_speech_hold_applied=true hold_ms=%s silent_frames_appended=%s tts_path=%s",
+            TTS_POST_SPEECH_HOLD_MS,
+            appended,
+            _last_tts_path or "n/a",
+        )
 
 
 def _safe_source_excerpt(obj: object, max_chars: int) -> str:
@@ -1956,12 +2447,80 @@ def _resolve_ai_coustics_model(model_name: str):
     return ai_coustics.EnhancerModel.QUAIL_VF_S, "QUAIL_VF_S"
 
 
+def _livekit_agents_version() -> str:
+    try:
+        import importlib.metadata as _md
+        return _md.version("livekit-agents")
+    except Exception:
+        return "unknown"
+
+
+def build_audio_turn_detector() -> tuple[object, dict]:
+    """Build the LiveKit audio end-of-turn detector, feature-detected and flag-gated.
+
+    Returns (detector_or_None, info). When the detector is unavailable or disabled
+    we return None and the caller keeps the existing vad/stt turn_detection mode,
+    so this is safe on SDKs without inference.TurnDetector.
+    """
+    info: dict = {
+        "available": _lk_inference is not None and hasattr(_lk_inference, "TurnDetector"),
+        "enabled": LIVEKIT_TURN_DETECTOR_ENABLED,
+        "class": "none",
+        "version": LIVEKIT_TURN_DETECTOR_VERSION,
+        "default_selection": "auto(sdk: v1 via LiveKit Inference, else v1-mini local)"
+        if LIVEKIT_TURN_DETECTOR_VERSION in ("", "auto")
+        else LIVEKIT_TURN_DETECTOR_VERSION,
+        "fallback_used": False,
+        "error": "none",
+    }
+    if not LIVEKIT_TURN_DETECTOR_ENABLED:
+        info["error"] = "disabled_by_config"
+        return None, info
+    if not info["available"]:
+        info["fallback_used"] = True
+        info["error"] = f"inference.TurnDetector unavailable in livekit-agents {_livekit_agents_version()} (needs >=1.6.1)"
+        return None, info
+    kwargs: dict = {}
+    if LIVEKIT_TURN_DETECTOR_VERSION not in ("", "auto"):
+        kwargs["version"] = LIVEKIT_TURN_DETECTOR_VERSION
+    if LIVEKIT_TURN_DETECTOR_UNLIKELY_THRESHOLD:
+        try:
+            kwargs["unlikely_threshold"] = float(LIVEKIT_TURN_DETECTOR_UNLIKELY_THRESHOLD)
+        except ValueError:
+            logger.warning("Invalid LIVEKIT_TURN_DETECTOR_UNLIKELY_THRESHOLD=%s; ignoring", LIVEKIT_TURN_DETECTOR_UNLIKELY_THRESHOLD)
+    try:
+        detector = _lk_inference.TurnDetector(**kwargs)
+        info["class"] = type(detector).__name__
+        return detector, info
+    except Exception as exc:
+        info["fallback_used"] = True
+        info["error"] = f"{type(exc).__name__}: {_redact_sensitive_text(exc)}"
+        logger.warning("LiveKit audio TurnDetector init failed; keeping vad/stt mode: %s", info["error"])
+        return None, info
+
+
 def build_room_options() -> room_io.RoomOptions | None:
-    if not AI_COUSTICS_ENABLED:
-        logger.info("ai-coustics disabled: AI_COUSTICS_ENABLED=false")
+    # Inbound audio enhancement is applied at the room audio_input stage, i.e.
+    # BEFORE STT / VAD / turn detection. AI_COUSTICS_ENABLED remains the master
+    # switch; LIVEKIT_AUDIO_ENHANCEMENT_* are the canonical config names.
+    enabled = LIVEKIT_AUDIO_ENHANCEMENT_ENABLED and AI_COUSTICS_ENABLED
+    model_name_cfg = LIVEKIT_AUDIO_ENHANCEMENT_MODEL or os.getenv("AI_COUSTICS_MODEL", "QUAIL_VF_S")
+    if not enabled:
+        logger.info(
+            "audio_enhancement_enabled=false audio_enhancement_provider=%s audio_enhancement_model=%s audio_enhancement_applied_stage=none audio_enhancement_error=disabled_by_config",
+            LIVEKIT_AUDIO_ENHANCEMENT_PROVIDER,
+            model_name_cfg,
+        )
+        return None
+    if LIVEKIT_AUDIO_ENHANCEMENT_PROVIDER not in ("ai_coustics", "ai-coustics"):
+        logger.warning(
+            "audio_enhancement_enabled=true audio_enhancement_provider=%s audio_enhancement_model=%s audio_enhancement_applied_stage=none audio_enhancement_error=unsupported_provider_only_ai_coustics_supported",
+            LIVEKIT_AUDIO_ENHANCEMENT_PROVIDER,
+            model_name_cfg,
+        )
         return None
 
-    selected_model, selected_model_name = _resolve_ai_coustics_model(os.getenv("AI_COUSTICS_MODEL", "QUAIL_VF_S"))
+    selected_model, selected_model_name = _resolve_ai_coustics_model(model_name_cfg)
     raw_level = os.getenv("AI_COUSTICS_ENHANCEMENT_LEVEL", "0.8")
     try:
         enhancement_level = float(raw_level)
@@ -1969,13 +2528,6 @@ def build_room_options() -> room_io.RoomOptions | None:
         logger.warning("Invalid AI_COUSTICS_ENHANCEMENT_LEVEL=%s. Falling back to 0.8", raw_level)
         enhancement_level = 0.8
     enhancement_level = max(0.0, min(1.0, enhancement_level))
-
-    logger.info(
-        "ai-coustics configuration: enabled=%s model=%s enhancement_level=%s",
-        True,
-        selected_model_name,
-        enhancement_level,
-    )
 
     try:
         if hasattr(ai_coustics, "ModelParameters"):
@@ -1987,7 +2539,19 @@ def build_room_options() -> room_io.RoomOptions | None:
     except TypeError as e:
         logger.warning("ai-coustics model_parameters unsupported in installed package, using model-only enhancement: %s", e)
         enhancer = ai_coustics.audio_enhancement(model=selected_model)
+    except Exception as e:
+        logger.error(
+            "audio_enhancement_enabled=true audio_enhancement_provider=ai_coustics audio_enhancement_model=%s audio_enhancement_applied_stage=failed audio_enhancement_error=%s",
+            selected_model_name,
+            f"{type(e).__name__}: {_redact_sensitive_text(e)}",
+        )
+        return None
 
+    logger.info(
+        "audio_enhancement_enabled=true audio_enhancement_provider=ai_coustics audio_enhancement_model=%s audio_enhancement_applied_stage=inbound_pre_stt_vad_turndetection enhancement_level=%s audio_enhancement_error=none",
+        selected_model_name,
+        enhancement_level,
+    )
     return room_io.RoomOptions(
         audio_input=room_io.AudioInputOptions(
             noise_cancellation=enhancer,
@@ -3065,15 +3629,10 @@ class LucyAgent(Agent):
             )
         return output
 
-    def _normalize_spoken_text(self, text: str) -> str:
-        normalized = text.strip()
-        if not normalized:
-            return normalized
-        if "```" in normalized:
-            return normalized
-        if normalized[-1] not in {".", "?", "!", "…"}:
-            return normalized + "."
-        return normalized
+def _safe_metadata_preview(value: Any) -> str:
+    if value is None:
+        return "none"
+    return _redact_sensitive_text(value)[:500]
 
     async def stt_node(self, audio, model_settings):
         # Observational AudioInteraction fork: tee user audio frames to the shadow
@@ -3215,7 +3774,13 @@ class LucyAgent(Agent):
 
             return _default_tts_with_hume_logs()
 
-        logger.info("Spoken text normalization enabled=true mode=buffered_full_segment")
+    recent_non_system_ids = {id(message) for message in non_system_messages[-max_non_system_messages:]}
+    pruned_messages = [
+        message
+        for message in message_list
+        if _is_system_or_developer_message(message) or id(message) in recent_non_system_ids
+    ]
+    dropped_messages = total_messages - len(pruned_messages)
 
         async def _direct_or_plugin_or_default() -> AsyncIterable[Any]:
             global _latest_normalized_text_hash, _last_tts_request_start_at, _last_tts_first_audio_at, _last_tts_text_length, _last_tts_sentence_end_count, _last_tts_path, _last_hume_request_start_at, _last_tts_received_text_hash, _last_tts_completed_at, _last_tts_raw_chunk_count, _last_tts_normalized_yield_count, _last_tts_first_input_at
@@ -3275,15 +3840,16 @@ class LucyAgent(Agent):
             if TTS_TEXT_DEBUG:
                 logger.info("TTS text debug: raw_chunk_count=%s raw_total_length=%s raw_preview=%s final_preview=%s", chunk_count, len(raw_text), _redact_sensitive_text(raw_text)[:200], _redact_sensitive_text(normalized_text)[:200])
 
-            async def _single_text_stream() -> AsyncIterable[str]:
-                if normalized_text:
-                    yield normalized_text
+    logger.info(
+        "context_pruned: turn_id=%s total_messages=%s kept_messages=%s dropped_messages=%s context_window_turns=%s",
+        turn_id or _current_turn_id,
+        total_messages,
+        len(pruned_messages),
+        dropped_messages,
+        CONTEXT_WINDOW_TURNS,
+    )
+    return total_messages, len(pruned_messages), dropped_messages
 
-            if TTS_PROVIDER == "hume" and HUME_DIRECT_API_TTS:
-                # experimental Plan B direct path; fallback must reuse preserved normalized_text
-                pass
-            else:
-                logger.info("Direct Hume TTS attempt: hume_direct_api_tts_requested=%s", False)
 
             if TTS_PROVIDER == "hume" and HUME_FULL_UTTERANCE_TTS:
                 activity = getattr(self, "_activity", None)
@@ -3355,9 +3921,17 @@ class LucyAgent(Agent):
                             return
                         logger.warning("Hume full-utterance plugin fallback: hume_full_utterance_plugin_requested=%s hume_full_utterance_plugin_used=%s hume_full_utterance_plugin_fallback_reason=%s path=%s", True, False, _redact_sensitive_text(e), "default_agent_tts_node_fallback")
                 else:
-                    logger.info("Hume full-utterance mode: full_utterance_requested=%s full_utterance_supported=%s full_utterance_used=%s path=%s fallback_reason=%s", True, False, False, "default_agent_tts_node_fallback", "activity_tts_synthesize_unavailable_or_empty_text")
+                    fu_reason = "empty_normalized_text" if not normalized_text else "activity_tts_synthesize_unavailable"
+                    logger.info("Hume full-utterance mode: full_utterance_requested=%s full_utterance_supported=%s full_utterance_used=%s path=%s fallback_reason=%s", True, False, False, "default_agent_tts_node_fallback", fu_reason)
+                    logger.warning(
+                        "Hume full-utterance path unavailable: hume_full_utterance_requested=true hume_full_utterance_supported=false hume_full_utterance_used=false hume_full_utterance_unsupported_reason=%s path=default_agent_tts_node_fallback",
+                        fu_reason,
+                    )
             elif TTS_PROVIDER == "hume":
                 logger.info("Hume full-utterance mode: full_utterance_requested=%s full_utterance_supported=%s full_utterance_used=%s path=%s fallback_reason=%s", False, False, False, "default_agent_tts_node_fallback", "not_requested")
+                logger.info(
+                    "Hume full-utterance path not requested: hume_full_utterance_requested=false hume_full_utterance_supported=unknown hume_full_utterance_used=false fallback_reason=not_requested path=default_agent_tts_node_fallback hint=set_HUME_FULL_UTTERANCE_TTS=true_to_bypass_default_tts_node_sentence_splitting",
+                )
 
             try:
                 hume_start = time.monotonic()
@@ -3467,8 +4041,59 @@ class LucyAgent(Agent):
                         request_index,
                     )
 
-            return _direct_hume_or_fallback_stream()
-        return _direct_or_plugin_or_default()
+            return _with_post_speech_hold(_direct_hume_or_fallback_stream())
+        return _with_post_speech_hold(_direct_or_plugin_or_default())
+
+    def llm_node(self, chat_ctx, tools, model_settings):
+        datetime_user_text = _extract_latest_user_text_from_chat_ctx(chat_ctx)
+        datetime_intent = detect_datetime_intent(datetime_user_text)
+        if datetime_intent and self.runtime_context is not None:
+            async def _datetime_guard_stream():
+                global _last_llm_start_at, _last_llm_first_token_at, _last_llm_complete_at, _last_llm_stream_status, _last_llm_timeout_stage, _last_llm_fallback_response_used, _pending_llm_fallback_text, _last_llm_completed_text, _last_llm_completed_text_hash, _last_llm_completed_at, _last_generic_llm_fallback_used, _llm_turn_id
+                _llm_turn_id = _current_turn_id
+                answer = answer_datetime_intent(self.runtime_context, datetime_intent)
+                now = time.monotonic()
+                _last_llm_start_at = now
+                _last_llm_first_token_at = now
+                _last_llm_complete_at = now
+                _last_llm_completed_at = now
+                _last_llm_stream_status = "datetime_guard"
+                _last_llm_timeout_stage = "none"
+                _last_llm_fallback_response_used = False
+                _last_generic_llm_fallback_used = False
+                _pending_llm_fallback_text = None
+                _last_llm_completed_text = answer
+                _last_llm_completed_text_hash = _text_hash(answer)
+                logger.info(
+                    "Date/time guard triggered: turn_id=%s datetime_guard_triggered=%s datetime_intent=%s datetime_answer_source=runtime_context search_called=%s session_timezone=%s runtime_current_date=%s runtime_current_time=%s text_length=%s",
+                    _current_turn_id,
+                    True,
+                    datetime_intent,
+                    "runtime_context",
+                    False,
+                    self.runtime_context.session_timezone,
+                    self.runtime_context.current_date,
+                    self.runtime_context.current_time,
+                    len(answer),
+                )
+                yield answer
+                logger.info(
+                    "LLM stream ended: turn_id=%s llm_turn_id=%s search_turn_id=%s status=%s first_token_seen=%s chunk_count=%s text_length=%s fallback_used=%s timeout_stage=%s search_in_progress=%s search_tool_called=%s search_failed=%s generic_llm_fallback_used=%s",
+                    _llm_turn_id,
+                    _llm_turn_id,
+                    _search_turn_id,
+                    _last_llm_stream_status,
+                    True,
+                    1,
+                    len(answer),
+                    False,
+                    "none",
+                    _search_in_progress,
+                    _search_tool_called,
+                    _search_failed,
+                    False,
+                )
+            return _datetime_guard_stream()
 
     def llm_node(self, chat_ctx, tools, model_settings):
         datetime_user_text = _extract_latest_user_text_from_chat_ctx(chat_ctx)
@@ -4354,6 +4979,30 @@ def _attach_optional_interruption_diagnostics(session: AgentSession) -> None:
 
 
 
+async def _run_hume_evi_voice_engine(ctx: JobContext) -> None:
+    """Connect the LiveKit room, then hand room audio to the Hume EVI bridge.
+
+    The bridge publishes an output track and subscribes to remote audio, both of
+    which require a connected room/local participant. The cascaded pipeline gets
+    this connect for free via ``AgentSession.start()``; the EVI path has no
+    session, so it must connect explicitly before bridging. Bootstrap failures
+    are logged with a clear, parseable line (no secrets) before re-raising so the
+    job fails visibly rather than via an opaque traceback.
+    """
+    logger.info("voice_engine_selected=hume_evi current_pipeline_disabled=true livekit_room_layer=true")
+    try:
+        await ctx.connect()
+        logger.info("voice_engine_room_connected=true engine=hume_evi")
+        await run_hume_evi_bridge(ctx.room)
+    except Exception as exc:
+        logger.error(
+            "voice_engine_bootstrap_failed=true engine=hume_evi error_type=%s error=%s",
+            type(exc).__name__,
+            exc,
+        )
+        raise
+
+
 async def entrypoint(ctx: JobContext):
     job_started_at = time.monotonic()
     logger.info(
@@ -4606,7 +5255,7 @@ async def entrypoint(ctx: JobContext):
     if STT_PROVIDER == "deepgram_flux":
         if resolved_livekit_turn_detection_mode == "stt":
             session_kwargs["turn_handling"] = TurnHandlingOptions(
-                turn_detection="stt",
+                turn_detection=_td("stt"),
                 interruption=interruption_options,
                 preemptive_generation=preemptive_generation_options,
             )
@@ -4615,7 +5264,7 @@ async def entrypoint(ctx: JobContext):
         elif resolved_livekit_turn_detection_mode == "vad":
             try:
                 session_kwargs["turn_handling"] = TurnHandlingOptions(
-                    turn_detection="vad",
+                    turn_detection=_td("vad"),
                     interruption=interruption_options,
                     preemptive_generation=preemptive_generation_options,
                 )
@@ -4624,7 +5273,7 @@ async def entrypoint(ctx: JobContext):
             except Exception as e:
                 logger.warning("VAD turn_detection mode unavailable in this LiveKit version, falling back to stt: %s", e)
                 session_kwargs["turn_handling"] = TurnHandlingOptions(
-                    turn_detection="stt",
+                    turn_detection=_td("stt"),
                     interruption=interruption_options,
                     preemptive_generation=preemptive_generation_options,
                 )
@@ -4644,7 +5293,7 @@ async def entrypoint(ctx: JobContext):
         )
     elif STT_PROVIDER == "mistral":
         session_kwargs["turn_handling"] = TurnHandlingOptions(
-            turn_detection="vad",
+            turn_detection=_td("vad"),
             interruption=interruption_options,
             endpointing={
                 "mode": endpointing_mode,
@@ -4657,7 +5306,7 @@ async def entrypoint(ctx: JobContext):
         logger.info("Using Mistral VAD-only turn handling")
     else:
         session_kwargs["turn_handling"] = TurnHandlingOptions(
-            turn_detection="vad",
+            turn_detection=_td("vad"),
             interruption=interruption_options,
             preemptive_generation=preemptive_generation_options,
         )
