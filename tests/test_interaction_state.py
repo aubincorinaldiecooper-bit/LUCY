@@ -180,6 +180,113 @@ class ToolCallSeparationTests(unittest.TestCase):
         self.assertEqual(sm.state, ASSISTANT_THINKING)
 
 
+class AssistantSpeechLifecycleTests(unittest.TestCase):
+    def test_speech_object_created_does_not_enter_speaking(self):
+        sm = committed_machine()
+        sm.on_llm_started()
+        self.assertEqual(sm.state, ASSISTANT_THINKING)
+        sm.on_assistant_speech_created("speech_x")
+        # Object creation is not playout: must stay thinking, not SPEAKING.
+        self.assertEqual(sm.state, ASSISTANT_THINKING)
+
+    def test_real_playout_enters_speaking_after_object_created(self):
+        sm = committed_machine()
+        sm.on_llm_started()
+        sm.on_assistant_speech_created("speech_x")
+        self.assertEqual(sm.state, ASSISTANT_THINKING)
+        sm.on_assistant_speech_started("speech_x")
+        self.assertEqual(sm.state, ASSISTANT_SPEAKING)
+
+    def test_object_created_never_played_does_not_strand_in_speaking(self):
+        # A suppressed/zero-audio speech object that never plays must not leave
+        # the FSM believing the assistant is speaking.
+        sm = committed_machine()
+        sm.on_llm_started()
+        sm.on_assistant_speech_created("speech_x")
+        sm.on_assistant_speech_finished(interrupted=True, speech_id="speech_x")
+        self.assertNotEqual(sm.state, ASSISTANT_SPEAKING)
+
+
+class BeginTurnAttributionTests(unittest.TestCase):
+    def test_explicit_observed_signal_avoids_anomaly_reason(self):
+        sm = InteractionStateMachine()
+        # FSM never saw the user-speech event (state LISTENING), but the caller
+        # passes a real observed signal -> explained, not the counted anomaly.
+        with self.assertLogs(interaction_state.logger, level="INFO") as captured:
+            sm.begin_turn(1, user_speech_observed=True)
+        joined = "\n".join(captured.output)
+        self.assertIn("turn_committed_after_state_advanced_post_user_speech", joined)
+        self.assertNotIn("turn_committed_by_pipeline_without_observed_user_speech", joined)
+
+    def test_explicit_no_speech_signal_emits_anomaly_reason(self):
+        sm = InteractionStateMachine()
+        with self.assertLogs(interaction_state.logger, level="INFO") as captured:
+            sm.begin_turn(1, user_speech_observed=False)
+        self.assertTrue(
+            any("turn_committed_by_pipeline_without_observed_user_speech" in line for line in captured.output)
+        )
+
+    def test_observed_flag_does_not_leak_across_turns(self):
+        sm = InteractionStateMachine()
+        sm.on_user_speech_started()
+        sm.on_user_speech_stopped()
+        sm.begin_turn(1)  # consumes the observed flag
+        # A later pipeline-only commit from LISTENING with no fresh speech is an
+        # anomaly again, not silently explained by the prior turn's flag.
+        sm.transition(LISTENING, reason="reset_for_test")
+        with self.assertLogs(interaction_state.logger, level="INFO") as captured:
+            sm.begin_turn(2)
+        self.assertTrue(
+            any("turn_committed_by_pipeline_without_observed_user_speech" in line for line in captured.output)
+        )
+
+
+class ToolResultAuthorityTests(unittest.TestCase):
+    def _machine_in_tool_call(self):
+        sm = committed_machine()
+        sm.set_turn_kind(TURN_KIND_ACTION, detected_intent="tool_request_search")
+        sm.on_llm_started()
+        sm.on_tool_call_started("internet_search")
+        return sm
+
+    def test_tool_call_start_grants_authority(self):
+        sm = self._machine_in_tool_call()
+        self.assertEqual(sm.state, TOOL_CALL_PENDING)
+        self.assertTrue(sm.tool_result_speak_authority)
+        self.assertFalse(sm.tool_result_pending_revalidation)
+
+    def test_user_speech_during_tool_call_pauses_authority(self):
+        sm = self._machine_in_tool_call()
+        with self.assertLogs(interaction_state.logger, level="INFO") as captured:
+            sm.on_user_speech_started()
+        self.assertEqual(sm.state, USER_INTERRUPTING)
+        self.assertFalse(sm.tool_result_speak_authority)
+        self.assertTrue(sm.tool_result_pending_revalidation)
+        self.assertIn("tool_result_authority_paused_pending_revalidation=true", "\n".join(captured.output))
+
+    def test_additive_context_restores_authority(self):
+        sm = self._machine_in_tool_call()
+        sm.on_user_speech_started()
+        regained = sm.revalidate_tool_result("additive_context")
+        self.assertTrue(regained)
+        self.assertTrue(sm.tool_result_speak_authority)
+        self.assertFalse(sm.tool_result_pending_revalidation)
+
+    def test_correction_and_cancel_withhold_authority(self):
+        for cls in ("correction", "cancellation", "pivot", "meta_complaint", "unrelated"):
+            sm = self._machine_in_tool_call()
+            sm.on_user_speech_started()
+            regained = sm.revalidate_tool_result(cls)
+            self.assertFalse(regained, cls)
+            self.assertFalse(sm.tool_result_speak_authority, cls)
+
+    def test_revalidate_without_pause_is_noop(self):
+        sm = self._machine_in_tool_call()
+        # No barge-in: authority intact, revalidate returns current authority.
+        self.assertTrue(sm.revalidate_tool_result("unrelated"))
+        self.assertTrue(sm.tool_result_speak_authority)
+
+
 class FallbackVisibilityTests(unittest.TestCase):
     def test_suppressed_fallback_logged_with_state(self):
         sm = committed_machine()

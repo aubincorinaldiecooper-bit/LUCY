@@ -43,9 +43,14 @@ from internet_search import (
 from audiointeraction_shadow import AudioInteractionShadow, audiointeraction_mode, build_shadow_from_env
 from hume_evi_bridge import run_hume_evi_bridge, voice_engine
 from interaction_state import (
+    ASSISTANT_SPEAKING,
     ASSISTANT_THINKING,
+    LISTENING,
     TOOL_CALL_PENDING,
     TURN_KIND_ACTION,
+    USER_INTERRUPTING,
+    USER_SPEAKING,
+    USER_SPEECH_OBSERVATION_WINDOW_SECONDS as INTERACTION_USER_SPEECH_OBSERVATION_WINDOW_SECONDS,
     AudioEnvironmentDecision,
     InteractionStateMachine,
     build_audio_environment_decision,
@@ -342,6 +347,49 @@ def _search_active_for_current_turn() -> bool:
 
 def _search_specific_response_for_current_turn() -> bool:
     return _search_tool_called and _search_specific_response_produced and _search_turn_matches_current()
+
+
+def _tool_revalidation_class(classification: str | None, intent: str | None, context_dependency: str | None) -> str:
+    """Map turn signals to the tool-result revalidation taxonomy.
+
+    Conservative by design: only a high-dependency continuation is treated as
+    additive context that lets an in-flight result keep its right to speak.
+    Everything else defaults to a class that withholds that authority.
+    """
+    cls = (classification or "").strip().upper()
+    if cls == "META_COMPLAINT":
+        return "meta_complaint"
+    if (context_dependency or "").strip().lower() == "high":
+        return "additive_context"
+    return "unrelated"
+
+
+def _search_result_authority_gate(output: str, turn_id: int) -> str:
+    """Withhold a search result that lost its right to speak after a barge-in.
+
+    The user may speak during a search (TOOL_CALL_PENDING) to add context; that
+    pauses the result's authority until the new utterance is classified. If
+    revalidation revoked authority, the stale result must not auto-speak. If
+    revalidation has not completed yet (rare race), allow but flag it.
+    """
+    if _interaction_state.tool_result_pending_revalidation:
+        logger.warning(
+            "search_result_authority_pending_revalidation=true turn_id=%s note=allowing_result_revalidation_incomplete",
+            turn_id,
+        )
+        return output
+    if not _interaction_state.tool_result_speak_authority:
+        logger.info(
+            "search_result_authority_revoked=true turn_id=%s tool_result_paused_reason=%s note=stale_result_must_not_speak",
+            turn_id,
+            _interaction_state.tool_result_paused_reason or "n/a",
+        )
+        return (
+            "Search result withheld: the user spoke again during the lookup and the new "
+            "message was not additive context. Do not speak this result; address the user's "
+            "newest message first and re-run the search only if it is still what they want."
+        )
+    return output
 
 
 def _search_wait_elapsed_seconds() -> float:
@@ -744,6 +792,44 @@ def _bind_candidate_for_commit(committed_text: str) -> tuple[str, bool, str]:
     drift_suspected = bool(_stt_candidates) and latest_final_hash != committed_hash
     candidate_id = matched_id if matched_id != "none" else (f"commit-{_current_turn_id}" if committed_text else "empty")
     return candidate_id, drift_suspected, latest_final_hash
+
+
+def _categorize_transcript_drift(committed_text: str) -> str:
+    """Classify a suspected transcript drift so logs distinguish expected merges
+    from real one-segment lag.
+
+    Returns one of:
+      none                       committed text equals the newest final
+      expected_merge_or_superset committed already contains the newest final
+                                 (a merged/superset turn — expected behavior)
+      real_lag                   the newest final is a superset/continuation of
+                                 the committed text (committed lags one segment)
+      ambiguous_commit           newest final and committed text diverge in a way
+                                 that cannot be classified as merge or lag
+      no_candidates              no STT candidates to compare against
+    """
+    if not _stt_candidates:
+        return "no_candidates"
+    latest = (_stt_candidates[-1].get("text") or "").strip().lower()
+    committed = (committed_text or "").strip().lower()
+    if not latest or not committed:
+        return "ambiguous_commit"
+    if latest == committed:
+        return "none"
+    if latest in committed:
+        # Committed text already contains the newest final: merged/superset turn.
+        return "expected_merge_or_superset"
+    if committed in latest:
+        # Newest final is a superset of what committed: committed lags behind.
+        return "real_lag"
+    # Disjoint finals: treat a shared leading prefix as lag, otherwise ambiguous.
+    prefix_len = 0
+    for a, b in zip(latest, committed):
+        if a != b:
+            break
+        prefix_len += 1
+    shared_prefix = prefix_len >= max(6, min(len(latest), len(committed)) // 2)
+    return "real_lag" if shared_prefix else "ambiguous_commit"
 
 
 def _redact_sensitive_text(value: object) -> str:
@@ -1440,7 +1526,10 @@ def attach_session_diagnostics(session: AgentSession) -> None:
             _latest_current_speech_id_for_hume = speech_id
             _latest_active_assistant_count_for_hume = len(active_speech_handles)
 
-        _interaction_state.on_assistant_speech_started(speech_id)
+        # Speech OBJECT created — do NOT mark the FSM as SPEAKING yet. Real audio
+        # playout is signalled separately by agent_state_changed -> "speaking",
+        # which is where the ASSISTANT_SPEAKING transition is driven.
+        _interaction_state.on_assistant_speech_created(speech_id)
         logger.info(
             "Assistant speech started: current_user_turn_id=%s speech_id=%s speech_turn_id=%s llm_turn_id=%s active_count=%s",
             _current_turn_id,
@@ -1487,7 +1576,7 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                 done_speech_llm_turn_id = assistant_speech_llm_turn_ids.pop(done_id, 0)
                 if was_active and not was_stale:
                     pending_user_handoff_speech_id = done_id
-                _interaction_state.on_assistant_speech_finished(interrupted=str(interrupted).strip().lower() == "true")
+                _interaction_state.on_assistant_speech_finished(interrupted=str(interrupted).strip().lower() == "true", speech_id=done_id)
                 logger.info(
                     "Assistant speech finished: current_user_turn_id=%s speech_id=%s speech_turn_id=%s llm_turn_id=%s interrupted=%s active_count=%s was_suppressed=%s was_stale=%s was_active=%s",
                     _current_turn_id,
@@ -1675,6 +1764,9 @@ def attach_session_diagnostics(session: AgentSession) -> None:
         _latest_active_assistant_count_for_hume = len(active_speech_handles)
         if extracted_new_state == "speaking" and current_speech_id is not None:
             agent_speaking_at[current_speech_id] = latest_agent_state_timestamp
+            # Real audio playout is starting now (not at speech-object creation):
+            # this is where the FSM is allowed to enter ASSISTANT_SPEAKING.
+            _interaction_state.on_assistant_speech_started(current_speech_id)
         old_state = getattr(state, "old_state", None)
         old_state_normalized = str(old_state).strip().lower() if old_state is not None else ""
         if (
@@ -1692,6 +1784,15 @@ def attach_session_diagnostics(session: AgentSession) -> None:
         )
         if extracted_new_state == "listening" and not has_current_speech:
             _clear_active_handles("agent_returned_to_listening")
+            # Reconcile the FSM: a speech object that was created but never reached
+            # real audio playout (suppressed / zero-audio) leaves the FSM in an
+            # assistant-active state. Now that the agent is idle with no speech,
+            # return it to LISTENING so downstream logic does not believe the
+            # assistant is still thinking/speaking.
+            if _interaction_state.state in (ASSISTANT_THINKING, TOOL_CALL_PENDING, ASSISTANT_SPEAKING):
+                _interaction_state.transition(
+                    LISTENING, reason="agent_idle_no_active_speech_reconcile"
+                )
 
     @session.on("user_state_changed")
     def _on_user_state_changed(state: object) -> None:
@@ -1785,10 +1886,25 @@ def attach_session_diagnostics(session: AgentSession) -> None:
             ledger_text = _extract_text_for_debug(target)
             interrupted_bool = str(interrupted).strip().lower() in {"true", "1", "yes"}
             is_suppressed = role_l == "assistant" and (interrupted_bool or not ledger_text.strip())
-            # speech_id is not exposed on the conversation item; assistant entries
-            # are matched later by turn_id. Assistant entries are provisional until
-            # the audio outcome is reconciled at speech-finished.
+            # speech_id is usually not exposed on the conversation item, which
+            # broke outcome reconciliation (turn_id alone drifts when the speech's
+            # turn differs from the live turn). Correlate the assistant entry with
+            # the live speech so the later downgrade can match on speech_id — the
+            # stable owner key — instead of a drifting turn_id.
             entry_speech_id = _safe_attr(target, "speech_id", None) or None
+            if entry_speech_id is None and role_l == "assistant":
+                current_speech = getattr(session, "current_speech", None)
+                if current_speech is not None:
+                    entry_speech_id = _speech_id(current_speech)
+                elif active_speech_handles:
+                    entry_speech_id = next(reversed(active_speech_handles), None)
+                if entry_speech_id is not None:
+                    logger.info(
+                        "ledger_entry_speech_id_correlated=true ledger_entry_speech_id=%s ledger_entry_turn_id=%s source=%s",
+                        entry_speech_id,
+                        _current_turn_id,
+                        "session_current_speech" if current_speech is not None else "active_speech_handles",
+                    )
             _ledger_append(
                 role_l,
                 ledger_text,
@@ -3703,7 +3819,7 @@ class LucyAgent(Agent):
                 _search_wait_elapsed_seconds(),
                 SEARCH_BRIDGE_MIN_DELAY_SECONDS,
             )
-        return output
+        return _search_result_authority_gate(output, turn_id)
 
 def _safe_metadata_preview(value: Any) -> str:
     if value is None:
@@ -4410,7 +4526,7 @@ class LucyAgent(Agent):
                 _search_wait_elapsed_seconds(),
                 SEARCH_BRIDGE_MIN_DELAY_SECONDS,
             )
-        return output
+        return _search_result_authority_gate(output, turn_id)
 
     def _normalize_spoken_text(self, text: str) -> str:
         normalized = text.strip()
@@ -5468,7 +5584,16 @@ class LucyAgent(Agent):
         _barge_in_during_thinking_turn_id = 0
         _barge_in_started_at = 0.0
         _barge_in_confirmed_real = False
-        _interaction_state.begin_turn(_current_turn_id)
+        # Attribute this commit against real user-speech signals (not only FSM
+        # events, which can be missed): a recent user-speaking edge or a recent
+        # STT final means the user genuinely spoke for this turn even if the FSM
+        # state already advanced. Only a commit with neither is a true anomaly.
+        _commit_now = time.monotonic()
+        _user_speech_observed_for_commit = (
+            (_latest_user_speaking_at > 0.0 and (_commit_now - _latest_user_speaking_at) <= INTERACTION_USER_SPEECH_OBSERVATION_WINDOW_SECONDS)
+            or (_latest_stt_final_at > 0.0 and (_commit_now - _latest_stt_final_at) <= INTERACTION_USER_SPEECH_OBSERVATION_WINDOW_SECONDS)
+        )
+        _interaction_state.begin_turn(_current_turn_id, user_speech_observed=_user_speech_observed_for_commit)
         _reset_search_state_for_turn(_current_turn_id)
         _last_turn_committed_at = time.monotonic()
         _last_llm_start_at = 0.0
@@ -5492,8 +5617,10 @@ class LucyAgent(Agent):
             _search_tool_called,
         )
         if _candidate_drift_suspected:
+            _drift_category = _categorize_transcript_drift(_last_user_message_text)
             logger.warning(
-                "transcript_drift_suspected=true turn_id=%s candidate_id=%s committed_text_hash=%s latest_stt_final_text_hash=%s note=committed_turn_text_lags_newest_stt_final",
+                "transcript_drift_suspected=true transcript_drift_category=%s turn_id=%s candidate_id=%s committed_text_hash=%s latest_stt_final_text_hash=%s note=committed_turn_text_differs_from_newest_stt_final",
+                _drift_category,
                 _current_turn_id,
                 _current_candidate_id,
                 _text_hash(_last_user_message_text),
@@ -5626,6 +5753,17 @@ class LucyAgent(Agent):
             detected_intent=_current_turn_transcript_intent,
         )
         _interaction_state.on_turn_policy(turn_policy.decision, turn_policy.classification, turn_policy.reason)
+        # If a tool/search result's authority to speak was paused by user speech
+        # mid tool call, classify this newer utterance now to decide whether the
+        # in-flight result may still speak (additive context) or must defer.
+        if _interaction_state.tool_result_pending_revalidation:
+            _interaction_state.revalidate_tool_result(
+                _tool_revalidation_class(
+                    turn_policy.classification,
+                    _current_turn_transcript_intent,
+                    _current_context_dependency,
+                )
+            )
         if _audiointeraction_shadow is not None:
             try:
                 _audiointeraction_shadow.compare_at_turn_commit(
@@ -5753,6 +5891,28 @@ class LucyAgent(Agent):
                     hold_yield_reason,
                     hold_turn_id,
                     time.monotonic() - _held_turn_fragment_created_at,
+                )
+                raise StopResponse()
+            # Final conservative guard: the loop above can exit on the deadline
+            # in the same tick that newer speech/continuation arrives. Re-check
+            # right before committing so the deadline never fires while newer
+            # speech, active speech, or fresh continuation candidates exist —
+            # the held fragment is retained for merge instead.
+            _deadline_now = time.monotonic()
+            _active_continuation = (
+                _latest_user_state_for_greeting == "speaking"
+                or _latest_stt_partial_at > hold_started_at
+                or _latest_stt_final_at > hold_started_at
+                or _interaction_state.state in (USER_SPEAKING, USER_INTERRUPTING)
+                or _current_turn_id != hold_turn_id
+            )
+            if _active_continuation:
+                logger.info(
+                    "held_fragment_deadline_suppressed_active_continuation=true turn_id=%s user_state=%s interaction_state=%s held_fragment_age_seconds=%.3f held_fragment_retained_for_merge=true",
+                    hold_turn_id,
+                    _latest_user_state_for_greeting,
+                    _interaction_state.state,
+                    _deadline_now - _held_turn_fragment_created_at,
                 )
                 raise StopResponse()
             logger.info(
