@@ -103,46 +103,20 @@ def _audio_output_bytes(message: dict[str, Any]) -> bytes:
         return b""
 
 
-def _parse_wav(data: bytes) -> tuple[bytes, int, int]:
-    """Return (pcm_bytes, sample_rate, channels) from an EVI audio_output payload.
-
-    Hume EVI sends each audio_output chunk as a base64-encoded WAV file, so the
-    RIFF/``fmt ``/``data`` header must be stripped before the bytes are treated as
-    PCM; feeding the header into the audio stream is heard as a click on every
-    chunk boundary. Payloads without a RIFF header are treated as raw PCM at the
-    EVI defaults so a header-once/raw-after stream still plays.
-    """
-    if len(data) < 12 or data[:4] != b"RIFF" or data[8:12] != b"WAVE":
-        return data, EVI_OUTPUT_SAMPLE_RATE, EVI_CHANNELS
-    sample_rate = EVI_OUTPUT_SAMPLE_RATE
-    channels = EVI_CHANNELS
-    pcm = b""
-    pos = 12
-    while pos + 8 <= len(data):
-        chunk_id = data[pos : pos + 4]
-        chunk_size = int.from_bytes(data[pos + 4 : pos + 8], "little")
-        body = data[pos + 8 : pos + 8 + chunk_size]
-        if chunk_id == b"fmt " and len(body) >= 16:
-            channels = int.from_bytes(body[2:4], "little") or EVI_CHANNELS
-            sample_rate = int.from_bytes(body[4:8], "little") or EVI_OUTPUT_SAMPLE_RATE
-        elif chunk_id == b"data":
-            pcm = body
-        pos += 8 + chunk_size + (chunk_size & 1)  # chunk bodies are word-aligned
-    return pcm, sample_rate, channels
-
-
-def _take_full_frames(buffer: bytearray, frame_bytes: int) -> list[bytes]:
-    """Drain whole 20ms frames from ``buffer``, leaving any remainder in place.
-
-    Buffering the remainder across audio_output messages (instead of zero-padding
-    each message's tail) keeps assistant audio continuous; interior padding
-    inserts silence gaps that are heard as clicking between chunks.
-    """
-    frames: list[bytes] = []
-    while len(buffer) >= frame_bytes:
-        frames.append(bytes(buffer[:frame_bytes]))
-        del buffer[:frame_bytes]
-    return frames
+def _iter_pcm_frames(pcm: bytes, *, sample_rate: int = EVI_OUTPUT_SAMPLE_RATE, channels: int = EVI_CHANNELS):
+    bytes_per_sample = 2
+    samples_per_channel = max(1, int(sample_rate * EVI_FRAME_MS / 1000))
+    frame_size = samples_per_channel * channels * bytes_per_sample
+    for offset in range(0, len(pcm), frame_size):
+        chunk = pcm[offset : offset + frame_size]
+        if len(chunk) < frame_size:
+            chunk = chunk + (b"\x00" * (frame_size - len(chunk)))
+        yield rtc.AudioFrame(
+            data=chunk,
+            sample_rate=sample_rate,
+            num_channels=channels,
+            samples_per_channel=samples_per_channel,
+        )
 
 
 class HumeEVILiveKitBridge:
@@ -154,11 +128,6 @@ class HumeEVILiveKitBridge:
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._output_source = rtc.AudioSource(EVI_OUTPUT_SAMPLE_RATE, EVI_CHANNELS)
         self._published = False
-        self._output_buffer = bytearray()
-        self._output_frame_bytes = int(EVI_OUTPUT_SAMPLE_RATE * EVI_FRAME_MS / 1000) * EVI_CHANNELS * 2
-        self._output_samples_per_channel = int(EVI_OUTPUT_SAMPLE_RATE * EVI_FRAME_MS / 1000)
-        self._pending_user_final_at: float | None = None
-        self._format_warning_logged = False
 
     async def run(self) -> None:
         started_at = time.monotonic()
@@ -253,8 +222,7 @@ class HumeEVILiveKitBridge:
                 if not pcm:
                     continue
                 await ws.send_json({"type": "audio_input", "data": base64.b64encode(pcm).decode("ascii")})
-                if evi_log_audio():
-                    logger.info("evi_audio_input_forwarded=true bytes=%s", len(pcm))
+                logger.info("evi_audio_input_forwarded=true bytes=%s", len(pcm) if evi_log_audio() else "redacted")
         finally:
             await stream.aclose()
 
@@ -270,71 +238,21 @@ class HumeEVILiveKitBridge:
                 break
         self._closed.set()
 
-    async def _enqueue_output_pcm(self, pcm: bytes) -> None:
-        if not pcm:
-            return
-        self._output_buffer.extend(pcm)
-        for chunk in _take_full_frames(self._output_buffer, self._output_frame_bytes):
-            await self._output_source.capture_frame(
-                rtc.AudioFrame(
-                    data=chunk,
-                    sample_rate=EVI_OUTPUT_SAMPLE_RATE,
-                    num_channels=EVI_CHANNELS,
-                    samples_per_channel=self._output_samples_per_channel,
-                )
-            )
-
-    async def _flush_output(self) -> None:
-        """Emit any buffered tail at end-of-utterance, zero-padding only the final frame."""
-        while self._output_buffer:
-            chunk = bytes(self._output_buffer[: self._output_frame_bytes])
-            del self._output_buffer[: self._output_frame_bytes]
-            if len(chunk) < self._output_frame_bytes:
-                chunk = chunk + (b"\x00" * (self._output_frame_bytes - len(chunk)))
-            await self._output_source.capture_frame(
-                rtc.AudioFrame(
-                    data=chunk,
-                    sample_rate=EVI_OUTPUT_SAMPLE_RATE,
-                    num_channels=EVI_CHANNELS,
-                    samples_per_channel=self._output_samples_per_channel,
-                )
-            )
-
     async def _handle_evi_message(self, payload: dict[str, Any]) -> None:
         msg_type = str(payload.get("type") or "")
         if msg_type == "audio_output":
-            pcm, sample_rate, channels = _parse_wav(_audio_output_bytes(payload))
-            if (sample_rate != EVI_OUTPUT_SAMPLE_RATE or channels != EVI_CHANNELS) and not self._format_warning_logged:
-                self._format_warning_logged = True
-                logger.warning(
-                    "evi_audio_output_format_unexpected=true sample_rate=%s channels=%s expected_sample_rate=%s expected_channels=%s",
-                    sample_rate,
-                    channels,
-                    EVI_OUTPUT_SAMPLE_RATE,
-                    EVI_CHANNELS,
-                )
-            if self._pending_user_final_at is not None:
-                logger.info(
-                    "evi_turn_latency_user_final_to_first_audio_ms=%.1f",
-                    (time.monotonic() - self._pending_user_final_at) * 1000.0,
-                )
-                self._pending_user_final_at = None
             logger.info("evi_audio_output_received=true")
-            await self._enqueue_output_pcm(pcm)
+            pcm = _audio_output_bytes(payload)
+            for frame in _iter_pcm_frames(pcm):
+                await self._output_source.capture_frame(frame)
             logger.info("evi_audio_published_to_livekit=true audio_output_bytes=%s", len(pcm) if evi_log_audio() else "redacted")
         elif msg_type == "user_message":
-            interim = bool(payload.get("interim"))
-            if not interim:
-                self._pending_user_final_at = time.monotonic()
-            logger.info("evi_user_message_received=true interim=%s", interim)
+            logger.info("evi_user_message_received=true interim=%s", bool(payload.get("interim")))
         elif msg_type == "assistant_message":
             logger.info("evi_assistant_message_received=true")
         elif msg_type == "assistant_end":
-            await self._flush_output()
             logger.info("evi_assistant_end_received=true")
         elif msg_type in {"user_interruption", "assistant_interrupted", "interruption"}:
-            self._output_buffer.clear()
-            self._pending_user_final_at = None
             logger.info("evi_interruption_detected=true event_type=%s", msg_type)
         elif msg_type == "error":
             logger.error("evi_bridge_error=true error_type=hume_error code=%s reason=%s", payload.get("code"), payload.get("message"))
