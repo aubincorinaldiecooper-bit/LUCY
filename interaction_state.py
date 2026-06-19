@@ -239,6 +239,10 @@ class InteractionStateMachine:
         self.tool_result_speak_authority = True
         self.tool_result_pending_revalidation = False
         self.tool_result_paused_reason = ""
+        self.tool_result_relationship = ""
+        self.tool_result_resume_decision = ""
+        # Count of high-risk runtime gates this machine has blocked (observability).
+        self.gate_blocked_count = 0
 
     # ---------- core ----------
 
@@ -285,6 +289,8 @@ class InteractionStateMachine:
             "pending_speech_count": len(self._pending_speech_ids),
             "tool_result_speak_authority": self.tool_result_speak_authority,
             "tool_result_pending_revalidation": self.tool_result_pending_revalidation,
+            "tool_result_resume_decision": self.tool_result_resume_decision,
+            "gate_blocked_count": self.gate_blocked_count,
         }
 
     # ---------- user speech (full-duplex awareness) ----------
@@ -378,6 +384,66 @@ class InteractionStateMachine:
         )
         return regained
 
+    def apply_tool_resume_decision(
+        self,
+        *,
+        relationship: str,
+        decision: str,
+        resolution: str,
+        additive_allowed: bool,
+    ) -> bool:
+        """Apply a composer resume decision to the in-flight tool result.
+
+        Authority to speak the existing result is granted only when the decision
+        is to compose it with the newer utterance. rerun/withhold/discard/defer/
+        clarify all withhold the stale result's right to speak on its own.
+        """
+        self.tool_result_relationship = relationship
+        self.tool_result_resume_decision = decision
+        self.tool_result_speak_authority = bool(additive_allowed) and decision == "compose"
+        self.tool_result_pending_revalidation = False
+        logger.info(
+            "tool_result_resume_decision=%s tool_revalidation_class=%s context_resolution=%s "
+            "tool_result_composed_with_newer_user_utterance=%s tool_result_authority_restored=%s "
+            "stale_tool_result_blocked=%s turn_id=%s",
+            decision,
+            relationship,
+            resolution,
+            decision == "compose",
+            self.tool_result_speak_authority,
+            not self.tool_result_speak_authority,
+            self.turn_id,
+        )
+        return self.tool_result_speak_authority
+
+    # ---------- runtime enforcement (act, not just observe) ----------
+
+    def runtime_gate(self, action: str, allowed: bool, reason: str) -> bool:
+        """Record and return a high-risk gate decision.
+
+        The FSM observes and logs; the caller acts on the returned boolean. A
+        blocked gate is always logged so a denied high-risk action is traceable.
+        """
+        if allowed:
+            logger.info(
+                "fsm_gate_blocked=false fsm_gate_action=%s fsm_gate_reason=%s interaction_state=%s turn_id=%s",
+                action,
+                reason,
+                self.state,
+                self.turn_id,
+            )
+        else:
+            self.gate_blocked_count += 1
+            logger.warning(
+                "fsm_gate_blocked=true fsm_gate_action=%s fsm_gate_reason=%s interaction_state=%s turn_id=%s gate_blocked_count=%s",
+                action,
+                reason,
+                self.state,
+                self.turn_id,
+                self.gate_blocked_count,
+            )
+        return allowed
+
     def set_turn_kind(self, turn_kind: str, detected_intent: str | None = None) -> None:
         self.turn_kind = turn_kind
         self.detected_intent = (detected_intent or "unknown").strip() or "unknown"
@@ -415,6 +481,8 @@ class InteractionStateMachine:
         self.tool_result_speak_authority = True
         self.tool_result_pending_revalidation = False
         self.tool_result_paused_reason = ""
+        self.tool_result_relationship = ""
+        self.tool_result_resume_decision = ""
         self.transition(TOOL_CALL_PENDING, reason=f"tool_call_started:{tool_name}")
 
     def on_tool_call_finished(self, tool_name: str) -> None:
