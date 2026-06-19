@@ -286,6 +286,58 @@ class ToolResultAuthorityTests(unittest.TestCase):
         self.assertTrue(sm.revalidate_tool_result("unrelated"))
         self.assertTrue(sm.tool_result_speak_authority)
 
+    def test_apply_compose_decision_grants_authority(self):
+        sm = self._machine_in_tool_call()
+        sm.on_user_speech_started()
+        with self.assertLogs(interaction_state.logger, level="INFO") as captured:
+            granted = sm.apply_tool_resume_decision(
+                relationship="additive_context", decision="compose", resolution="resolved", additive_allowed=True
+            )
+        self.assertTrue(granted)
+        self.assertTrue(sm.tool_result_speak_authority)
+        self.assertEqual(sm.tool_result_resume_decision, "compose")
+        joined = "\n".join(captured.output)
+        self.assertIn("tool_result_resume_decision=compose", joined)
+        self.assertIn("tool_result_composed_with_newer_user_utterance=True", joined)
+
+    def test_apply_rerun_decision_withholds_authority(self):
+        sm = self._machine_in_tool_call()
+        sm.on_user_speech_started()
+        granted = sm.apply_tool_resume_decision(
+            relationship="major_correction", decision="rerun", resolution="resolved", additive_allowed=False
+        )
+        self.assertFalse(granted)
+        self.assertFalse(sm.tool_result_speak_authority)
+        self.assertEqual(sm.tool_result_resume_decision, "rerun")
+
+    def test_apply_withhold_even_if_additive_flag_but_not_compose(self):
+        sm = self._machine_in_tool_call()
+        sm.on_user_speech_started()
+        granted = sm.apply_tool_resume_decision(
+            relationship="additive_context", decision="defer", resolution="unresolved", additive_allowed=True
+        )
+        self.assertFalse(granted)
+
+
+class RuntimeGateTests(unittest.TestCase):
+    def test_blocked_gate_logs_and_counts(self):
+        sm = InteractionStateMachine()
+        with self.assertLogs(interaction_state.logger, level="WARNING") as captured:
+            allowed = sm.runtime_gate("turn_commit_owner", False, reason="turn_commit_no_owner")
+        self.assertFalse(allowed)
+        self.assertEqual(sm.gate_blocked_count, 1)
+        joined = "\n".join(captured.output)
+        self.assertIn("fsm_gate_blocked=true", joined)
+        self.assertIn("fsm_gate_action=turn_commit_owner", joined)
+
+    def test_allowed_gate_returns_true_without_counting(self):
+        sm = InteractionStateMachine()
+        with self.assertLogs(interaction_state.logger, level="INFO") as captured:
+            allowed = sm.runtime_gate("turn_commit_owner", True, reason="valid_owner")
+        self.assertTrue(allowed)
+        self.assertEqual(sm.gate_blocked_count, 0)
+        self.assertIn("fsm_gate_blocked=false", "\n".join(captured.output))
+
 
 class FallbackVisibilityTests(unittest.TestCase):
     def test_suppressed_fallback_logged_with_state(self):

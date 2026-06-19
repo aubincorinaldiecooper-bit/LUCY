@@ -50,6 +50,7 @@ from interaction_state import (
     TURN_KIND_ACTION,
     USER_INTERRUPTING,
     USER_SPEAKING,
+    USER_TURN_CANDIDATE,
     USER_SPEECH_OBSERVATION_WINDOW_SECONDS as INTERACTION_USER_SPEECH_OBSERVATION_WINDOW_SECONDS,
     AudioEnvironmentDecision,
     InteractionStateMachine,
@@ -59,12 +60,21 @@ from interaction_state import (
 from memory_layer import MemoryLayer, identity_from_metadata, memory_enabled
 from runtime_context import RuntimeContext, answer_datetime_intent, detect_datetime_intent, runtime_context_from_metadata
 from transcript_context import (
+    ADDITIVE_FAMILY,
     ContextDecision,
+    ContextResolution,
     TranscriptContext,
     build_context_decision,
+    classify_tool_revalidation_relationship,
     clean_transcript,
+    decide_tool_result_resume,
     detect_transcript_context,
     interpret_transcript_context,
+    query_materially_changed,
+    require_context_resolution_for_tool_authority,
+    resolve_transcript_context,
+    tool_revalidation_additive_min_dependency,
+    tool_revalidation_context_classifier_max_wait_ms,
     transcript_context_debug,
     transcript_context_layer_enabled,
     transcript_context_llm_enabled,
@@ -240,6 +250,13 @@ _search_result_handoff_spoken = False
 _last_search_tool_output = ""
 _last_search_tool_output_hash = "empty"
 _last_generic_llm_fallback_used = False
+# Original query that initiated the in-flight search, captured at search start so
+# a barge-in turn can be classified against it by the tool-result composer.
+_pending_search_query = ""
+_pending_search_result_available = False
+# Set False when a turn commits with no valid speech/candidate owner; gates
+# canonical writes and tool authority for that turn (runtime enforcement).
+_current_turn_owner_valid = True
 _current_turn_id = 0
 _turn_id_counter = 0
 _search_turn_id = 0
@@ -299,8 +316,8 @@ def _reset_search_state_for_turn(turn_id: int | None = None) -> None:
     _search_turn_id = turn_id or _current_turn_id
 
 
-def _mark_search_wait_started(pre_ack_spoken: bool = False, turn_id: int | None = None) -> None:
-    global _search_tool_called, _search_in_progress, _search_started_at, _search_completed_at, _search_failed, _search_pre_ack_spoken, _search_specific_response_produced, _search_result_handoff_spoken, _last_search_tool_output, _last_search_tool_output_hash, _search_turn_id
+def _mark_search_wait_started(pre_ack_spoken: bool = False, turn_id: int | None = None, query: str = "") -> None:
+    global _search_tool_called, _search_in_progress, _search_started_at, _search_completed_at, _search_failed, _search_pre_ack_spoken, _search_specific_response_produced, _search_result_handoff_spoken, _last_search_tool_output, _last_search_tool_output_hash, _search_turn_id, _pending_search_query, _pending_search_result_available
     _search_turn_id = turn_id or _current_turn_id
     _search_tool_called = True
     _search_in_progress = True
@@ -312,11 +329,15 @@ def _mark_search_wait_started(pre_ack_spoken: bool = False, turn_id: int | None 
     _search_result_handoff_spoken = False
     _last_search_tool_output = ""
     _last_search_tool_output_hash = "empty"
+    # Snapshot the query that initiated this search so a later barge-in can be
+    # classified against it; the result is not yet available.
+    _pending_search_query = query or _last_user_message_text
+    _pending_search_result_available = False
     _interaction_state.on_tool_call_started("internet_search")
 
 
 def _mark_search_wait_completed(failed: bool, output: str, result_handoff_spoken: bool = False, turn_id: int | None = None) -> bool:
-    global _search_in_progress, _search_completed_at, _search_failed, _search_specific_response_produced, _search_result_handoff_spoken, _last_search_tool_output, _last_search_tool_output_hash
+    global _search_in_progress, _search_completed_at, _search_failed, _search_specific_response_produced, _search_result_handoff_spoken, _last_search_tool_output, _last_search_tool_output_hash, _pending_search_result_available
     completion_turn_id = turn_id or _search_turn_id
     if completion_turn_id != _current_turn_id or _search_turn_id != _current_turn_id:
         logger.warning(
@@ -333,6 +354,7 @@ def _mark_search_wait_completed(failed: bool, output: str, result_handoff_spoken
     _search_result_handoff_spoken = result_handoff_spoken
     _last_search_tool_output = output
     _last_search_tool_output_hash = _text_hash(output)
+    _pending_search_result_available = True
     _interaction_state.on_tool_call_finished("internet_search")
     return True
 
@@ -374,13 +396,15 @@ def _search_result_authority_gate(output: str, turn_id: int) -> str:
     """
     if _interaction_state.tool_result_pending_revalidation:
         logger.warning(
-            "search_result_authority_pending_revalidation=true turn_id=%s note=allowing_result_revalidation_incomplete",
+            "search_result_authority_pending_revalidation=true stale_tool_result_blocked=false turn_id=%s note=allowing_result_revalidation_incomplete",
             turn_id,
         )
         return output
     if not _interaction_state.tool_result_speak_authority:
         logger.info(
-            "search_result_authority_revoked=true turn_id=%s tool_result_paused_reason=%s note=stale_result_must_not_speak",
+            "search_result_authority_revoked=true stale_tool_result_blocked=true tool_result_resume_decision=%s tool_revalidation_class=%s turn_id=%s tool_result_paused_reason=%s note=stale_result_must_not_speak",
+            _interaction_state.tool_result_resume_decision or "n/a",
+            _interaction_state.tool_result_relationship or "n/a",
             turn_id,
             _interaction_state.tool_result_paused_reason or "n/a",
         )
@@ -390,6 +414,156 @@ def _search_result_authority_gate(output: str, turn_id: int) -> str:
             "newest message first and re-run the search only if it is still what they want."
         )
     return output
+
+
+def _inject_tool_result_composition_note(
+    turn_ctx: object, original_query: str, pending_result: str, newer_utterance: str
+) -> bool:
+    """Compose: keep the pending result but fold in the newer user utterance.
+
+    Injects a developer note so Lucy answers using the in-flight result together
+    with the user's mid-search addition, instead of discarding either.
+    """
+    add_message = getattr(turn_ctx, "add_message", None)
+    if not callable(add_message):
+        return False
+    note = (
+        "Mid-search addition (compose):\n"
+        "The user added context while a lookup was in progress. Incorporate it into the answer; "
+        "do not start over or ignore the earlier request.\n"
+        f"- Original request: {_redact_sensitive_text(original_query)[:240]}\n"
+        f"- User's addition: {_redact_sensitive_text(newer_utterance)[:240]}\n"
+        f"- Lookup result so far: {_redact_sensitive_text(pending_result)[:600]}\n"
+        "Answer the combined request naturally in one turn."
+    )
+    try:
+        add_message(role="developer", content=note)
+        return True
+    except Exception as exc:
+        logger.warning(
+            "tool_result_composition_note_injection_failed=true error_type=%s error=%s",
+            type(exc).__name__,
+            _redact_sensitive_text(exc),
+        )
+        return False
+
+
+async def _revalidate_pending_tool_result(
+    turn_ctx: object,
+    *,
+    newer_utterance: str,
+    classification: str | None,
+    recent_turns: list[str] | None,
+) -> str:
+    """High-risk tool/search handoff composer.
+
+    Classifies how the barge-in utterance relates to the pending query, resolves
+    context with the longer tool-revalidation wait, and decides compose / rerun /
+    withhold / discard / defer / clarify. Returns the resume decision.
+    """
+    original_query = _pending_search_query
+    result_available = _pending_search_result_available
+
+    resolution_info = await resolve_transcript_context(
+        newer_utterance,
+        recent_turns=recent_turns,
+        runtime_context=None,
+        max_wait_ms=tool_revalidation_context_classifier_max_wait_ms(),
+        high_risk=True,
+    )
+    resolution = resolution_info.resolution
+    timed_out = resolution_info.timed_out
+    classifier_path = resolution_info.classifier_path
+    require_resolution = require_context_resolution_for_tool_authority()
+    additive_min = tool_revalidation_additive_min_dependency()
+    revalidation_timeout_ms = tool_revalidation_context_classifier_max_wait_ms()
+    layer_enabled = transcript_context_layer_enabled()
+    llm_enabled = transcript_context_llm_enabled()
+    classifier_model = transcript_context_llm_model() if llm_enabled else "deterministic"
+
+    relationship, dependency, rel_conf = classify_tool_revalidation_relationship(
+        original_query=original_query,
+        newer_utterance=newer_utterance,
+        base_intent=_current_turn_transcript_intent,
+        classification=classification,
+    )
+    materially_changed = query_materially_changed(original_query, newer_utterance)
+    decision, additive_allowed = decide_tool_result_resume(
+        relationship=relationship,
+        resolution=resolution,
+        dependency_level=dependency,
+        additive_min_dependency=additive_min,
+        require_resolution=require_resolution,
+        materially_changed=materially_changed,
+        result_available=result_available,
+    )
+
+    handoff_allowed = decision == "compose"
+    if handoff_allowed:
+        blocked_reason = "none"
+    elif resolution == "unresolved" and require_resolution:
+        blocked_reason = "timeout" if timed_out else "ambiguous"
+    elif relationship in {"major_correction", "minor_correction"}:
+        blocked_reason = "newer_user_turn"
+    elif relationship in {"pivot", "unrelated", "meta_complaint"}:
+        blocked_reason = "stale_origin"
+    else:
+        blocked_reason = "ambiguous"
+
+    logger.info(
+        "context_resolution=%s context_resolution_source=%s transcript_context_llm_timed_out=%s "
+        "context_handoff_allowed=%s context_handoff_blocked_reason=%s tool_revalidation_class=%s "
+        "tool_revalidation_dependency=%s tool_revalidation_confidence=%.2f "
+        "tool_revalidation_additive_min_dependency=%s tool_result_resume_decision=%s "
+        "query_materially_changed=%s result_available=%s "
+        "transcript_context_layer_enabled=%s transcript_context_llm_enabled=%s "
+        "tool_revalidation_classifier_path=%s tool_revalidation_classifier_model=%s "
+        "tool_revalidation_timeout_ms=%s tool_revalidation_context_resolution=%s "
+        "tool_revalidation_resume_decision=%s turn_id=%s",
+        resolution,
+        resolution_info.resolution_source,
+        timed_out,
+        handoff_allowed,
+        blocked_reason,
+        relationship,
+        dependency,
+        rel_conf,
+        additive_min,
+        decision,
+        materially_changed,
+        result_available,
+        layer_enabled,
+        llm_enabled,
+        classifier_path,
+        classifier_model,
+        revalidation_timeout_ms,
+        resolution,
+        decision,
+        _current_turn_id,
+    )
+    # Enforce, not just observe: only a compose decision grants the in-flight
+    # result the right to speak.
+    _interaction_state.runtime_gate(
+        "stale_tool_result_speak",
+        handoff_allowed,
+        reason=f"resume_decision={decision};resolution={resolution};class={relationship}",
+    )
+    _interaction_state.apply_tool_resume_decision(
+        relationship=relationship,
+        decision=decision,
+        resolution=resolution,
+        additive_allowed=additive_allowed,
+    )
+    if decision == "compose" and result_available and _last_search_tool_output.strip():
+        composed = _inject_tool_result_composition_note(
+            turn_ctx, original_query, _last_search_tool_output, newer_utterance
+        )
+        logger.info(
+            "tool_result_composed_with_newer_user_utterance=%s turn_id=%s",
+            composed,
+            _current_turn_id,
+        )
+    return decision
 
 
 def _search_wait_elapsed_seconds() -> float:
@@ -1382,6 +1556,14 @@ def attach_session_diagnostics(session: AgentSession) -> None:
             _mark_speech_stale(speech_id)
             suppressed_speech_ids.add(speech_id)
             assistant_speech_finished_at.setdefault(speech_id, time.monotonic())
+            # Enforce: a speech object created while the user is speaking must not
+            # reach audio playout (the FSM also only enters SPEAKING on real
+            # playout). Block here and record it as a gated high-risk action.
+            _interaction_state.runtime_gate(
+                "assistant_speech_start_before_playout",
+                False,
+                reason="user_speaking_before_assistant_start",
+            )
             logger.warning(
                 "assistant_speech_start_allowed=false assistant_speech_start_blocked_reason=user_speaking current_user_turn_id=%s speech_id=%s speech_turn_id=%s llm_turn_id=%s cleanup_reason=%s cleanup_action=interrupt attempted_method=%s cleanup_result=%s",
                 _current_turn_id,
@@ -1905,6 +2087,23 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                         _current_turn_id,
                         "session_current_speech" if current_speech is not None else "active_speech_handles",
                     )
+            # Runtime gate (enforce, not just observe): an assistant turn whose
+            # owning user commit had no valid speech/candidate owner must not
+            # become canonical context, even though it may still be shown/heard.
+            canonical_block_reason = "none"
+            if role_l == "assistant" and not is_suppressed and ledger_text.strip():
+                if not _current_turn_owner_valid:
+                    canonical_block_reason = "turn_commit_no_owner"
+                if canonical_block_reason != "none":
+                    _interaction_state.runtime_gate(
+                        "assistant_canonical_write", False, reason=canonical_block_reason
+                    )
+                    logger.info(
+                        "canonical_write_blocked_reason=%s ledger_entry_turn_id=%s ledger_entry_speech_id=%s",
+                        canonical_block_reason,
+                        _current_turn_id,
+                        entry_speech_id or "n/a",
+                    )
             _ledger_append(
                 role_l,
                 ledger_text,
@@ -1913,13 +2112,16 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                 turn_id=_current_turn_id,
                 speech_id=entry_speech_id,
                 provisional=role_l == "assistant",
+                block_canonical=canonical_block_reason != "none",
+                canonical_block_reason=canonical_block_reason,
             )
             if role_l == "assistant":
                 logger.info(
-                    "ledger_entry_provisional=true ledger_entry_speech_id=%s ledger_entry_turn_id=%s canonical_for_context=%s",
+                    "ledger_entry_provisional=true ledger_entry_speech_id=%s ledger_entry_turn_id=%s canonical_for_context=%s canonical_write_blocked_reason=%s",
                     entry_speech_id or "n/a",
                     _current_turn_id,
-                    not is_suppressed and bool(ledger_text.strip()),
+                    not is_suppressed and bool(ledger_text.strip()) and canonical_block_reason == "none",
+                    canonical_block_reason,
                 )
         if _active_memory_layer is not None and str(role).strip().lower() == "assistant":
             _active_memory_layer.schedule_remember(
@@ -2147,21 +2349,25 @@ def _ledger_append(
     turn_id: int | None = None,
     speech_id: str | None = None,
     provisional: bool = False,
+    block_canonical: bool = False,
+    canonical_block_reason: str = "none",
 ) -> dict:
     """Record a turn in the thin conversation ledger.
 
     canonical_for_context gates prompt injection: a turn is canonical only when it
-    is visible, not suppressed, and has real text. Assistant entries are added
+    is visible, not suppressed, has real text, and is not gated by a runtime
+    canonical block (e.g. an owner-less commit). Assistant entries are added
     provisionally and may be downgraded later by the outcome reconciliation once
     the true audio result is known. Returns the appended entry.
     """
-    canonical = bool(visible and not suppressed and (text or "").strip())
+    canonical = bool(visible and not suppressed and (text or "").strip()) and not block_canonical
     entry = {
         "role": role,
         "text": text or "",
         "visible_to_user": bool(visible),
         "suppressed": bool(suppressed),
         "canonical_for_context": canonical,
+        "canonical_block_reason": canonical_block_reason if block_canonical else "none",
         "turn_id": turn_id,
         "speech_id": speech_id,
         "provisional": bool(provisional),
@@ -3750,7 +3956,7 @@ class LucyAgent(Agent):
             _mark_search_wait_completed(failed=True, output=output, result_handoff_spoken=False, turn_id=turn_id)
             return output
 
-        _mark_search_wait_started(pre_ack_spoken=False, turn_id=turn_id)
+        _mark_search_wait_started(pre_ack_spoken=False, turn_id=turn_id, query=query)
         logger.info(
             "search_wait_started turn_id=%s search_turn_id=%s search_in_progress=%s search_started_at=%s search_pre_ack_spoken=%s search_query_original=%s search_allowed_for_turn=%s search_allowed_reason=%s",
             turn_id,
@@ -4457,7 +4663,7 @@ class LucyAgent(Agent):
             _mark_search_wait_completed(failed=True, output=output, result_handoff_spoken=False, turn_id=turn_id)
             return output
 
-        _mark_search_wait_started(pre_ack_spoken=False, turn_id=turn_id)
+        _mark_search_wait_started(pre_ack_spoken=False, turn_id=turn_id, query=query)
         logger.info(
             "search_wait_started turn_id=%s search_turn_id=%s search_in_progress=%s search_started_at=%s search_pre_ack_spoken=%s search_query_original=%s search_allowed_for_turn=%s search_allowed_reason=%s",
             turn_id,
@@ -5577,7 +5783,7 @@ class LucyAgent(Agent):
     async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
         global _last_turn_committed_at, _last_llm_start_at, _last_llm_first_token_at, _last_llm_complete_at, _last_llm_stream_status, _last_llm_timeout_stage, _last_llm_fallback_response_used, _last_llm_completed_text, _last_llm_completed_text_hash, _last_llm_completed_at, _last_tts_received_text_hash, _last_user_message_text, _current_turn_id, _current_turn_transcript_intent, _current_turn_search_allowed, _current_turn_search_allowed_reason, _current_turn_policy_classification, _current_turn_policy_decision, _current_turn_audio_unclear, _held_turn_fragment_text, _held_turn_fragment_created_at, _held_turn_fragment_classification, _held_turn_fragment_incomplete
         global _barge_in_during_thinking_turn_id, _barge_in_started_at, _barge_in_confirmed_real
-        global _prior_context_decision, _current_context_dependency, _current_candidate_id
+        global _prior_context_decision, _current_context_dependency, _current_candidate_id, _current_turn_owner_valid
         _current_turn_id = _next_turn_id()
         # New turn committed: clear any barge-in latch from the prior turn. A stale
         # prior reply is now covered by the existing _is_stale_llm_turn path.
@@ -5593,7 +5799,21 @@ class LucyAgent(Agent):
             (_latest_user_speaking_at > 0.0 and (_commit_now - _latest_user_speaking_at) <= INTERACTION_USER_SPEECH_OBSERVATION_WINDOW_SECONDS)
             or (_latest_stt_final_at > 0.0 and (_commit_now - _latest_stt_final_at) <= INTERACTION_USER_SPEECH_OBSERVATION_WINDOW_SECONDS)
         )
+        # Owner validity: a turn has a valid owner when real user speech was
+        # observed or the FSM was already in a user-speech state. An owner-less
+        # commit is gated so it cannot produce canonical context (enforce).
+        _pre_begin_state = _interaction_state.state
+        _current_turn_owner_valid = bool(_user_speech_observed_for_commit) or _pre_begin_state in (
+            USER_TURN_CANDIDATE,
+            USER_SPEAKING,
+            USER_INTERRUPTING,
+        )
         _interaction_state.begin_turn(_current_turn_id, user_speech_observed=_user_speech_observed_for_commit)
+        _interaction_state.runtime_gate(
+            "turn_commit_owner",
+            _current_turn_owner_valid,
+            reason="valid_owner" if _current_turn_owner_valid else "turn_commit_no_owner",
+        )
         _reset_search_state_for_turn(_current_turn_id)
         _last_turn_committed_at = time.monotonic()
         _last_llm_start_at = 0.0
@@ -5754,15 +5974,15 @@ class LucyAgent(Agent):
         )
         _interaction_state.on_turn_policy(turn_policy.decision, turn_policy.classification, turn_policy.reason)
         # If a tool/search result's authority to speak was paused by user speech
-        # mid tool call, classify this newer utterance now to decide whether the
-        # in-flight result may still speak (additive context) or must defer.
+        # mid tool call, run the high-risk composer: classify how this newer
+        # utterance relates to the pending query and decide compose / rerun /
+        # withhold. A timeout protects latency but never grants authority.
         if _interaction_state.tool_result_pending_revalidation:
-            _interaction_state.revalidate_tool_result(
-                _tool_revalidation_class(
-                    turn_policy.classification,
-                    _current_turn_transcript_intent,
-                    _current_context_dependency,
-                )
+            await _revalidate_pending_tool_result(
+                turn_ctx,
+                newer_utterance=_last_user_message_text,
+                classification=turn_policy.classification,
+                recent_turns=_recent_turn_previews_from_chat_ctx(turn_ctx),
             )
         if _audiointeraction_shadow is not None:
             try:
@@ -5906,7 +6126,13 @@ class LucyAgent(Agent):
                 or _interaction_state.state in (USER_SPEAKING, USER_INTERRUPTING)
                 or _current_turn_id != hold_turn_id
             )
-            if _active_continuation:
+            # Enforce: the deadline commit is gated, not merely observed.
+            _deadline_commit_allowed = _interaction_state.runtime_gate(
+                "held_fragment_deadline_commit",
+                not _active_continuation,
+                reason="active_continuation" if _active_continuation else "no_active_continuation",
+            )
+            if not _deadline_commit_allowed:
                 logger.info(
                     "held_fragment_deadline_suppressed_active_continuation=true turn_id=%s user_state=%s interaction_state=%s held_fragment_age_seconds=%.3f held_fragment_retained_for_merge=true",
                     hold_turn_id,
