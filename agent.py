@@ -200,6 +200,12 @@ _last_llm_completed_text = ""
 _last_llm_completed_text_hash = "empty"
 _last_llm_completed_at = 0.0
 _last_user_message_text = ""
+# Immutable per-final-STT candidates so every consumer of a turn (commit, debug,
+# turn policy, pruning, generation) references the same transcript segment instead
+# of a lagging global. Detects transcript drift under barge-in / rapid follow-up.
+_stt_candidates: list[dict] = []
+_stt_segment_counter = 0
+_current_candidate_id: str | None = None
 _last_tts_node_entered_at = 0.0
 _last_tts_received_text_hash = "empty"
 _last_hume_request_start_at = 0.0
@@ -698,6 +704,46 @@ def _build_voice_latency_audit(
 
 def _text_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12] if text else "empty"
+
+
+def _record_stt_final_candidate(text: str, *, user_state: str, partial_count: int) -> str:
+    """Record an immutable candidate for a final STT result and return its id."""
+    global _stt_segment_counter
+    _stt_segment_counter += 1
+    candidate_id = f"stt-{_stt_segment_counter}"
+    _stt_candidates.append(
+        {
+            "candidate_id": candidate_id,
+            "text": text or "",
+            "text_hash": _text_hash((text or "").strip()),
+            "received_at": time.monotonic(),
+            "user_state": user_state,
+            "partial_count_at_final": partial_count,
+        }
+    )
+    if len(_stt_candidates) > 40:
+        del _stt_candidates[:-40]
+    return candidate_id
+
+
+def _bind_candidate_for_commit(committed_text: str) -> tuple[str, bool, str]:
+    """Bind the committing turn to the STT candidate that produced it.
+
+    Returns (candidate_id, drift_suspected, latest_final_hash). Prefers the most
+    recent candidate whose text matches the committed text; if the newest final
+    differs from what is being committed, transcript drift is flagged so the
+    one-segment lag is visible in logs.
+    """
+    committed_hash = _text_hash((committed_text or "").strip())
+    latest_final_hash = _stt_candidates[-1]["text_hash"] if _stt_candidates else "none"
+    matched_id = "none"
+    for candidate in reversed(_stt_candidates):
+        if candidate["text_hash"] == committed_hash:
+            matched_id = candidate["candidate_id"]
+            break
+    drift_suspected = bool(_stt_candidates) and latest_final_hash != committed_hash
+    candidate_id = matched_id if matched_id != "none" else (f"commit-{_current_turn_id}" if committed_text else "empty")
+    return candidate_id, drift_suspected, latest_final_hash
 
 
 def _redact_sensitive_text(value: object) -> str:
@@ -1805,6 +1851,18 @@ def attach_session_diagnostics(session: AgentSession) -> None:
             _latest_stt_language = str(language) if language not in (None, "") else "n/a"
             stt_conf = _safe_attr(event, "language_confidence", _safe_attr(event, "confidence", None))
             _latest_stt_language_confidence = f"{float(stt_conf):.2f}" if isinstance(stt_conf, (int, float)) else "n/a"
+            candidate_id = _record_stt_final_candidate(
+                transcript_str,
+                user_state=str(_latest_user_state_for_greeting or "unknown"),
+                partial_count=stt_partial_count,
+            )
+            logger.info(
+                "stt_final_candidate stt_segment_id=%s text_hash=%s user_state=%s transcript_length=%s",
+                candidate_id,
+                _text_hash(transcript_str.strip()),
+                _latest_user_state_for_greeting or "unknown",
+                len(transcript_str),
+            )
         else:
             stt_partial_count += 1
             _latest_stt_partial_at = last_stt_any_at
@@ -5403,7 +5461,7 @@ class LucyAgent(Agent):
     async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
         global _last_turn_committed_at, _last_llm_start_at, _last_llm_first_token_at, _last_llm_complete_at, _last_llm_stream_status, _last_llm_timeout_stage, _last_llm_fallback_response_used, _last_llm_completed_text, _last_llm_completed_text_hash, _last_llm_completed_at, _last_tts_received_text_hash, _last_user_message_text, _current_turn_id, _current_turn_transcript_intent, _current_turn_search_allowed, _current_turn_search_allowed_reason, _current_turn_policy_classification, _current_turn_policy_decision, _current_turn_audio_unclear, _held_turn_fragment_text, _held_turn_fragment_created_at, _held_turn_fragment_classification, _held_turn_fragment_incomplete
         global _barge_in_during_thinking_turn_id, _barge_in_started_at, _barge_in_confirmed_real
-        global _prior_context_decision, _current_context_dependency
+        global _prior_context_decision, _current_context_dependency, _current_candidate_id
         _current_turn_id = _next_turn_id()
         # New turn committed: clear any barge-in latch from the prior turn. A stale
         # prior reply is now covered by the existing _is_stale_llm_turn path.
@@ -5424,13 +5482,23 @@ class LucyAgent(Agent):
         _last_llm_completed_at = 0.0
         _last_user_message_text = _extract_text_for_debug(new_message).strip()
         _last_tts_received_text_hash = "empty"
+        _current_candidate_id, _candidate_drift_suspected, _candidate_latest_final_hash = _bind_candidate_for_commit(_last_user_message_text)
         logger.info(
-            "User turn committed: turn_id=%s search_state_reset=true search_turn_id=%s search_in_progress=%s search_tool_called=%s",
+            "User turn committed: turn_id=%s candidate_id=%s search_state_reset=true search_turn_id=%s search_in_progress=%s search_tool_called=%s",
             _current_turn_id,
+            _current_candidate_id,
             _search_turn_id,
             _search_in_progress,
             _search_tool_called,
         )
+        if _candidate_drift_suspected:
+            logger.warning(
+                "transcript_drift_suspected=true turn_id=%s candidate_id=%s committed_text_hash=%s latest_stt_final_text_hash=%s note=committed_turn_text_lags_newest_stt_final",
+                _current_turn_id,
+                _current_candidate_id,
+                _text_hash(_last_user_message_text),
+                _candidate_latest_final_hash,
+            )
         if transcript_context_layer_enabled():
             transcript_context_llm_started = transcript_context_llm_enabled()
             context_error_type = "none"
@@ -5500,8 +5568,9 @@ class LucyAgent(Agent):
         )
         response_posture = "acknowledge_and_attempt" if context_fit == "low_coherence" else "answer"
         logger.info(
-            "turn_policy_decision=%s transcript_classification=%s classification_confidence=%.2f classification_reason=%s should_start_generation=%s should_merge_held_fragment=%s should_clear_held_fragment=%s commit_allowed=%s commit_block_reason=%s active_language=%s stt_language_candidate=%s stt_language_confidence=%s normalized_user_text=%s context_fit=%s coherence_reason=%s coherence_confidence=%.2f response_posture=%s",
+            "turn_policy_decision=%s candidate_id=%s transcript_classification=%s classification_confidence=%.2f classification_reason=%s should_start_generation=%s should_merge_held_fragment=%s should_clear_held_fragment=%s commit_allowed=%s commit_block_reason=%s active_language=%s stt_language_candidate=%s stt_language_confidence=%s normalized_user_text=%s context_fit=%s coherence_reason=%s coherence_confidence=%.2f response_posture=%s",
             turn_policy.decision,
+            _current_candidate_id,
             turn_policy.classification,
             turn_policy.confidence,
             turn_policy.reason,
@@ -5736,7 +5805,8 @@ class LucyAgent(Agent):
             message_count = len(turn_ctx_items) if turn_ctx_items is not None else "n/a"
             held_fragment_count = 1 if _held_turn_fragment_text.strip() else 0
             logger.info(
-                "User turn debug: new_message_length=%s preview=%s turn_ctx_message_count=%s held_fragment_count=%s held_fragment_merged=%s",
+                "User turn debug: candidate_id=%s new_message_length=%s preview=%s turn_ctx_message_count=%s held_fragment_count=%s held_fragment_merged=%s",
+                _current_candidate_id,
                 len(msg_str),
                 _redact_sensitive_text(msg_str)[:200],
                 message_count,
