@@ -65,6 +65,7 @@ from transcript_context import (
     ContextResolution,
     TranscriptContext,
     build_context_decision,
+    call_transcript_context_llm,
     classify_tool_revalidation_relationship,
     clean_transcript,
     decide_tool_result_resume,
@@ -6316,6 +6317,64 @@ async def _run_hume_evi_voice_engine(ctx: JobContext) -> None:
         raise
 
 
+async def _prewarm_models(llm_obj: Any) -> None:
+    """Fire tiny throwaway requests so the first real turn isn't paying
+    connection/provider cold-start cost.
+
+    Best-effort: every failure is swallowed and logged. This never blocks the
+    live path — it is launched as a background task and bounded by short
+    timeouts. Warms two distinct paths: the main generation LLM (OpenRouter via
+    the LiveKit openai client, which is where the turn-1 first-token cold start
+    was observed) and, when enabled, the transcript-context classifier model
+    (raw OpenRouter POST) with a generous timeout so the warmup itself can
+    actually complete instead of timing out at the normal per-turn budget.
+    """
+    from livekit.agents import APIConnectOptions
+    from livekit.agents import llm as _lk_llm
+
+    gen_started_at = time.monotonic()
+    try:
+        warm_ctx = _lk_llm.ChatContext.empty()
+        warm_ctx.add_message(role="user", content="ping")
+        stream = llm_obj.chat(
+            chat_ctx=warm_ctx,
+            conn_options=APIConnectOptions(max_retry=0, timeout=10.0),
+        )
+        try:
+            async for _chunk in stream:
+                break
+        finally:
+            await stream.aclose()
+        logger.info(
+            "LLM warmup completed: target=generation elapsed_seconds=%s",
+            _fmt_seconds(time.monotonic() - gen_started_at),
+        )
+    except Exception as exc:  # noqa: BLE001 - warmup must never break startup
+        logger.info(
+            "LLM warmup skipped/failed: target=generation error_type=%s elapsed_seconds=%s",
+            type(exc).__name__,
+            _fmt_seconds(time.monotonic() - gen_started_at),
+        )
+
+    if transcript_context_llm_enabled():
+        tc_started_at = time.monotonic()
+        try:
+            await call_transcript_context_llm(
+                detect_transcript_context("ok"),
+                timeout_ms=10000,
+            )
+            logger.info(
+                "LLM warmup completed: target=transcript_context elapsed_seconds=%s",
+                _fmt_seconds(time.monotonic() - tc_started_at),
+            )
+        except Exception as exc:  # noqa: BLE001 - warmup must never break startup
+            logger.info(
+                "LLM warmup skipped/failed: target=transcript_context error_type=%s elapsed_seconds=%s",
+                type(exc).__name__,
+                _fmt_seconds(time.monotonic() - tc_started_at),
+            )
+
+
 async def entrypoint(ctx: JobContext):
     job_started_at = time.monotonic()
     logger.info(
@@ -6381,6 +6440,13 @@ async def entrypoint(ctx: JobContext):
         transcript_context_llm_timeout_ms(),
         transcript_context_debug(),
     )
+    # Warm the OpenRouter generation model (and the transcript-context model when
+    # enabled) with tiny throwaway requests so the first real turn isn't paying
+    # connection/provider cold-start cost. Runs concurrently with session setup
+    # and the greeting; best-effort and never blocks the live path.
+    if env_bool("LLM_WARMUP_ENABLED", True):
+        logger.info("LLM warmup starting: target=generation+transcript_context")
+        asyncio.create_task(_prewarm_models(llm))
     # TODO: Re-enable Tavily using LiveKit's supported function-tool pattern.
     logger.warning("Skipping Tavily tools for MVP voice path; Exa is the only active search provider when enabled")
 

@@ -478,6 +478,7 @@ async def call_transcript_context_llm(
     *,
     recent_turns: Sequence[str] | None = None,
     runtime_context: str | None = None,
+    timeout_ms: int | None = None,
 ) -> TranscriptContext:
     api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
     if not api_key:
@@ -494,7 +495,8 @@ async def call_transcript_context_llm(
     if provider:
         payload["provider"] = provider
 
-    timeout = aiohttp.ClientTimeout(total=max(transcript_context_llm_timeout_ms() / 1000, 0.05))
+    effective_timeout_ms = timeout_ms if timeout_ms is not None else transcript_context_llm_timeout_ms()
+    timeout = aiohttp.ClientTimeout(total=max(effective_timeout_ms / 1000, 0.05))
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.post(
             f"{OPENROUTER_BASE_URL}/chat/completions",
