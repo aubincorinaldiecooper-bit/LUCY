@@ -3774,13 +3774,7 @@ def _safe_metadata_preview(value: Any) -> str:
 
             return _default_tts_with_hume_logs()
 
-    recent_non_system_ids = {id(message) for message in non_system_messages[-max_non_system_messages:]}
-    pruned_messages = [
-        message
-        for message in message_list
-        if _is_system_or_developer_message(message) or id(message) in recent_non_system_ids
-    ]
-    dropped_messages = total_messages - len(pruned_messages)
+        logger.info("Spoken text normalization enabled=true mode=buffered_full_segment")
 
         async def _direct_or_plugin_or_default() -> AsyncIterable[Any]:
             global _latest_normalized_text_hash, _last_tts_request_start_at, _last_tts_first_audio_at, _last_tts_text_length, _last_tts_sentence_end_count, _last_tts_path, _last_hume_request_start_at, _last_tts_received_text_hash, _last_tts_completed_at, _last_tts_raw_chunk_count, _last_tts_normalized_yield_count, _last_tts_first_input_at
@@ -3839,17 +3833,6 @@ def _safe_metadata_preview(value: Any) -> str:
                 )
             if TTS_TEXT_DEBUG:
                 logger.info("TTS text debug: raw_chunk_count=%s raw_total_length=%s raw_preview=%s final_preview=%s", chunk_count, len(raw_text), _redact_sensitive_text(raw_text)[:200], _redact_sensitive_text(normalized_text)[:200])
-
-    logger.info(
-        "context_pruned: turn_id=%s total_messages=%s kept_messages=%s dropped_messages=%s context_window_turns=%s",
-        turn_id or _current_turn_id,
-        total_messages,
-        len(pruned_messages),
-        dropped_messages,
-        CONTEXT_WINDOW_TURNS,
-    )
-    return total_messages, len(pruned_messages), dropped_messages
-
 
             if TTS_PROVIDER == "hume" and HUME_FULL_UTTERANCE_TTS:
                 activity = getattr(self, "_activity", None)
