@@ -281,6 +281,55 @@ class VoiceLifecycleObservabilityTests(unittest.TestCase):
         self.assertIsNone(second["llm_request_started_at"])
         self.assertIsNone(second["tts_request_started_at"])
 
+    def test_latency_audit_rejects_stale_greeting_tts_first_audio(self):
+        # A later turn whose tts_request_started_at was not captured must not
+        # inherit a stale greeting-era tts_first_audio_at (set at session start).
+        # Otherwise tts_first_audio_to_playout_start reports the whole session
+        # gap (~11-15s) instead of the real per-speech latency.
+        audit = agent._build_voice_latency_audit(
+            turn_id=4,
+            speech_id="speech_4",
+            user_speech_started_at=100.0,
+            user_speech_stopped_at=101.0,
+            final_stt_received_at=102.0,
+            user_turn_committed_at=103.0,
+            llm_request_started_at=104.0,
+            llm_first_token_at=105.0,
+            llm_completed_at=106.0,
+            tts_request_started_at=None,
+            tts_first_audio_at=2.0,  # stale: greeting first-audio at session start
+            tts_completed_at=None,
+            assistant_playout_started_at=107.0,
+            assistant_playout_completed_at=108.0,
+        )
+
+        self.assertIsNone(audit["tts_first_audio_at"])
+        self.assertIsNone(audit["tts_first_audio_to_playout_start"])
+
+    def test_latency_audit_keeps_real_tts_first_audio_without_tts_start(self):
+        # When tts_first_audio_at legitimately belongs to this turn (after the
+        # commit boundary) it is still kept even if tts_request_started_at is
+        # missing, so accurate numbers survive.
+        audit = agent._build_voice_latency_audit(
+            turn_id=5,
+            speech_id="speech_5",
+            user_speech_started_at=100.0,
+            user_speech_stopped_at=101.0,
+            final_stt_received_at=102.0,
+            user_turn_committed_at=103.0,
+            llm_request_started_at=104.0,
+            llm_first_token_at=105.0,
+            llm_completed_at=106.0,
+            tts_request_started_at=None,
+            tts_first_audio_at=106.5,  # after commit: real for this turn
+            tts_completed_at=None,
+            assistant_playout_started_at=107.0,
+            assistant_playout_completed_at=108.0,
+        )
+
+        self.assertEqual(audit["tts_first_audio_at"], 106.5)
+        self.assertAlmostEqual(audit["tts_first_audio_to_playout_start"], 0.5)
+
     def test_hume_duplicate_request_detection_for_same_speech_and_hash(self):
         first = agent._record_hume_request_metadata(
             path="default_agent_tts_node_fallback",
