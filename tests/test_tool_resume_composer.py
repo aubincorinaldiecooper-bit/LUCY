@@ -37,11 +37,68 @@ class TimeoutEnvTests(unittest.TestCase):
             self.assertEqual(tc.normal_context_classifier_max_wait_ms(), 500)
             self.assertEqual(tc.tool_revalidation_context_classifier_max_wait_ms(), 1000)
 
+    def test_normal_precedence_normal_env_wins(self):
+        with patch.dict("os.environ", {
+            "NORMAL_CONTEXT_CLASSIFIER_MAX_WAIT_MS": "600",
+            "TRANSCRIPT_CONTEXT_LLM_TIMEOUT_MS": "200",
+        }, clear=False):
+            ms, source = tc.normal_context_classifier_timeout()
+            self.assertEqual(ms, 600)
+            self.assertEqual(source, "normal_env")
+
     def test_normal_falls_back_to_legacy_env(self):
+        import os
         with patch.dict("os.environ", {"TRANSCRIPT_CONTEXT_LLM_TIMEOUT_MS": "420"}, clear=False):
-            import os
             os.environ.pop("NORMAL_CONTEXT_CLASSIFIER_MAX_WAIT_MS", None)
-            self.assertEqual(tc.normal_context_classifier_max_wait_ms(), 420)
+            ms, source = tc.normal_context_classifier_timeout()
+            self.assertEqual(ms, 420)
+            self.assertEqual(source, "legacy_env")
+
+    def test_normal_default_when_no_env(self):
+        import os
+        with patch.dict("os.environ", {}, clear=False):
+            os.environ.pop("NORMAL_CONTEXT_CLASSIFIER_MAX_WAIT_MS", None)
+            os.environ.pop("TRANSCRIPT_CONTEXT_LLM_TIMEOUT_MS", None)
+            ms, source = tc.normal_context_classifier_timeout()
+            self.assertEqual(ms, 500)
+            self.assertEqual(source, "default")
+
+    def test_tool_precedence_tool_env_wins(self):
+        with patch.dict("os.environ", {
+            "TOOL_REVALIDATION_CONTEXT_CLASSIFIER_MAX_WAIT_MS": "1200",
+            "NORMAL_CONTEXT_CLASSIFIER_MAX_WAIT_MS": "500",
+            "TRANSCRIPT_CONTEXT_LLM_TIMEOUT_MS": "200",
+        }, clear=False):
+            ms, source = tc.tool_revalidation_context_classifier_timeout()
+            self.assertEqual(ms, 1200)
+            self.assertEqual(source, "tool_env")
+
+    def test_tool_falls_back_to_normal_then_legacy(self):
+        import os
+        with patch.dict("os.environ", {"NORMAL_CONTEXT_CLASSIFIER_MAX_WAIT_MS": "550"}, clear=False):
+            os.environ.pop("TOOL_REVALIDATION_CONTEXT_CLASSIFIER_MAX_WAIT_MS", None)
+            ms, source = tc.tool_revalidation_context_classifier_timeout()
+            self.assertEqual(ms, 550)
+            self.assertEqual(source, "normal_env")
+        with patch.dict("os.environ", {"TRANSCRIPT_CONTEXT_LLM_TIMEOUT_MS": "275"}, clear=False):
+            os.environ.pop("TOOL_REVALIDATION_CONTEXT_CLASSIFIER_MAX_WAIT_MS", None)
+            os.environ.pop("NORMAL_CONTEXT_CLASSIFIER_MAX_WAIT_MS", None)
+            ms, source = tc.tool_revalidation_context_classifier_timeout()
+            self.assertEqual(ms, 275)
+            self.assertEqual(source, "legacy_env")
+
+    def test_tool_default_when_no_env(self):
+        import os
+        with patch.dict("os.environ", {}, clear=False):
+            for var in (
+                "TOOL_REVALIDATION_CONTEXT_CLASSIFIER_MAX_WAIT_MS",
+                "NORMAL_CONTEXT_CLASSIFIER_MAX_WAIT_MS",
+                "TRANSCRIPT_CONTEXT_LLM_TIMEOUT_MS",
+            ):
+                os.environ.pop(var, None)
+            ms, source = tc.tool_revalidation_context_classifier_timeout()
+            self.assertEqual(ms, 1000)
+            self.assertEqual(source, "default")
 
     def test_additive_min_dependency_default_high(self):
         import os
@@ -129,6 +186,26 @@ class ResolutionTests(unittest.TestCase):
         ):
             res = self._run(resolve_transcript_context("look up the weather in paris", high_risk=True))
         self.assertEqual(res.classifier_path, "deterministic")
+
+    def test_tool_path_reports_timeout_source_and_path(self):
+        import os
+        with patch.object(tc, "transcript_context_llm_enabled", lambda: False), patch.object(
+            tc, "detect_transcript_context", lambda t: _ctx(confidence=0.92)
+        ), patch.dict("os.environ", {"TOOL_REVALIDATION_CONTEXT_CLASSIFIER_MAX_WAIT_MS": "1300"}, clear=False):
+            res = self._run(resolve_transcript_context("paris weather", path="tool_revalidation"))
+        self.assertEqual(res.path, "tool_revalidation")
+        self.assertEqual(res.timeout_ms, 1300)
+        self.assertEqual(res.timeout_source, "tool_env")
+
+    def test_normal_path_reports_timeout_source_and_path(self):
+        import os
+        with patch.object(tc, "transcript_context_llm_enabled", lambda: False), patch.object(
+            tc, "detect_transcript_context", lambda t: _ctx(confidence=0.92)
+        ), patch.dict("os.environ", {"NORMAL_CONTEXT_CLASSIFIER_MAX_WAIT_MS": "480"}, clear=False):
+            res = self._run(resolve_transcript_context("paris weather", path="normal_turn"))
+        self.assertEqual(res.path, "normal_turn")
+        self.assertEqual(res.timeout_ms, 480)
+        self.assertEqual(res.timeout_source, "normal_env")
 
 
 class RelationshipClassifierTests(unittest.TestCase):
