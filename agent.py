@@ -905,7 +905,18 @@ def _build_voice_latency_audit(
     llm_first = _valid_timestamp(llm_first_token_at, after=llm_start) if llm_start is not None else _valid_timestamp(llm_first_token_at)
     llm_done = _valid_timestamp(llm_completed_at, after=llm_start) if llm_start is not None else _valid_timestamp(llm_completed_at)
     tts_start = _valid_timestamp(tts_request_started_at, after=turn_committed) if turn_committed is not None else _valid_timestamp(tts_request_started_at)
-    tts_first = _valid_timestamp(tts_first_audio_at, after=tts_start) if tts_start is not None else _valid_timestamp(tts_first_audio_at)
+    # tts_first must be anchored to this turn. When tts_start is missing we cannot
+    # accept a raw tts_first_audio_at: a stale global (e.g. the greeting's
+    # first-audio timestamp captured at session start) would otherwise leak in and
+    # make tts_first_audio_to_playout_start report the whole session gap (~11-15s)
+    # instead of the real per-speech latency. Fall back to the turn-commit boundary
+    # so any timestamp predating this turn is rejected.
+    if tts_start is not None:
+        tts_first = _valid_timestamp(tts_first_audio_at, after=tts_start)
+    elif turn_committed is not None:
+        tts_first = _valid_timestamp(tts_first_audio_at, after=turn_committed)
+    else:
+        tts_first = _valid_timestamp(tts_first_audio_at)
     tts_done = _valid_timestamp(tts_completed_at, after=tts_start) if tts_start is not None else _valid_timestamp(tts_completed_at)
     playout_start = _valid_timestamp(assistant_playout_started_at, after=tts_first) if tts_first is not None else _valid_timestamp(assistant_playout_started_at)
     playout_done = _valid_timestamp(assistant_playout_completed_at, after=playout_start) if playout_start is not None else _valid_timestamp(assistant_playout_completed_at)
