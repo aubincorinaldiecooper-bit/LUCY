@@ -105,6 +105,26 @@ class TranscriptContextDeterministicTests(unittest.TestCase):
     def test_backchannel(self):
         self.assert_intent("Yeah.", "greeting_or_backchannel")
 
+    def test_memory_recall_do_you_remember(self):
+        context = self.assert_intent("Do you remember what I told you about my sister?", "memory_recall_request")
+        self.assertFalse(context.ambiguity_detected)
+        self.assertIn("recall something from earlier", context.llm_context_note or "")
+        self.assertIn("say you don't remember", context.llm_context_note or "")
+
+    def test_memory_recall_what_did_i(self):
+        self.assert_intent("What did I say my dog's name was?", "memory_recall_request")
+
+    def test_memory_recall_what_do_you_know_about_me(self):
+        self.assert_intent("What do you know about me?", "memory_recall_request")
+
+    def test_memory_recall_last_time_we_talked(self):
+        self.assert_intent("Last time we talked I mentioned a trip.", "memory_recall_request")
+
+    def test_non_recall_question_is_not_memory_recall(self):
+        # A plain factual question must not be misread as a recall ask.
+        context = detect_transcript_context("What time is it?")
+        self.assertNotEqual(context.detected_intent, "memory_recall_request")
+
 
 class TranscriptContextLLMTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
