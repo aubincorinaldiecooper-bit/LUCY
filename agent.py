@@ -3995,6 +3995,7 @@ def _search_policy_for_intent(intent: str | None, clarification_suggested: bool)
         "pronunciation_correction",
         "voice_change_request",
         "date_time_question",
+        "memory_recall_request",
     }
     if normalized == "tool_request_search":
         if clarification_suggested:
@@ -4706,6 +4707,7 @@ def _search_policy_for_intent(intent: str | None, clarification_suggested: bool)
         "pronunciation_correction",
         "voice_change_request",
         "date_time_question",
+        "memory_recall_request",
     }
     if normalized == "tool_request_search":
         if clarification_suggested:
@@ -6338,9 +6340,21 @@ class LucyAgent(Agent):
 
         memory_layer = getattr(self, "memory_layer", None)
         if memory_layer is not None:
-            retrieved_memories = await memory_layer.retrieve(_last_user_message_text)
-            if retrieved_memories:
-                _inject_memory_note(turn_ctx, retrieved_memories)
+            memory_intent = getattr(endpointing_decision_context, "detected_intent", None)
+            retrieval_allowed, retrieval_gate_reason = _memory_retrieval_policy_for_intent(memory_intent)
+            logger.info(
+                "memory_retrieval_gate=%s memory_retrieval_gate_reason=%s detected_intent=%s turn_id=%s",
+                retrieval_allowed,
+                retrieval_gate_reason,
+                memory_intent,
+                _current_turn_id,
+            )
+            if retrieval_allowed:
+                retrieved_memories = await memory_layer.retrieve(_last_user_message_text)
+                if retrieved_memories:
+                    _inject_memory_note(turn_ctx, retrieved_memories)
+            # The write path is never gated: Lucy keeps remembering every turn so
+            # there is material to recall on a later "do you remember..." turn.
             memory_layer.schedule_remember(role="user", content=_last_user_message_text, turn_id=_current_turn_id)
 
         _prune_turn_context_messages(turn_ctx, _current_turn_id)
@@ -6512,6 +6526,21 @@ async def _prewarm_models(llm_obj: Any) -> None:
                 type(exc).__name__,
                 _fmt_seconds(time.monotonic() - tc_started_at),
             )
+
+
+def _memory_retrieval_policy_for_intent(intent: str | None) -> tuple[bool, str]:
+    """Gate semantic memory retrieval to explicit recall asks.
+
+    Mirrors the search-intent gate: the ~300ms SimpleMem lookup is only paid when
+    the user is actually asking Lucy to remember something ("do you remember...",
+    "what did I..."). Every other turn skips retrieval entirely and pays no
+    latency. The memory *write* path is never gated — Lucy keeps remembering
+    everything so there is material to recall later.
+    """
+    normalized = (intent or "unknown").strip().lower()
+    if normalized == "memory_recall_request":
+        return True, "memory_recall_intent"
+    return False, "no_recall_intent"
 
 
 async def entrypoint(ctx: JobContext):

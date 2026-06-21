@@ -28,6 +28,7 @@ ALLOWED_INTENTS = {
     "counting_request",
     "profanity_reaction",
     "reference_to_prior_context",
+    "memory_recall_request",
     "unknown",
 }
 
@@ -232,6 +233,8 @@ def build_llm_context_note(context: TranscriptContext) -> str | None:
         return "The user is delegating a choice. Offer a simple recommendation or ask for one constraint if the choice is unclear."
     if intent == "reference_to_prior_context":
         return "The user referred to prior context with an ambiguous word like 'that' or 'it'. Use recent context if clear; otherwise ask what they mean."
+    if intent == "memory_recall_request":
+        return "The user is asking you to recall something from earlier conversations. Use any provided long-term memory context naturally, the way a friend remembers. If no relevant memory is available, say you don't remember rather than inventing details."
     if intent == "unclear_fragment":
         return "The transcript is fragmentary or unclear. Do not over-interpret; ask a short clarification question."
     return context.llm_context_note
@@ -280,6 +283,19 @@ def detect_transcript_context(text: str) -> TranscriptContext:
         clarification = False
         should_replace = False
         confidence = 0.86
+    elif re.search(
+        r"\b(do you remember|do you recall|you remember|remember when|remember that time|"
+        r"what did i (say|tell|mention|call|name|ask|talk)|did i (ever )?(tell|mention|say) you|"
+        r"what (was|were) (that|the) .* i (said|told|mentioned)|what do you (remember|know) about me|"
+        r"what do you remember|last time we (talked|spoke)|earlier i (said|told|mentioned)|"
+        r"i told you (about|that)|i (already )?told you|we (talked|spoke) about)\b",
+        lower,
+    ):
+        intent = "memory_recall_request"
+        ambiguity = False
+        clarification = False
+        should_replace = False
+        confidence = 0.85
     elif re.search(r"\b(email|e-mail|send (that|this|it|me)|send .* to me)\b", lower):
         intent = "tool_request_email"
         ambiguity = bool(re.search(r"\b(that|this|it)\b", lower)) or "@" not in lower
