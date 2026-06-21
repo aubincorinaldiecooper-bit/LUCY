@@ -787,5 +787,64 @@ class ContextPruningTests(unittest.TestCase):
             self.assertEqual(agent.env_int_clamped("CONTEXT_WINDOW_TURNS", 10, 4, 100), 4)
 
 
+class InterruptionLedgerTests(unittest.TestCase):
+    def setUp(self):
+        agent._conversation_ledger.clear()
+
+    def tearDown(self):
+        agent._conversation_ledger.clear()
+
+    def test_interrupted_assistant_speech_cannot_be_canonical(self):
+        # An assistant turn is added provisionally and is canonical at first.
+        entry = agent._ledger_append(
+            "assistant",
+            "half-spoken reply",
+            visible=True,
+            suppressed=False,
+            turn_id=7,
+            speech_id="sp7",
+            provisional=True,
+        )
+        self.assertTrue(entry["canonical_for_context"])
+
+        # Outcome reconciliation sees the speech was interrupted.
+        reason = agent._ledger_downgrade_reason_for_outcome(
+            was_suppressed=False,
+            interrupted="true",
+            generated_bytes=1234,
+            playout_seconds=0.4,
+        )
+        self.assertEqual(reason, "interrupted")
+
+        strategy = agent._ledger_downgrade_for_outcome(turn_id=7, speech_id="sp7", reason=reason)
+        self.assertEqual(strategy, "speech_id")
+
+        # The interrupted turn is now suppressed + non-canonical, so it can never
+        # leak into the prompt context / memory.
+        self.assertFalse(entry["canonical_for_context"])
+        self.assertTrue(entry["suppressed"])
+        self.assertEqual(agent._ledger_recent_canonical(5), [])
+
+    def test_completed_assistant_speech_stays_canonical(self):
+        entry = agent._ledger_append(
+            "assistant",
+            "a complete reply",
+            visible=True,
+            suppressed=False,
+            turn_id=8,
+            speech_id="sp8",
+            provisional=True,
+        )
+        reason = agent._ledger_downgrade_reason_for_outcome(
+            was_suppressed=False,
+            interrupted="false",
+            generated_bytes=4096,
+            playout_seconds=1.2,
+        )
+        self.assertIsNone(reason)  # audible turn → no downgrade
+        self.assertTrue(entry["canonical_for_context"])
+        self.assertEqual(len(agent._ledger_recent_canonical(5)), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
