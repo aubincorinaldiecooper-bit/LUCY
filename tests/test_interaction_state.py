@@ -150,6 +150,56 @@ class InterruptionAndOverlapTests(unittest.TestCase):
         sm.on_assistant_speech_finished(interrupted=False)
         self.assertEqual(sm.state, LISTENING)
 
+    def test_interrupt_before_first_audio(self):
+        # Speech object created (LLM/TTS scheduled) but real audio never started;
+        # user barges in. The FSM must move to USER_INTERRUPTING and never have a
+        # live active_speech_id.
+        sm = committed_machine()
+        sm.on_llm_started()
+        sm.on_assistant_speech_created("speech_pre")
+        self.assertIsNone(sm.active_speech_id)  # no playout yet
+        sm.on_user_speech_started()
+        self.assertEqual(sm.state, USER_INTERRUPTING)
+        sm.on_assistant_speech_finished(interrupted=True, speech_id="speech_pre")
+        self.assertIsNone(sm.active_speech_id)
+        self.assertNotIn("speech_pre", sm._pending_speech_ids)
+        # User is still the active party — we did not snap back to LISTENING.
+        self.assertEqual(sm.state, USER_INTERRUPTING)
+
+    def test_interrupt_mid_playout_marks_and_clears_active_speech(self):
+        sm = committed_machine()
+        sm.on_llm_started()
+        sm.on_assistant_speech_started("speech_live")
+        self.assertEqual(sm.active_speech_id, "speech_live")
+        sm.on_user_speech_started()
+        # Interruption is recorded immediately, before the handle resolves.
+        self.assertEqual(sm.state, USER_INTERRUPTING)
+        self.assertTrue(sm.active_speech_interrupted)
+        sm.on_assistant_speech_finished(interrupted=True, speech_id="speech_live")
+        self.assertIsNone(sm.active_speech_id)
+        self.assertFalse(sm.active_speech_interrupted)
+
+    def test_user_speaks_after_assistant_fully_finishes_is_clean(self):
+        sm = committed_machine()
+        sm.on_llm_started()
+        sm.on_assistant_speech_started("speech_done")
+        sm.on_assistant_speech_finished(interrupted=False, speech_id="speech_done")
+        self.assertEqual(sm.state, LISTENING)
+        self.assertIsNone(sm.active_speech_id)
+        # A new utterance after a clean finish is normal speech, NOT an interrupt.
+        sm.on_user_speech_started()
+        self.assertEqual(sm.state, USER_SPEAKING)
+        self.assertFalse(sm.active_speech_interrupted)
+
+    def test_next_user_turn_after_interruption_gets_fresh_turn_id(self):
+        sm = committed_machine(turn_id=1)
+        sm.on_llm_started()
+        sm.on_assistant_speech_started("speech_live")
+        sm.on_user_speech_started()  # interrupt
+        sm.on_user_speech_stopped()
+        sm.begin_turn(2)  # the next user utterance commits as a fresh turn
+        self.assertEqual(sm.turn_id, 2)
+
     def test_newer_turn_while_assistant_thinking_supersedes_old_turn(self):
         sm = committed_machine(turn_id=1)
         sm.on_llm_started()

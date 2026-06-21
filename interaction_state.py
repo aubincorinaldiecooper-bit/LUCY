@@ -233,6 +233,14 @@ class InteractionStateMachine:
         # Speech objects that exist (LLM/TTS scheduled) but have not begun real
         # audio playout. ASSISTANT_SPEAKING is reserved for actual playout.
         self._pending_speech_ids: set[str] = set()
+        # The speech id whose audio is actively playing out. Set when playout
+        # begins and cleared the moment it finishes/cancels, so after an
+        # interruption nothing still points at a dead speech.
+        self.active_speech_id: str | None = None
+        # True once the active assistant speech was interrupted by the user, so
+        # the interruption is recorded immediately (not only when the handle
+        # later resolves). Reset when a new speech starts.
+        self.active_speech_interrupted = False
         # Tool/search result authority to speak. A result earns authority when
         # its tool call starts and loses it the moment the user speaks during
         # TOOL_CALL_PENDING, until the newer utterance is classified.
@@ -287,6 +295,8 @@ class InteractionStateMachine:
             "detected_intent": self.detected_intent,
             "seconds_in_state": time.monotonic() - self.state_entered_at,
             "pending_speech_count": len(self._pending_speech_ids),
+            "active_speech_id": self.active_speech_id,
+            "active_speech_interrupted": self.active_speech_interrupted,
             "tool_result_speak_authority": self.tool_result_speak_authority,
             "tool_result_pending_revalidation": self.tool_result_pending_revalidation,
             "tool_result_resume_decision": self.tool_result_resume_decision,
@@ -307,6 +317,17 @@ class InteractionStateMachine:
         if self.state == TOOL_CALL_PENDING:
             self._pause_tool_result_authority("user_spoke_during_tool_call")
         if self.state in {ASSISTANT_SPEAKING, ASSISTANT_THINKING, TOOL_CALL_PENDING}:
+            # Mark the active assistant speech interrupted immediately, so the
+            # interruption is known right away rather than only when the speech
+            # handle later resolves.
+            if self.active_speech_id is not None:
+                self.active_speech_interrupted = True
+                logger.info(
+                    "active_speech_marked_interrupted=true speech_id=%s interaction_state=%s turn_id=%s",
+                    self.active_speech_id,
+                    self.state,
+                    self.turn_id,
+                )
             self.transition(USER_INTERRUPTING, reason=f"user_started_speaking_during_{self.state.lower()}")
         else:
             self.transition(USER_SPEAKING, reason="user_started_speaking")
@@ -522,12 +543,20 @@ class InteractionStateMachine:
                 self.overlap_count,
             )
         self._pending_speech_ids.discard(speech_id)
+        self.active_speech_id = speech_id
+        self.active_speech_interrupted = overlap
         self.transition(ASSISTANT_SPEAKING, reason=f"assistant_speech_started:{speech_id}")
         return overlap
 
     def on_assistant_speech_finished(self, interrupted: bool, speech_id: str | None = None) -> None:
         if speech_id is not None:
             self._pending_speech_ids.discard(speech_id)
+        # Clear the active speech once it finishes/cancels so nothing keeps
+        # pointing at a dead speech after an interruption. Only clear when it
+        # matches (or no id was tracked) to avoid clobbering a newer speech.
+        if speech_id is None or self.active_speech_id is None or self.active_speech_id == speech_id:
+            self.active_speech_id = None
+            self.active_speech_interrupted = False
         if self.state == ASSISTANT_SPEAKING:
             self.transition(LISTENING, reason="assistant_speech_finished_interrupted" if interrupted else "assistant_speech_finished")
 
