@@ -6,6 +6,7 @@ import logging
 import os
 import time
 import uuid
+import asyncio
 from email.utils import parseaddr
 from html.parser import HTMLParser
 from typing import Any, AsyncIterable
@@ -681,37 +682,85 @@ async def create_livekit_session(payload: SessionRequest, request: Request):
 class FeedbackRequest(BaseModel):
     email: str | None = None
     message: str | None = None
+    user_id: str | None = None
 
 
-def _respond_to_feedback(companion_input: dict[str, Any]) -> None:
-    """Generate Arche's reply to a user's feedback and email it back to them.
+def _insert_feedback_row(user_id: str | None, email: str | None, message: str) -> str | None:
+    """Persist feedback to Postgres and return its id. None on failure.
 
-    Runs in the background so the request returns immediately, mirroring the
-    inbound-email companion flow. The user's address is the reply target, which
-    is why this is an autonomous loop (Arche writes back to the person).
+    This is the durable record the team reviews; capturing it is the priority,
+    so it runs before (and independently of) the autonomous Arche reply.
     """
-    to_email = str(companion_input.get("userEmail") or "").strip()
-    if not to_email:
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        logger.warning("feedback_not_persisted reason=missing_DATABASE_URL")
+        return None
+    try:
+        import psycopg
+
+        with psycopg.connect(database_url, connect_timeout=5) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO feedback (user_id, email, message) VALUES (%s, %s, %s) RETURNING id",
+                    (user_id, email, message),
+                )
+                row = cur.fetchone()
+            conn.commit()
+        feedback_id = str(row[0]) if row else None
+        logger.info("feedback_persisted feedback_id=%s", feedback_id)
+        return feedback_id
+    except Exception:
+        logger.exception("feedback_persist_failed")
+        return None
+
+
+def _update_feedback_reply(feedback_id: str, reply: str) -> None:
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url or not feedback_id:
         return
+    try:
+        import psycopg
+
+        with psycopg.connect(database_url, connect_timeout=5) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE feedback SET reply = %s, replied_at = now() WHERE id = %s",
+                    (reply, feedback_id),
+                )
+            conn.commit()
+    except Exception:
+        logger.exception("feedback_reply_update_failed")
+
+
+def _reply_to_feedback(feedback_id: str | None, email: str, message: str) -> None:
+    """Generate Arche's reply to feedback and email it back to the user.
+
+    Runs in the background so the request returns immediately. Best-effort: a
+    failure here never loses the already-persisted feedback row.
+    """
+    companion_input = {
+        "userEmail": email,
+        "subject": "Your note to Arche",
+        "body": message,
+    }
     try:
         reply_text = generate_companion_email_response(companion_input)
     except CompanionEmailError:
-        logger.exception("feedback companion response failed")
+        logger.exception("feedback companion response failed feedback_id=%s", feedback_id)
         return
     try:
-        result = send_email(
-            to=to_email,
-            subject="Re: your note to Arche",
-            text=reply_text,
-        )
+        result = send_email(to=email, subject="Re: your note to Arche", text=reply_text)
     except AgentMailError:
-        logger.exception("feedback reply send failed")
+        logger.exception("feedback reply send failed feedback_id=%s", feedback_id)
         return
     logger.info(
-        "feedback reply sent reply_message_id=%s reply_text_length=%s",
+        "feedback reply sent feedback_id=%s reply_message_id=%s reply_text_length=%s",
+        feedback_id,
         result.get("message_id"),
         len(reply_text),
     )
+    if feedback_id:
+        _update_feedback_reply(feedback_id, reply_text)
 
 
 @app.post("/api/feedback")
@@ -731,16 +780,19 @@ async def submit_feedback(
 
     email = (payload.email or "").strip()
     message = (payload.message or "").strip()
+    user_id = (payload.user_id or "").strip() or None
     if not email or not message:
         raise HTTPException(status_code=400, detail="email and message are required")
     if len(message) > 5000:
         raise HTTPException(status_code=400, detail="message too long")
 
-    companion_input = {
-        "userEmail": email,
-        "subject": "Your note to Arche",
-        "body": message,
-    }
-    background_tasks.add_task(_respond_to_feedback, companion_input)
-    logger.info("feedback accepted message_length=%s", len(message))
+    # Persist first (authoritative) — the durable record matters more than the
+    # auto-reply. Fail the request if we couldn't store it so the user can retry.
+    feedback_id = await asyncio.to_thread(_insert_feedback_row, user_id, email, message)
+    if feedback_id is None:
+        raise HTTPException(status_code=502, detail="could not store feedback")
+
+    # Then reply as Arche in the background (best-effort).
+    background_tasks.add_task(_reply_to_feedback, feedback_id, email, message)
+    logger.info("feedback accepted feedback_id=%s message_length=%s", feedback_id, len(message))
     return JSONResponse({"ok": True})

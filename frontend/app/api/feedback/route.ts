@@ -13,6 +13,7 @@ export async function POST(request: Request) {
   if (!session?.user?.email) {
     return NextResponse.json({ error: "Please sign in to leave feedback." }, { status: 401 });
   }
+  const userId = session.user.id;
 
   let body: { message?: string } = {};
   try {
@@ -39,7 +40,7 @@ export async function POST(request: Request) {
     const upstream = await fetch(new URL("/api/feedback", backendUrl).toString(), {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Internal-Auth": sharedSecret },
-      body: JSON.stringify({ email: session.user.email, message }),
+      body: JSON.stringify({ email: session.user.email, message, user_id: userId }),
     });
     if (!upstream.ok) {
       return NextResponse.json(
