@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from livekit import api
 from pydantic import BaseModel
 
-from agentmail_client import AgentMailError, reply_to_email
+from agentmail_client import AgentMailError, reply_to_email, send_email
 from companion_email import CompanionEmailError, generate_companion_email_response
 from memory_layer import MemoryIdentity, MemoryLayer, memory_enabled
 
@@ -676,3 +676,71 @@ async def create_livekit_session(payload: SessionRequest, request: Request):
 
     await lkapi.aclose()
     return {"room_url": os.getenv("LIVEKIT_URL"), "token": token}
+
+
+class FeedbackRequest(BaseModel):
+    email: str | None = None
+    message: str | None = None
+
+
+def _respond_to_feedback(companion_input: dict[str, Any]) -> None:
+    """Generate Arche's reply to a user's feedback and email it back to them.
+
+    Runs in the background so the request returns immediately, mirroring the
+    inbound-email companion flow. The user's address is the reply target, which
+    is why this is an autonomous loop (Arche writes back to the person).
+    """
+    to_email = str(companion_input.get("userEmail") or "").strip()
+    if not to_email:
+        return
+    try:
+        reply_text = generate_companion_email_response(companion_input)
+    except CompanionEmailError:
+        logger.exception("feedback companion response failed")
+        return
+    try:
+        result = send_email(
+            to=to_email,
+            subject="Re: your note to Arche",
+            text=reply_text,
+        )
+    except AgentMailError:
+        logger.exception("feedback reply send failed")
+        return
+    logger.info(
+        "feedback reply sent reply_message_id=%s reply_text_length=%s",
+        result.get("message_id"),
+        len(reply_text),
+    )
+
+
+@app.post("/api/feedback")
+async def submit_feedback(
+    payload: FeedbackRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+) -> JSONResponse:
+    # Trust comes from the frontend BFF route, which verified the Better Auth
+    # session before forwarding. Require the shared secret so the public endpoint
+    # can't be driven directly.
+    expected = os.getenv("SESSION_IDENTITY_SHARED_SECRET", "")
+    provided = request.headers.get("x-internal-auth", "")
+    if not (expected and provided and hmac.compare_digest(provided, expected)):
+        logger.warning("feedback rejected: secret_configured=%s header_present=%s", bool(expected), bool(provided))
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+    email = (payload.email or "").strip()
+    message = (payload.message or "").strip()
+    if not email or not message:
+        raise HTTPException(status_code=400, detail="email and message are required")
+    if len(message) > 5000:
+        raise HTTPException(status_code=400, detail="message too long")
+
+    companion_input = {
+        "userEmail": email,
+        "subject": "Your note to Arche",
+        "body": message,
+    }
+    background_tasks.add_task(_respond_to_feedback, companion_input)
+    logger.info("feedback accepted message_length=%s", len(message))
+    return JSONResponse({"ok": True})

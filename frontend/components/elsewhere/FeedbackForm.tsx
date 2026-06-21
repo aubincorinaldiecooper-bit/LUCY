@@ -37,7 +37,7 @@ export function FeedbackForm() {
   if (status === "sent") {
     return (
       <div className="rounded-xl bg-[#34C759]/10 px-4 py-3 text-center">
-        <p className="text-xs font-medium text-[#34C759]">Thanks — your feedback is on its way to the team.</p>
+        <p className="text-xs font-medium text-[#34C759]">Thanks — Arche will write back to you by email shortly.</p>
       </div>
     );
   }

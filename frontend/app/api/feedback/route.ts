@@ -1,23 +1,16 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
-import { sendAgentMailEmail } from "@/lib/agentmail";
 
 const MAX_FEEDBACK_CHARS = 5000;
 
-function escapeHtml(value: string): string {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
-
 // Collect end-of-session feedback. Sign-in is REQUIRED — verified here via the
-// Better Auth session (the UI gates too, this is the server-side enforcement).
-// Each submission is emailed to the team inbox via AgentMail.
+// Better Auth session. We forward the verified user's email + message to the
+// Python backend (server-to-server, shared secret), which generates Arche's
+// reply and emails it back to the user. That makes the loop autonomous: the
+// agent itself responds to feedback.
 export async function POST(request: Request) {
   const session = await auth.api.getSession({ headers: request.headers });
-  if (!session?.user) {
+  if (!session?.user?.email) {
     return NextResponse.json({ error: "Please sign in to leave feedback." }, { status: 401 });
   }
 
@@ -36,24 +29,24 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Feedback is too long." }, { status: 400 });
   }
 
-  const to = process.env.FEEDBACK_TO_EMAIL || process.env.AGENTMAIL_FROM_EMAIL;
-  if (!to) {
-    return NextResponse.json(
-      { error: "Feedback destination is not configured." },
-      { status: 500 }
-    );
+  const backendUrl = process.env.BACKEND_API_URL ?? process.env.NEXT_PUBLIC_API_URL;
+  const sharedSecret = process.env.SESSION_IDENTITY_SHARED_SECRET;
+  if (!backendUrl || !sharedSecret) {
+    return NextResponse.json({ error: "Feedback is not configured." }, { status: 500 });
   }
 
-  const userEmail = session.user.email ?? "unknown";
-  const subject = `Lucy feedback from ${userEmail}`;
-  const text = `From: ${userEmail} (user id: ${session.user.id})\n\n${message}`;
-  const html =
-    `<p><strong>From:</strong> ${escapeHtml(userEmail)} ` +
-    `(user id: ${escapeHtml(session.user.id)})</p>` +
-    `<p style="white-space:pre-wrap">${escapeHtml(message)}</p>`;
-
   try {
-    await sendAgentMailEmail({ to, subject, text, html });
+    const upstream = await fetch(new URL("/api/feedback", backendUrl).toString(), {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Internal-Auth": sharedSecret },
+      body: JSON.stringify({ email: session.user.email, message }),
+    });
+    if (!upstream.ok) {
+      return NextResponse.json(
+        { error: "Couldn't send your feedback right now. Please try again." },
+        { status: 502 }
+      );
+    }
   } catch {
     return NextResponse.json(
       { error: "Couldn't send your feedback right now. Please try again." },
