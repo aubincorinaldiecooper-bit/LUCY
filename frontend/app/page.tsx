@@ -2,6 +2,7 @@
 
 import { AnimatePresence } from "framer-motion";
 import { useCallback, useEffect, useMemo, useState } from "react";
+import AccountLink from "@/components/auth/AccountLink";
 import { EarlyAccessModal } from "@/components/elsewhere/EarlyAccessModal";
 import { EndSessionPage } from "@/components/elsewhere/EndSessionPage";
 import { LandingPage } from "@/components/elsewhere/LandingPage";
@@ -55,6 +56,13 @@ function HomePage() {
 
   return (
     <div className="min-h-screen bg-[#FAFAFA] font-sans text-[#1C1C1E] antialiased selection:bg-[#D4A373]/20">
+      {/* Account affordance, shown only outside an active call so it never
+          competes with the conversation UI. */}
+      {view === "landing" || view === "ended" ? (
+        <div className="fixed right-4 top-4 z-50">
+          <AccountLink />
+        </div>
+      ) : null}
       <AnimatePresence mode="wait">
         {view === "landing" ? <LandingPage key="landing" onStartSession={handleStart} onOpenEarlyAccess={() => setShowEarlyAccess(true)} /> : null}
         {view === "preparing" ? <PreparingPage key="preparing" onCancel={handleCancelPreparing} /> : null}
