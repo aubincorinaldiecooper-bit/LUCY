@@ -1,6 +1,7 @@
 import { betterAuth } from "better-auth";
 import { magicLink } from "better-auth/plugins";
 import { Pool } from "pg";
+import { sendAgentMailEmail } from "@/lib/agentmail";
 
 // Better Auth lives in the Next.js app and stores its tables (user, session,
 // account, verification) in the SAME Postgres your agent uses. It reads
@@ -38,25 +39,20 @@ export const auth = betterAuth({
 });
 
 /**
- * TODO: wire this to your real email provider. The cheapest options reuse infra
- * you already have:
- *   - Resend:  await resend.emails.send({ from, to: email, subject: "Sign in to Lucy",
- *                html: `<a href="${url}">Click to sign in</a>` })
- *   - AgentMail / your backend: POST an email job to your existing email service.
- *   - SMTP (nodemailer): transporter.sendMail({ to: email, html: ... })
- *
- * In dev the link is logged above, so this can stay a no-op locally. In
- * production it throws until implemented, so a missing provider fails loudly
- * instead of silently "succeeding" without delivering the link.
+ * Sends the magic-link email via AgentMail (the same inbox the agent uses).
+ * Requires AGENTMAIL_API_KEY / AGENTMAIL_INBOX_ID / AGENTMAIL_FROM_EMAIL on the
+ * frontend service. The 5-minute expiry mirrors the plugin's `expiresIn`.
  */
 async function sendMagicLinkEmail(email: string, url: string): Promise<void> {
-  if (process.env.NODE_ENV === "production") {
-    throw new Error(
-      "sendMagicLinkEmail is not implemented. Wire your email provider in " +
-        "frontend/lib/auth.ts before deploying magic-link sign-in."
-    );
-  }
-  // No-op in non-production: the link was already logged for manual testing.
-  void email;
-  void url;
+  const subject = "Your Lucy sign-in link";
+  const text =
+    `Click to sign in to Lucy:\n\n${url}\n\n` +
+    "This link expires in 5 minutes. If you didn't request it, you can ignore this email.";
+  const html =
+    `<p>Click to sign in to Lucy:</p>` +
+    `<p><a href="${url}">Sign in to Lucy</a></p>` +
+    `<p style="color:#666;font-size:13px">This link expires in 5 minutes. ` +
+    `If you didn't request it, you can ignore this email.</p>`;
+
+  await sendAgentMailEmail({ to: email, subject, text, html });
 }
