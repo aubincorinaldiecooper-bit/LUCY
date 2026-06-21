@@ -2,13 +2,14 @@
 
 import { motion } from "framer-motion";
 import { FormEvent, useState } from "react";
+import AccountLink from "@/components/auth/AccountLink";
 import { Button } from "./Button";
 import { Input } from "./Input";
 import { PageTransition } from "./PageTransition";
 
 const END_IMAGE = "https://res.cloudinary.com/dvsfba1ww/image/upload/q_auto/f_auto/v1780860202/ChatGPT_Image_Jun_7_2026_02_34_47_PM_uwszje.png";
 
-export function EndSessionPage({ onReturnHome, onOpenEarlyAccess }: { onReturnHome: () => void; onOpenEarlyAccess: () => void }) {
+export function EndSessionPage({ onReturnHome }: { onReturnHome: () => void }) {
   const [email, setEmail] = useState("");
   const [submitted, setSubmitted] = useState(false);
 
@@ -24,7 +25,7 @@ export function EndSessionPage({ onReturnHome, onOpenEarlyAccess }: { onReturnHo
       <div className="relative flex h-screen flex-1 flex-col overflow-hidden bg-[#FAFAFA]">
         <nav className="fixed top-0 z-40 flex w-full items-center justify-between border-b border-[#E5E5E5]/50 bg-[#FAFAFA]/90 px-5 py-4 backdrop-blur-xl md:px-8">
           <div className="text-sm font-semibold tracking-tight text-[#1C1C1E]">Elsewhere</div>
-          <Button variant="outline" onClick={onOpenEarlyAccess} className="!rounded-full !px-4 !py-1.5 !text-xs">Early access</Button>
+          <AccountLink variant="light" />
         </nav>
         <div className="relative z-10 flex flex-1 flex-col items-center justify-center px-5 pb-6 pt-20 md:px-8">
           <div className="flex w-full max-w-lg flex-col items-center">
