@@ -159,11 +159,33 @@ def detect_datetime_intent(text: str) -> str | None:
     return None
 
 
-def answer_datetime_intent(runtime_context: RuntimeContext, intent: str) -> str:
-    local_now = datetime.fromisoformat(runtime_context.current_datetime_iso)
-    date_phrase = f"{runtime_context.weekday}, {local_now.strftime('%B')} {_ordinal_day(local_now.day)}, {local_now.year}"
+def current_datetime_snapshot(
+    runtime_context: RuntimeContext, now: datetime | None = None
+) -> tuple[str, str]:
+    """Fresh (current_date, current_time) in the session timezone, recomputed now.
+
+    Never reuses runtime_context.current_* (which is frozen at session init). Pass
+    `now` in tests to advance the clock deterministically.
+    """
+    tz = ZoneInfo(runtime_context.session_timezone)
+    local_now = now.astimezone(tz) if now else datetime.now(tz)
+    return local_now.strftime("%Y-%m-%d"), local_now.strftime("%I:%M %p").lstrip("0")
+
+
+def answer_datetime_intent(
+    runtime_context: RuntimeContext, intent: str, now: datetime | None = None
+) -> str:
+    # Recompute the current moment in the session timezone on every call. The
+    # values stored on runtime_context are captured at session start and go stale
+    # as the conversation continues, so a later "what time is it?" must not reuse
+    # them. `now` is injectable for deterministic tests.
+    tz = ZoneInfo(runtime_context.session_timezone)
+    local_now = now.astimezone(tz) if now else datetime.now(tz)
+    current_time = local_now.strftime("%I:%M %p").lstrip("0")
+    weekday = local_now.strftime("%A")
+    date_phrase = f"{weekday}, {local_now.strftime('%B')} {_ordinal_day(local_now.day)}, {local_now.year}"
     if intent == "time":
-        return f"It’s {runtime_context.current_time} in {runtime_context.session_timezone}."
+        return f"It’s {current_time} in {runtime_context.session_timezone}."
     if intent == "month":
         return f"It’s {local_now.strftime('%B')} in {runtime_context.session_timezone}."
     if intent == "year":
