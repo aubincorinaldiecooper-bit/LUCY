@@ -12,10 +12,11 @@ function getClientTimezone() {
 }
 
 function resolveSessionUrl() {
-  const rawApiUrl = process.env.NEXT_PUBLIC_API_URL?.trim().replace(/^['"]|['"]$/g, "");
-  if (!rawApiUrl) throw new Error("NEXT_PUBLIC_API_URL is not configured");
-  const baseUrl = /^https?:\/\//i.test(rawApiUrl) ? rawApiUrl : `https://${rawApiUrl}`;
-  return new URL("/api/livekit/session", baseUrl).toString();
+  // Call our same-origin BFF route (app/api/livekit/session). It validates the
+  // Better Auth session here — where the cookie is readable — then forwards to
+  // the Python backend with the verified user_id. Same-origin also means the
+  // session cookie is sent automatically and no CORS is involved.
+  return "/api/livekit/session";
 }
 
 async function createSession(model?: string): Promise<SessionResponse> {
