@@ -1,8 +1,25 @@
 import { betterAuth } from "better-auth";
 import { magicLink } from "better-auth/plugins";
 import { Pool } from "pg";
+import { createHash } from "crypto";
 import { sendAgentMailEmail } from "@/lib/agentmail";
 import { buildMagicLinkEmail } from "@/lib/magic-link-email";
+
+// Short, non-reversible email fingerprint for logs (never log the raw address).
+function hashEmail(email: string): string {
+  return createHash("sha256").update(email.trim().toLowerCase()).digest("hex").slice(0, 12);
+}
+
+// Parse a magic-link URL into safe-to-log parts: the origin only (never the
+// token), and the callbackURL query param.
+function safeUrlParts(url: string): { origin: string; callbackURL: string } {
+  try {
+    const parsed = new URL(url);
+    return { origin: parsed.origin, callbackURL: parsed.searchParams.get("callbackURL") ?? "none" };
+  } catch {
+    return { origin: "unparseable", callbackURL: "unknown" };
+  }
+}
 
 // Better Auth lives in the Next.js app and stores its tables (user, session,
 // account, verification) in the SAME Postgres your agent uses. It reads
@@ -28,12 +45,29 @@ export const auth = betterAuth({
       // Called when a user requests a sign-in link. `url` already contains the
       // one-time token and the callbackURL; the user clicks it and is signed in.
       sendMagicLink: async ({ email, url }) => {
+        const emailHash = hashEmail(email);
+        const { origin, callbackURL } = safeUrlParts(url);
+        // Safe, structured observability — no raw email, no token.
+        console.log(
+          `[better-auth] magic_link_requested email_hash=${emailHash} ` +
+            `better_auth_url=${process.env.BETTER_AUTH_URL ?? "unset"} ` +
+            `url_origin=${origin} callback_url=${callbackURL}`
+        );
         if (process.env.NODE_ENV !== "production") {
-          // Dev convenience: surface the link in server logs so you can test
-          // without an email provider wired up yet.
+          // Dev only: full link (contains the token) for local testing. Never in prod.
           console.log(`[better-auth] magic link for ${email}: ${url}`);
         }
-        await sendMagicLinkEmail(email, url);
+        try {
+          await sendMagicLinkEmail(email, url);
+          console.log(`[better-auth] magic_link_send status=success email_hash=${emailHash}`);
+        } catch (error) {
+          console.error(
+            `[better-auth] magic_link_send status=failure email_hash=${emailHash} ` +
+              `error_type=${error instanceof Error ? error.name : "unknown"} ` +
+              `error_message=${error instanceof Error ? error.message : String(error)}`
+          );
+          throw error;
+        }
       },
     }),
   ],
