@@ -2,6 +2,7 @@ import { betterAuth } from "better-auth";
 import { magicLink } from "better-auth/plugins";
 import { Pool } from "pg";
 import { sendAgentMailEmail } from "@/lib/agentmail";
+import { buildMagicLinkEmail } from "@/lib/magic-link-email";
 
 // Better Auth lives in the Next.js app and stores its tables (user, session,
 // account, verification) in the SAME Postgres your agent uses. It reads
@@ -44,15 +45,6 @@ export const auth = betterAuth({
  * frontend service. The 5-minute expiry mirrors the plugin's `expiresIn`.
  */
 async function sendMagicLinkEmail(email: string, url: string): Promise<void> {
-  const subject = "Your Lucy sign-in link";
-  const text =
-    `Click to sign in to Lucy:\n\n${url}\n\n` +
-    "This link expires in 5 minutes. If you didn't request it, you can ignore this email.";
-  const html =
-    `<p>Click to sign in to Lucy:</p>` +
-    `<p><a href="${url}">Sign in to Lucy</a></p>` +
-    `<p style="color:#666;font-size:13px">This link expires in 5 minutes. ` +
-    `If you didn't request it, you can ignore this email.</p>`;
-
+  const { subject, text, html } = buildMagicLinkEmail(url);
   await sendAgentMailEmail({ to: email, subject, text, html });
 }

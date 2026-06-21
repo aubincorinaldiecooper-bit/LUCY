@@ -2,7 +2,7 @@
 
 import { useEffect, useRef } from "react";
 import { motion } from "framer-motion";
-import { Button } from "./Button";
+import AccountLink from "@/components/auth/AccountLink";
 import { PageTransition } from "./PageTransition";
 
 function InteractiveShader({
@@ -197,7 +197,7 @@ function ShaderBackground() {
   );
 }
 
-export function LandingPage({ onStartSession, onOpenEarlyAccess }: { onStartSession: () => void; onOpenEarlyAccess: () => void }) {
+export function LandingPage({ onStartSession }: { onStartSession: () => void }) {
   return (
     <PageTransition>
       <section className="relative isolate flex h-screen w-screen overflow-hidden bg-black text-white">
@@ -205,13 +205,7 @@ export function LandingPage({ onStartSession, onOpenEarlyAccess }: { onStartSess
 
         <nav className="fixed left-0 right-0 top-0 z-40 flex w-full items-center justify-between px-6 py-5 md:px-10 lg:px-16">
           <div className="text-sm font-light tracking-tight text-white/85">Elsewhere</div>
-          <Button
-            variant="ghost"
-            onClick={onOpenEarlyAccess}
-            className="!rounded-full !border !border-white/10 !bg-white/5 !px-4 !py-1.5 !text-xs !font-light !text-white/80 !backdrop-blur-sm hover:!bg-white/10 hover:!text-white"
-          >
-            Early access
-          </Button>
+          <AccountLink variant="dark" />
         </nav>
 
         <div className="relative z-10 mx-auto flex w-full max-w-7xl flex-col items-start justify-center gap-6 px-6 pb-20 pt-32 sm:gap-8 sm:pt-40 md:px-10 lg:px-16">
@@ -245,13 +239,6 @@ export function LandingPage({ onStartSession, onOpenEarlyAccess }: { onStartSess
               className="rounded-2xl border border-white/10 bg-white/10 px-5 py-3 text-sm font-light tracking-tight text-white backdrop-blur-sm transition-colors duration-300 hover:bg-white/20 focus:outline-none focus:ring-2 focus:ring-white/30"
             >
               Meet Arche
-            </button>
-            <button
-              type="button"
-              onClick={onOpenEarlyAccess}
-              className="rounded-2xl border border-white/10 px-5 py-3 text-sm font-light tracking-tight text-white/80 transition-colors duration-300 hover:bg-white/5 focus:outline-none focus:ring-2 focus:ring-white/30"
-            >
-              Early access
             </button>
           </motion.div>
 

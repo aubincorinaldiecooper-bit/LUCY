@@ -16,13 +16,11 @@ export function ListeningPage({
   timer,
   onToggleMute,
   onEnd,
-  onOpenEarlyAccess,
 }: {
   isMuted: boolean;
   timer: number;
   onToggleMute: () => void;
   onEnd: () => void;
-  onOpenEarlyAccess: () => void;
 }) {
   return (
     <PageTransition>
@@ -32,7 +30,6 @@ export function ListeningPage({
             <div className="h-3.5 w-3.5 rounded-full bg-gradient-to-br from-[#E0C9A8] to-[#C4A882]" />
             <span className="text-sm font-semibold tracking-tight text-[#1C1C1E]">Elsewhere</span>
           </div>
-          <Button variant="outline" onClick={onOpenEarlyAccess} className="!px-4 !py-1.5 !text-xs">Early access</Button>
         </nav>
         <div className="relative z-10 flex flex-1 flex-col items-center justify-center px-6 pt-20">
           <div className="relative mb-8 flex h-[100px] w-[100px] items-center justify-center md:mb-10 md:h-[130px] md:w-[130px]" aria-hidden="true">

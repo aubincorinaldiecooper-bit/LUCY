@@ -6,6 +6,7 @@ import logging
 import os
 import time
 import uuid
+import asyncio
 from email.utils import parseaddr
 from html.parser import HTMLParser
 from typing import Any, AsyncIterable
@@ -19,7 +20,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from livekit import api
 from pydantic import BaseModel
 
-from agentmail_client import AgentMailError, reply_to_email
+from agentmail_client import AgentMailError, reply_to_email, send_email
 from companion_email import CompanionEmailError, generate_companion_email_response
 from memory_layer import MemoryIdentity, MemoryLayer, memory_enabled
 
@@ -596,6 +597,30 @@ async def hume_clm_chat_completions(request: Request):
 class SessionRequest(BaseModel):
     model: str | None = None
     client_timezone: str | None = None
+    # Verified user id, only trusted when the request carries the matching
+    # SESSION_IDENTITY_SHARED_SECRET (i.e. it came from our own Next.js BFF route
+    # after Better Auth validated the session). Never trust this from the browser.
+    user_id: str | None = None
+
+
+def _trusted_user_id_from_request(request: Request, payload_user_id: str | None) -> str | None:
+    """Return payload.user_id only if the caller proved it's our trusted server.
+
+    Fails closed: if the secret is unset or the header doesn't match, the id is
+    ignored and the session is treated as anonymous (guest), exactly as before.
+    """
+    if not payload_user_id:
+        return None
+    expected = os.getenv("SESSION_IDENTITY_SHARED_SECRET", "")
+    provided = request.headers.get("x-internal-auth", "")
+    if expected and provided and hmac.compare_digest(provided, expected):
+        return payload_user_id
+    logger.warning(
+        "LiveKit session ignored untrusted user_id: secret_configured=%s header_present=%s",
+        bool(expected),
+        bool(provided),
+    )
+    return None
 
 
 @app.get("/health")
@@ -604,9 +629,10 @@ async def health() -> JSONResponse:
 
 
 @app.post("/api/livekit/session")
-async def create_livekit_session(payload: SessionRequest):
+async def create_livekit_session(payload: SessionRequest, request: Request):
     room_name = f"lucy-{uuid4().hex[:10]}"
     identity = f"web-{uuid4().hex[:8]}"
+    trusted_user_id = _trusted_user_id_from_request(request, payload.user_id)
 
     lkapi = api.LiveKitAPI(
         url=os.getenv("LIVEKIT_URL"),
@@ -618,18 +644,22 @@ async def create_livekit_session(payload: SessionRequest):
         for key, value in {
             "model": payload.model,
             "client_timezone": payload.client_timezone,
+            # The agent's memory_layer reads user_id to scope long-term memory to
+            # a real signed-in user; absent -> anonymous/guest scope.
+            "user_id": trusted_user_id,
         }.items()
         if value is not None
     }
     metadata = json.dumps(metadata_payload)
     metadata_keys = sorted(metadata_payload.keys())
     logger.info(
-        "LiveKit session metadata prepared: client_timezone_present=%s client_timezone_value=%s metadata_payload_keys=%s room_metadata_includes_client_timezone=%s token_metadata_includes_client_timezone=%s",
+        "LiveKit session metadata prepared: client_timezone_present=%s client_timezone_value=%s metadata_payload_keys=%s room_metadata_includes_client_timezone=%s token_metadata_includes_client_timezone=%s session_user_id_attached=%s",
         bool(payload.client_timezone),
         payload.client_timezone or "none",
         metadata_keys,
         "client_timezone" in metadata_payload,
         "client_timezone" in metadata_payload,
+        bool(trusted_user_id),
     )
     room_request = api.CreateRoomRequest(name=room_name, empty_timeout=600)
     room_request.metadata = metadata
@@ -647,3 +677,122 @@ async def create_livekit_session(payload: SessionRequest):
 
     await lkapi.aclose()
     return {"room_url": os.getenv("LIVEKIT_URL"), "token": token}
+
+
+class FeedbackRequest(BaseModel):
+    email: str | None = None
+    message: str | None = None
+    user_id: str | None = None
+
+
+def _insert_feedback_row(user_id: str | None, email: str | None, message: str) -> str | None:
+    """Persist feedback to Postgres and return its id. None on failure.
+
+    This is the durable record the team reviews; capturing it is the priority,
+    so it runs before (and independently of) the autonomous Arche reply.
+    """
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        logger.warning("feedback_not_persisted reason=missing_DATABASE_URL")
+        return None
+    try:
+        import psycopg
+
+        with psycopg.connect(database_url, connect_timeout=5) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO feedback (user_id, email, message) VALUES (%s, %s, %s) RETURNING id",
+                    (user_id, email, message),
+                )
+                row = cur.fetchone()
+            conn.commit()
+        feedback_id = str(row[0]) if row else None
+        logger.info("feedback_persisted feedback_id=%s", feedback_id)
+        return feedback_id
+    except Exception:
+        logger.exception("feedback_persist_failed")
+        return None
+
+
+def _update_feedback_reply(feedback_id: str, reply: str) -> None:
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url or not feedback_id:
+        return
+    try:
+        import psycopg
+
+        with psycopg.connect(database_url, connect_timeout=5) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE feedback SET reply = %s, replied_at = now() WHERE id = %s",
+                    (reply, feedback_id),
+                )
+            conn.commit()
+    except Exception:
+        logger.exception("feedback_reply_update_failed")
+
+
+def _reply_to_feedback(feedback_id: str | None, email: str, message: str) -> None:
+    """Generate Arche's reply to feedback and email it back to the user.
+
+    Runs in the background so the request returns immediately. Best-effort: a
+    failure here never loses the already-persisted feedback row.
+    """
+    companion_input = {
+        "userEmail": email,
+        "subject": "Your note to Arche",
+        "body": message,
+    }
+    try:
+        reply_text = generate_companion_email_response(companion_input)
+    except CompanionEmailError:
+        logger.exception("feedback companion response failed feedback_id=%s", feedback_id)
+        return
+    try:
+        result = send_email(to=email, subject="Re: your note to Arche", text=reply_text)
+    except AgentMailError:
+        logger.exception("feedback reply send failed feedback_id=%s", feedback_id)
+        return
+    logger.info(
+        "feedback reply sent feedback_id=%s reply_message_id=%s reply_text_length=%s",
+        feedback_id,
+        result.get("message_id"),
+        len(reply_text),
+    )
+    if feedback_id:
+        _update_feedback_reply(feedback_id, reply_text)
+
+
+@app.post("/api/feedback")
+async def submit_feedback(
+    payload: FeedbackRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+) -> JSONResponse:
+    # Trust comes from the frontend BFF route, which verified the Better Auth
+    # session before forwarding. Require the shared secret so the public endpoint
+    # can't be driven directly.
+    expected = os.getenv("SESSION_IDENTITY_SHARED_SECRET", "")
+    provided = request.headers.get("x-internal-auth", "")
+    if not (expected and provided and hmac.compare_digest(provided, expected)):
+        logger.warning("feedback rejected: secret_configured=%s header_present=%s", bool(expected), bool(provided))
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+    email = (payload.email or "").strip()
+    message = (payload.message or "").strip()
+    user_id = (payload.user_id or "").strip() or None
+    if not email or not message:
+        raise HTTPException(status_code=400, detail="email and message are required")
+    if len(message) > 5000:
+        raise HTTPException(status_code=400, detail="message too long")
+
+    # Persist first (authoritative) — the durable record matters more than the
+    # auto-reply. Fail the request if we couldn't store it so the user can retry.
+    feedback_id = await asyncio.to_thread(_insert_feedback_row, user_id, email, message)
+    if feedback_id is None:
+        raise HTTPException(status_code=502, detail="could not store feedback")
+
+    # Then reply as Arche in the background (best-effort).
+    background_tasks.add_task(_reply_to_feedback, feedback_id, email, message)
+    logger.info("feedback accepted feedback_id=%s message_length=%s", feedback_id, len(message))
+    return JSONResponse({"ok": True})

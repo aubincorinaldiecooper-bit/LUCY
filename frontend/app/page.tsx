@@ -2,7 +2,6 @@
 
 import { AnimatePresence } from "framer-motion";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { EarlyAccessModal } from "@/components/elsewhere/EarlyAccessModal";
 import { EndSessionPage } from "@/components/elsewhere/EndSessionPage";
 import { LandingPage } from "@/components/elsewhere/LandingPage";
 import { ListeningPage } from "@/components/elsewhere/ListeningPage";
@@ -14,7 +13,6 @@ function HomePage() {
   const [selectedModelId] = useState("openai/gpt-4o");
   const [hadCall, setHadCall] = useState(false);
   const [timer, setTimer] = useState(0);
-  const [showEarlyAccess, setShowEarlyAccess] = useState(false);
 
   const isActiveCall = state === "connected" || state === "muted";
 
@@ -56,7 +54,7 @@ function HomePage() {
   return (
     <div className="min-h-screen bg-[#FAFAFA] font-sans text-[#1C1C1E] antialiased selection:bg-[#D4A373]/20">
       <AnimatePresence mode="wait">
-        {view === "landing" ? <LandingPage key="landing" onStartSession={handleStart} onOpenEarlyAccess={() => setShowEarlyAccess(true)} /> : null}
+        {view === "landing" ? <LandingPage key="landing" onStartSession={handleStart} /> : null}
         {view === "preparing" ? <PreparingPage key="preparing" onCancel={handleCancelPreparing} /> : null}
         {view === "listening" ? (
           <ListeningPage
@@ -65,12 +63,10 @@ function HomePage() {
             timer={timer}
             onToggleMute={() => void toggleMute()}
             onEnd={() => void handleEndCall()}
-            onOpenEarlyAccess={() => setShowEarlyAccess(true)}
           />
         ) : null}
-        {view === "ended" ? <EndSessionPage key="ended" onReturnHome={handleReturnHome} onOpenEarlyAccess={() => setShowEarlyAccess(true)} /> : null}
+        {view === "ended" ? <EndSessionPage key="ended" onReturnHome={handleReturnHome} /> : null}
       </AnimatePresence>
-      <EarlyAccessModal isOpen={showEarlyAccess} onClose={() => setShowEarlyAccess(false)} />
     </div>
   );
 }
