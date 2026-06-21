@@ -208,6 +208,12 @@ _last_hume_style_context_applied = "n/a"
 _last_hume_tts_build_started_at = 0.0
 _last_hume_tts_build_completed_at = 0.0
 _last_hume_tts_debug_http = False
+# In-memory pre-rendered greeting WAV bytes (populated once at worker startup by
+# _prerender_greeting). None until rendered or if pre-render is disabled/failed.
+_prerendered_greeting_wav: bytes | None = None
+# Guards against concurrent jobs each firing a duplicate render before the first
+# one populates the buffer.
+_prerender_greeting_in_flight = False
 _silero_initialized = False
 _last_llm_stream_status = "n/a"
 _last_llm_timeout_stage = "n/a"
@@ -2609,6 +2615,13 @@ GREETING_TEXT = (os.getenv("GREETING_TEXT") or "Yo. What’s going on?").strip()
 GREETING_AUDIO_URL = (os.getenv("GREETING_AUDIO_URL") or "").strip()
 GREETING_AUDIO_PATH = (os.getenv("GREETING_AUDIO_PATH") or "").strip()
 GREETING_USE_CACHED_AUDIO = env_bool("GREETING_USE_CACHED_AUDIO", False)
+# Pre-render the fixed greeting to WAV once at worker startup (in-memory) and
+# serve every session's greeting from that buffer, so the first sound a user
+# hears is instant and identical instead of paying a live Hume round-trip each
+# session. The running worker holds the Hume key, so no asset needs committing.
+# Skipped when a static cached source (GREETING_USE_CACHED_AUDIO + URL/path) is
+# configured, since that path already serves cached audio.
+GREETING_PRERENDER_AT_STARTUP = env_bool("GREETING_PRERENDER_AT_STARTUP", True)
 SPOKEN_TEXT_NORMALIZATION_MODE = os.getenv("SPOKEN_TEXT_NORMALIZATION_MODE", "buffered_full_segment" if SPOKEN_TEXT_NORMALIZATION else "streaming_passthrough").strip() or ("buffered_full_segment" if SPOKEN_TEXT_NORMALIZATION else "streaming_passthrough")
 def _env_int_clamped_with_source(name: str, default: int, minimum: int, maximum: int, *fallback_names: str) -> tuple[int, str]:
     for candidate in (name, *fallback_names):
@@ -3060,6 +3073,121 @@ def _cached_wav_audio_frames(audio_bytes: bytes, first_frame_marker: dict[str, f
                 await asyncio.sleep(samples_per_channel / sample_rate)
 
     return _frames()
+
+
+async def _prerender_greeting() -> None:
+    """Render the fixed greeting to WAV once at startup and cache it in memory.
+
+    The running worker holds the Hume key, so this renders the fixed greeting
+    text through the same Hume TTS path the session uses, assembles the frames
+    into a WAV buffer, and stores it in ``_prerendered_greeting_wav``. Every
+    session then serves its greeting from that buffer for instant, identical
+    first audio. Best-effort: any failure is logged and leaves the buffer None,
+    in which case the greeting flow falls back to live TTS exactly as before.
+    """
+    global _prerendered_greeting_wav, _prerender_greeting_in_flight
+    if _prerendered_greeting_wav is not None or _prerender_greeting_in_flight:
+        return
+    if TTS_PROVIDER != "hume":
+        logger.info(
+            "Greeting pre-render skipped: greeting_prerender_skipped_reason=tts_provider_not_hume tts_provider=%s",
+            TTS_PROVIDER,
+        )
+        return
+    _prerender_greeting_in_flight = True
+    started_at = time.monotonic()
+    try:
+        wav_bytes = await _render_greeting_wav_bytes(started_at)
+    finally:
+        # Reset so a later job can retry if this render did not produce a buffer.
+        _prerender_greeting_in_flight = False
+    if wav_bytes is None:
+        return
+    _prerendered_greeting_wav = wav_bytes
+    logger.info(
+        "Greeting pre-render completed: greeting_prerender_ready=true wav_bytes=%s elapsed_seconds=%s",
+        len(wav_bytes),
+        _fmt_seconds(time.monotonic() - started_at),
+    )
+
+
+async def _render_greeting_wav_bytes(started_at: float) -> bytes | None:
+    """Synthesize the greeting via Hume and assemble WAV bytes. None on failure."""
+    try:
+        tts = build_tts()
+    except Exception as exc:  # noqa: BLE001 - pre-render must never break startup
+        logger.warning(
+            "Greeting pre-render skipped: greeting_prerender_skipped_reason=tts_build_failed error_type=%s",
+            type(exc).__name__,
+        )
+        return None
+    chunks: list[bytes] = []
+    sample_rate = 0
+    num_channels = 0
+    frame_count = 0
+    stream = tts.synthesize(GREETING_TEXT)
+    try:
+        async for event in stream:
+            frame = getattr(event, "frame", None)
+            if frame is None:
+                continue
+            data = getattr(frame, "data", None)
+            if not data:
+                continue
+            chunks.append(bytes(data))
+            if sample_rate == 0:
+                sample_rate = int(getattr(frame, "sample_rate", 0) or 0)
+                num_channels = int(getattr(frame, "num_channels", 0) or 0)
+            frame_count += 1
+    except Exception as exc:  # noqa: BLE001 - pre-render must never break startup
+        logger.warning(
+            "Greeting pre-render failed: greeting_prerender_failed_reason=synthesize_error error_type=%s elapsed_seconds=%s",
+            type(exc).__name__,
+            _fmt_seconds(time.monotonic() - started_at),
+        )
+        return None
+    finally:
+        for closeable in (stream, tts):
+            aclose = getattr(closeable, "aclose", None)
+            if callable(aclose):
+                try:
+                    await aclose()
+                except Exception:  # noqa: BLE001 - cleanup is best-effort
+                    pass
+    if not chunks or sample_rate <= 0 or num_channels <= 0:
+        logger.warning(
+            "Greeting pre-render produced no usable audio: frame_count=%s sample_rate=%s num_channels=%s elapsed_seconds=%s",
+            frame_count,
+            sample_rate,
+            num_channels,
+            _fmt_seconds(time.monotonic() - started_at),
+        )
+        return None
+    try:
+        buffer = io.BytesIO()
+        with wave.open(buffer, "wb") as wav:
+            wav.setnchannels(num_channels)
+            wav.setsampwidth(2)
+            wav.setframerate(sample_rate)
+            wav.writeframes(b"".join(chunks))
+        wav_bytes = buffer.getvalue()
+        _validate_cached_wav_audio(wav_bytes)
+    except Exception as exc:  # noqa: BLE001 - pre-render must never break startup
+        logger.warning(
+            "Greeting pre-render WAV assembly failed: error_type=%s elapsed_seconds=%s",
+            type(exc).__name__,
+            _fmt_seconds(time.monotonic() - started_at),
+        )
+        return None
+    logger.info(
+        "Greeting pre-render synthesized: frame_count=%s sample_rate=%s num_channels=%s wav_bytes=%s elapsed_seconds=%s",
+        frame_count,
+        sample_rate,
+        num_channels,
+        len(wav_bytes),
+        _fmt_seconds(time.monotonic() - started_at),
+    )
+    return wav_bytes
 
 
 def build_tts():
@@ -6458,6 +6586,22 @@ async def entrypoint(ctx: JobContext):
     if env_bool("LLM_WARMUP_ENABLED", True):
         logger.info("LLM warmup starting: target=generation+transcript_context")
         asyncio.create_task(_prewarm_models(llm))
+    # Pre-render the fixed greeting to an in-memory WAV once at startup so the
+    # first audio a user hears is instant and identical, instead of paying a live
+    # Hume round-trip each session. Runs concurrently with session setup; if it
+    # is not ready by the time the greeting plays, the greeting falls back to
+    # live TTS. Skipped when a static cached source is already configured.
+    _prerender_static_source_configured = GREETING_USE_CACHED_AUDIO and bool(GREETING_AUDIO_URL or GREETING_AUDIO_PATH)
+    if ENABLE_FIXED_GREETING and GREETING_PRERENDER_AT_STARTUP and not _prerender_static_source_configured:
+        logger.info("Greeting pre-render starting: greeting_prerender_enabled=true greeting_text_length=%s", len(GREETING_TEXT))
+        asyncio.create_task(_prerender_greeting())
+    else:
+        logger.info(
+            "Greeting pre-render skipped: greeting_prerender_enabled=%s fixed_greeting_enabled=%s static_cached_source_configured=%s",
+            GREETING_PRERENDER_AT_STARTUP,
+            ENABLE_FIXED_GREETING,
+            _prerender_static_source_configured,
+        )
     # TODO: Re-enable Tavily using LiveKit's supported function-tool pattern.
     logger.warning("Skipping Tavily tools for MVP voice path; Exa is the only active search provider when enabled")
 
@@ -6883,6 +7027,46 @@ async def entrypoint(ctx: JobContext):
             greeting_fallback_reason,
             greeting_audio_source,
         )
+
+    # Serve from the in-memory pre-rendered greeting when no static cached source
+    # produced a handle. This is the instant, identical-every-session path.
+    if greeting_handle is None and _prerendered_greeting_wav is not None:
+        if _latest_user_speaking_at > greeting_tts_request_at or _latest_user_state_for_greeting == "speaking":
+            greeting_cancelled_due_to_user_speech = True
+            logger.warning(
+                "Fixed greeting skipped: greeting_path=skipped fixed_greeting_skipped_reason=user_started_speaking_before_greeting greeting_cancelled_due_to_user_speech=%s latest_user_state=%s latest_user_speaking_at=%s greeting_playout_started_at=%s",
+                True,
+                _latest_user_state_for_greeting,
+                _latest_user_speaking_at,
+                greeting_tts_request_at,
+            )
+            return
+        try:
+            _validate_cached_wav_audio(_prerendered_greeting_wav)
+            greeting_path = "prerendered_cached_audio"
+            greeting_audio_source = "startup_prerender"
+            logger.info(
+                "Fixed greeting pre-rendered audio starting: greeting_path=%s greeting_audio_source=%s greeting_playout_started_at=%s greeting_cancelled_due_to_user_speech=%s prerendered_wav_bytes=%s",
+                greeting_path,
+                greeting_audio_source,
+                greeting_tts_request_at,
+                False,
+                len(_prerendered_greeting_wav),
+            )
+            greeting_handle = await session.say(
+                GREETING_TEXT,
+                audio=_cached_wav_audio_frames(_prerendered_greeting_wav, greeting_first_audio_marker),
+                allow_interruptions=False,
+            )
+        except Exception as exc:
+            greeting_path = "hume_live_tts"
+            greeting_fallback_reason = f"prerendered_audio_error_{type(exc).__name__}"
+            logger.warning(
+                "Fixed greeting pre-rendered audio unavailable; falling back to live TTS: greeting_path=%s fallback_reason=%s error=%s",
+                greeting_path,
+                greeting_fallback_reason,
+                _redact_sensitive_text(exc),
+            )
 
     if greeting_handle is None:
         if _latest_user_speaking_at > greeting_tts_request_at or _latest_user_state_for_greeting == "speaking":
