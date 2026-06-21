@@ -58,7 +58,13 @@ from interaction_state import (
     classify_turn_kind,
 )
 from memory_layer import MemoryLayer, identity_from_metadata, memory_enabled
-from runtime_context import RuntimeContext, answer_datetime_intent, detect_datetime_intent, runtime_context_from_metadata
+from runtime_context import (
+    RuntimeContext,
+    answer_datetime_intent,
+    current_datetime_snapshot,
+    detect_datetime_intent,
+    runtime_context_from_metadata,
+)
 from transcript_context import (
     ADDITIVE_FAMILY,
     ContextDecision,
@@ -5348,6 +5354,9 @@ class LucyAgent(Agent):
                 global _last_llm_start_at, _last_llm_first_token_at, _last_llm_complete_at, _last_llm_stream_status, _last_llm_timeout_stage, _last_llm_fallback_response_used, _pending_llm_fallback_text, _last_llm_completed_text, _last_llm_completed_text_hash, _last_llm_completed_at, _last_generic_llm_fallback_used, _llm_turn_id
                 _llm_turn_id = _current_turn_id
                 answer = answer_datetime_intent(self.runtime_context, datetime_intent)
+                # Log the freshly-recomputed date/time (not the stale session-init
+                # values) so observability matches what the user was actually told.
+                fresh_date, fresh_time = current_datetime_snapshot(self.runtime_context)
                 now = time.monotonic()
                 _last_llm_start_at = now
                 _last_llm_first_token_at = now
@@ -5361,15 +5370,18 @@ class LucyAgent(Agent):
                 _last_llm_completed_text = answer
                 _last_llm_completed_text_hash = _text_hash(answer)
                 logger.info(
-                    "Date/time guard triggered: turn_id=%s datetime_guard_triggered=%s datetime_intent=%s datetime_answer_source=runtime_context search_called=%s session_timezone=%s runtime_current_date=%s runtime_current_time=%s text_length=%s",
+                    "Date/time guard triggered: turn_id=%s datetime_guard_triggered=%s "
+                    "datetime_intent=%s datetime_answer_source=%s search_called=%s "
+                    "session_timezone=%s runtime_current_date=%s runtime_current_time=%s "
+                    "text_length=%s",
                     _current_turn_id,
                     True,
                     datetime_intent,
                     "runtime_context",
                     False,
                     self.runtime_context.session_timezone,
-                    self.runtime_context.current_date,
-                    self.runtime_context.current_time,
+                    fresh_date,
+                    fresh_time,
                     len(answer),
                 )
                 yield answer
