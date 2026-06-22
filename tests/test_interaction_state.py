@@ -191,6 +191,33 @@ class InterruptionAndOverlapTests(unittest.TestCase):
         self.assertEqual(sm.state, USER_SPEAKING)
         self.assertFalse(sm.active_speech_interrupted)
 
+    def test_interruption_during_speaking_is_recorded_for_ledger(self):
+        sm = committed_machine()
+        sm.on_llm_started()
+        sm.on_assistant_speech_started("speech_spk")
+        sm.on_user_speech_started()  # barge in mid-playout
+        self.assertEqual(sm.state, USER_INTERRUPTING)
+        # The FSM owns the interruption fact even if the TTS handle later says
+        # interrupted=False.
+        self.assertTrue(sm.was_speech_interrupted("speech_spk"))
+
+    def test_interruption_during_thinking_is_recorded_for_ledger(self):
+        sm = committed_machine()
+        sm.on_llm_started()  # ASSISTANT_THINKING
+        sm.on_assistant_speech_created("speech_pending")  # scheduled, no audio yet
+        self.assertEqual(sm.state, ASSISTANT_THINKING)
+        sm.on_user_speech_started()  # barge in during thinking
+        self.assertEqual(sm.state, USER_INTERRUPTING)
+        # No active_speech_id during thinking, but the pending speech is recorded.
+        self.assertTrue(sm.was_speech_interrupted("speech_pending"))
+
+    def test_uninterrupted_speech_is_not_recorded(self):
+        sm = committed_machine()
+        sm.on_llm_started()
+        sm.on_assistant_speech_started("speech_clean")
+        sm.on_assistant_speech_finished(interrupted=False, speech_id="speech_clean")
+        self.assertFalse(sm.was_speech_interrupted("speech_clean"))
+
     def test_next_user_turn_after_interruption_gets_fresh_turn_id(self):
         sm = committed_machine(turn_id=1)
         sm.on_llm_started()
