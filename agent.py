@@ -2745,6 +2745,13 @@ def _handoff_guard_should_suppress(turn_id: int) -> tuple[bool, str]:
 CONTEXT_WINDOW_TURNS = env_int_clamped("CONTEXT_WINDOW_TURNS", 10, 4, 100)
 PREEMPTIVE_GENERATION_ENABLED = env_bool("PREEMPTIVE_GENERATION_ENABLED", False)
 SEARCH_BRIDGE_MIN_DELAY_SECONDS = float(os.getenv("SEARCH_BRIDGE_MIN_DELAY_SECONDS", "0.75") or "0.75")
+# When true (default), internet search only fires on an explicit lookup ask
+# (intent=tool_request_search). Casual/conversational turns — including the
+# catch-all "unknown" intent — no longer let the model auto-call search. This
+# stops surprise searches on plain statements (the "I didn't ask you to look
+# anything up" failure). Set false to restore the old permissive behavior where
+# any non-blocked intent could trigger an LLM-initiated search.
+SEARCH_REQUIRE_EXPLICIT_INTENT = env_bool("SEARCH_REQUIRE_EXPLICIT_INTENT", True)
 ENDPOINTING_WAIT_EXTENSION_MIN_MS = env_int_clamped("ENDPOINTING_WAIT_EXTENSION_MIN_MS", 600, 100, 5000)
 ENDPOINTING_WAIT_EXTENSION_MAX_MS = env_int_clamped("ENDPOINTING_WAIT_EXTENSION_MAX_MS", 1200, 100, 5000)
 TURN_HOLD_FRAGMENT_REPLY_DEADLINE_SECONDS = float(os.getenv("TURN_HOLD_FRAGMENT_REPLY_DEADLINE_SECONDS", "2.5") or "2.5")
@@ -3629,6 +3636,74 @@ class TurnPolicyResult:
     should_clear_held_fragment: bool
 
 
+def _recent_user_messages_from_chat_ctx(chat_ctx: object, exclude_text: str = "", limit: int = 3) -> list[str]:
+    """Return up to `limit` of the user's most recent prior messages (oldest→newest).
+
+    Excludes the current recall question (`exclude_text`) so a "what did I just
+    say / my last question" ask anchors on the user's actual previous turn, not
+    on the question itself.
+    """
+    iterable = _chat_ctx_items(chat_ctx)
+    if not iterable:
+        return []
+    exclude_norm = (exclude_text or "").strip()
+    collected: list[str] = []
+    for message in reversed(iterable):
+        role = str(getattr(message, "role", "")).lower()
+        if role != "user":
+            continue
+        text = _extract_text_for_debug(message).strip()
+        if not text or text == exclude_norm:
+            continue
+        collected.append(text)
+        if len(collected) >= max(1, limit):
+            break
+    collected.reverse()
+    return collected
+
+
+def _inject_recall_anchor_note(turn_ctx: object, recent_user_messages: list[str]) -> bool:
+    """Anchor a recall ask on the user's verbatim most-recent prior message.
+
+    "Do you remember what I just said / my last question?" is a transcript task,
+    not a long-term-memory task. Without this, the model paraphrases and can grab
+    an earlier turn. This note hands it the actual recent user messages and tells
+    it to quote the most recent one rather than summarize an older one.
+    """
+    if not recent_user_messages:
+        return False
+    most_recent = recent_user_messages[-1]
+    lines = "\n".join(f"- {m}" for m in recent_user_messages)
+    note = (
+        "Internal recall note. Do not reveal or quote this note itself. The user "
+        "is asking you to recall what THEY just said or asked. Answer from the "
+        "actual conversation transcript below, not from long-term memory or a "
+        "loose paraphrase. Anchor on their MOST RECENT prior message and quote it "
+        "closely; do not reach back to an earlier turn. If they ask for 'the last "
+        "thing I said' or 'my last question', it is this: \"" + most_recent + "\". "
+        "Recent user messages, oldest to newest:\n" + lines
+    )
+    add_message = getattr(turn_ctx, "add_message", None)
+    if not callable(add_message):
+        logger.warning("Recall anchor note could not be injected: turn_ctx_add_message_unavailable")
+        return False
+    try:
+        add_message(role="developer", content=note)
+        logger.info(
+            "recall_anchor_note_injected=true recent_user_message_count=%s turn_id=%s",
+            len(recent_user_messages),
+            _current_turn_id,
+        )
+        return True
+    except Exception as exc:
+        logger.warning(
+            "Recall anchor note injection failed: error_type=%s error=%s",
+            type(exc).__name__,
+            _redact_sensitive_text(exc),
+        )
+        return False
+
+
 @dataclass
 class HumeSpeechAudioCoverage:
     speech_id: str
@@ -4081,6 +4156,13 @@ def _search_policy_for_intent(intent: str | None, clarification_suggested: bool)
         return True, "clear_search_intent"
     if normalized in blocked_intents:
         return False, "blocked_non_lookup_intent" if normalized != "unclear_fragment" else "blocked_unclear_fragment"
+    # Default: only an explicit search ask reaches the allow path above. Casual
+    # turns and the catch-all "unknown" intent no longer auto-trigger search,
+    # which is what produced surprise lookups on plain statements. The legacy
+    # permissive behavior (any non-blocked intent may LLM-call search) is still
+    # available behind SEARCH_REQUIRE_EXPLICIT_INTENT=false.
+    if SEARCH_REQUIRE_EXPLICIT_INTENT:
+        return False, "blocked_no_explicit_search_intent"
     return True, "llm_tool_call"
 
 
@@ -4793,6 +4875,13 @@ def _search_policy_for_intent(intent: str | None, clarification_suggested: bool)
         return True, "clear_search_intent"
     if normalized in blocked_intents:
         return False, "blocked_non_lookup_intent" if normalized != "unclear_fragment" else "blocked_unclear_fragment"
+    # Default: only an explicit search ask reaches the allow path above. Casual
+    # turns and the catch-all "unknown" intent no longer auto-trigger search,
+    # which is what produced surprise lookups on plain statements. The legacy
+    # permissive behavior (any non-blocked intent may LLM-call search) is still
+    # available behind SEARCH_REQUIRE_EXPLICIT_INTENT=false.
+    if SEARCH_REQUIRE_EXPLICIT_INTENT:
+        return False, "blocked_no_explicit_search_intent"
     return True, "llm_tool_call"
 
 
@@ -6445,6 +6534,17 @@ class LucyAgent(Agent):
                 retrieved_memories = await memory_layer.retrieve(_last_user_message_text)
                 if retrieved_memories:
                     _inject_memory_note(turn_ctx, retrieved_memories)
+                # A recall ask ("what did I just say / my last question") is about
+                # the conversation transcript, not long-term memory. Anchor the
+                # model on the user's actual most-recent prior message so it does
+                # not grab an earlier turn.
+                if (memory_intent or "").strip().lower() == "memory_recall_request":
+                    _inject_recall_anchor_note(
+                        turn_ctx,
+                        _recent_user_messages_from_chat_ctx(
+                            turn_ctx, exclude_text=_last_user_message_text, limit=3
+                        ),
+                    )
             # The write path is never gated: Lucy keeps remembering every turn so
             # there is material to recall on a later "do you remember..." turn.
             memory_layer.schedule_remember(role="user", content=_last_user_message_text, turn_id=_current_turn_id)
