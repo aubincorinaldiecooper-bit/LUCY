@@ -3160,6 +3160,9 @@ async def _render_greeting_wav_bytes(started_at: float) -> bytes | None:
                     await aclose()
                 except Exception:  # noqa: BLE001 - cleanup is best-effort
                     pass
+        # The throwaway TTS may own a debug http_session that aclose() doesn't
+        # close — close it so the pre-render doesn't leak a session per job.
+        await _close_tts_owned_session(tts)
     if not chunks or sample_rate <= 0 or num_channels <= 0:
         logger.warning(
             "Greeting pre-render produced no usable audio: frame_count=%s sample_rate=%s num_channels=%s elapsed_seconds=%s",
@@ -3438,6 +3441,11 @@ def build_tts():
             hume_tts_kwargs["http_session"] = aiohttp.ClientSession(trace_configs=[trace_config])
 
         tts_instance = hume.TTS(**hume_tts_kwargs)
+        # Track a debug http_session WE created (HUME_TTS_DEBUG_HTTP): the plugin
+        # never closes a caller-provided session, so without this it leaks as
+        # "Unclosed client session"/"Unclosed connector". Callers close it via
+        # _close_tts_owned_session(). None when we didn't create one.
+        setattr(tts_instance, "_lucy_owned_http_session", hume_tts_kwargs.get("http_session"))
         _last_hume_tts_build_completed_at = time.monotonic()
         logger.info(
             "Hume TTS instance created: build_duration_seconds=%s lazy_http_session_expected=%s debug_http=%s",
@@ -3448,6 +3456,22 @@ def build_tts():
         return tts_instance
 
     raise RuntimeError("Unsupported TTS_PROVIDER. Use 'deepgram' or 'hume'.")
+
+
+async def _close_tts_owned_session(tts: object) -> None:
+    """Close a debug http_session that build_tts created for this TTS instance.
+
+    The Hume plugin won't close a caller-provided session, so we must — otherwise
+    every build leaks an aiohttp ClientSession/connector.
+    """
+    session = getattr(tts, "_lucy_owned_http_session", None)
+    if session is None:
+        return
+    try:
+        if not getattr(session, "closed", True):
+            await session.close()
+    except Exception:  # noqa: BLE001 - cleanup is best-effort
+        pass
 
 app = FastAPI()
 
@@ -6817,10 +6841,17 @@ async def entrypoint(ctx: JobContext):
         memory_preload_note=memory_preload_note,
     )
 
+    session_tts = build_tts()
+    # If this TTS owns a debug http_session, close it on shutdown so the
+    # long-lived session doesn't leak it the way the pre-render did.
+    try:
+        ctx.add_shutdown_callback(lambda: _close_tts_owned_session(session_tts))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("tts_shutdown_callback_unavailable=true error_type=%s error=%s", type(exc).__name__, exc)
     session_kwargs: dict[str, Any] = {
         "stt": build_stt(),
         "llm": llm,
-        "tts": build_tts(),
+        "tts": session_tts,
         "vad": build_vad(),
     }
 
