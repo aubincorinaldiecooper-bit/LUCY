@@ -426,6 +426,39 @@ class VoiceLifecycleObservabilityTests(unittest.TestCase):
         )
 
 
+class SilenceRecoveryTests(unittest.TestCase):
+    def test_meta_complaint_without_held_fragment_triggers_recovery(self):
+        self.assertTrue(agent._should_trigger_silence_recovery("META_COMPLAINT", has_held_fragment=False))
+
+    def test_meta_complaint_with_held_fragment_uses_fragment_path(self):
+        # Held fragment has its own recovery; the silence note should NOT also fire.
+        self.assertFalse(agent._should_trigger_silence_recovery("META_COMPLAINT", has_held_fragment=True))
+
+    def test_non_meta_complaint_does_not_trigger_recovery(self):
+        for c in ("COMPLETE_THOUGHT", "EMOTIONAL_STATEMENT", None):
+            self.assertFalse(agent._should_trigger_silence_recovery(c, has_held_fragment=False))
+
+    def test_recovery_note_injected_into_turn_ctx(self):
+        captured = {}
+
+        class Ctx:
+            def add_message(self, role, content):
+                captured["role"] = role
+                captured["content"] = content
+
+        self.assertTrue(agent._inject_silence_recovery_note(Ctx()))
+        self.assertEqual(captured["role"], "developer")
+        self.assertIn("went quiet", captured["content"])
+        self.assertIn("one short question", captured["content"])
+
+    def test_recovery_note_safe_when_ctx_has_no_add_message(self):
+        self.assertFalse(agent._inject_silence_recovery_note(object()))
+
+    def test_meta_complaint_about_silence_classifies_as_meta(self):
+        result = agent._make_turn_policy_decision("What is happening? Like you keep going silent.")
+        self.assertEqual(result.classification, "META_COMPLAINT")
+
+
 class TurnPolicyTests(unittest.TestCase):
     def test_complete_emotional_statement_commits_immediately(self):
         result = agent._make_turn_policy_decision("I felt really hurt by that.")
