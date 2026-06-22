@@ -241,6 +241,11 @@ class InteractionStateMachine:
         # the interruption is recorded immediately (not only when the handle
         # later resolves). Reset when a new speech starts.
         self.active_speech_interrupted = False
+        # Speech ids the FSM observed being interrupted by the user (during
+        # ASSISTANT_SPEAKING or while scheduled in ASSISTANT_THINKING). The ledger
+        # reconciliation consults this so an interrupted reply is downgraded even
+        # when the TTS handle reports interrupted=False. Bounded.
+        self._interrupted_speech_ids: set[str] = set()
         # Tool/search result authority to speak. A result earns authority when
         # its tool call starts and loses it the moment the user speaks during
         # TOOL_CALL_PENDING, until the newer utterance is classified.
@@ -322,12 +327,18 @@ class InteractionStateMachine:
             # handle later resolves.
             if self.active_speech_id is not None:
                 self.active_speech_interrupted = True
+                self._record_interrupted_speech(self.active_speech_id)
                 logger.info(
                     "active_speech_marked_interrupted=true speech_id=%s interaction_state=%s turn_id=%s",
                     self.active_speech_id,
                     self.state,
                     self.turn_id,
                 )
+            # A reply interrupted while still scheduled (THINKING, no audio yet)
+            # has no active_speech_id, so also mark any pending speech objects so
+            # their ledger entry is downgraded too.
+            for pending_id in self._pending_speech_ids:
+                self._record_interrupted_speech(pending_id)
             self.transition(USER_INTERRUPTING, reason=f"user_started_speaking_during_{self.state.lower()}")
         else:
             self.transition(USER_SPEAKING, reason="user_started_speaking")
@@ -545,8 +556,28 @@ class InteractionStateMachine:
         self._pending_speech_ids.discard(speech_id)
         self.active_speech_id = speech_id
         self.active_speech_interrupted = overlap
+        if overlap:
+            # Audio started while the user was already active — treat as interrupted.
+            self._record_interrupted_speech(speech_id)
         self.transition(ASSISTANT_SPEAKING, reason=f"assistant_speech_started:{speech_id}")
         return overlap
+
+    def _record_interrupted_speech(self, speech_id: str) -> None:
+        """Remember that the user interrupted this speech (bounded set)."""
+        if not speech_id:
+            return
+        self._interrupted_speech_ids.add(speech_id)
+        if len(self._interrupted_speech_ids) > 64:
+            # Drop oldest-ish by rebuilding from an arbitrary recent slice.
+            self._interrupted_speech_ids = set(list(self._interrupted_speech_ids)[-64:])
+
+    def was_speech_interrupted(self, speech_id: str | None) -> bool:
+        """Did the FSM observe the user interrupting this speech?
+
+        Read by the ledger reconciliation so an interrupted reply is downgraded
+        even when the TTS handle reports interrupted=False.
+        """
+        return bool(speech_id) and speech_id in self._interrupted_speech_ids
 
     def on_assistant_speech_finished(self, interrupted: bool, speech_id: str | None = None) -> None:
         if speech_id is not None:

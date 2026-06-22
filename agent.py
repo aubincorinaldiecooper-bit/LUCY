@@ -1779,6 +1779,11 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                 suppressed_speech_ids.discard(done_id)
                 _unmark_speech_stale(done_id)
                 interrupted = _safe_attr(done_resolved_handle, "interrupted", "unknown")
+                # The TTS handle can report interrupted=False even when the FSM
+                # observed the user barging in. The FSM observation is
+                # authoritative for ledger ownership, so combine them.
+                fsm_observed_interrupted = _interaction_state.was_speech_interrupted(done_id)
+                effective_interrupted = _effective_interruption(interrupted, fsm_observed_interrupted)
                 speaking_at = agent_speaking_at.get(done_id)
                 listening_at = agent_listening_at.get(done_id)
                 speech_duration_seconds = (finished_at - started_at) if started_at is not None else -1.0
@@ -1793,14 +1798,16 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                 done_speech_llm_turn_id = assistant_speech_llm_turn_ids.pop(done_id, 0)
                 if was_active and not was_stale:
                     pending_user_handoff_speech_id = done_id
-                _interaction_state.on_assistant_speech_finished(interrupted=str(interrupted).strip().lower() == "true", speech_id=done_id)
+                _interaction_state.on_assistant_speech_finished(interrupted=effective_interrupted, speech_id=done_id)
                 logger.info(
-                    "Assistant speech finished: current_user_turn_id=%s speech_id=%s speech_turn_id=%s llm_turn_id=%s interrupted=%s active_count=%s was_suppressed=%s was_stale=%s was_active=%s",
+                    "Assistant speech finished: current_user_turn_id=%s speech_id=%s speech_turn_id=%s llm_turn_id=%s interrupted=%s handle_interrupted=%s fsm_observed_interrupted=%s active_count=%s was_suppressed=%s was_stale=%s was_active=%s",
                     _current_turn_id,
                     done_id,
                     done_speech_turn_id or "unknown",
                     done_speech_llm_turn_id or "unknown",
+                    effective_interrupted,
                     interrupted,
+                    fsm_observed_interrupted,
                     len(active_speech_handles),
                     was_suppressed,
                     was_stale,
@@ -1872,7 +1879,7 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                     generated_bytes = getattr(hume_coverage, "byte_count", None) if hume_coverage is not None else None
                     downgrade_reason = _ledger_downgrade_reason_for_outcome(
                         was_suppressed=was_suppressed or was_stale,
-                        interrupted=interrupted,
+                        interrupted=effective_interrupted,
                         generated_bytes=generated_bytes,
                         playout_seconds=speech_duration_seconds,
                     )
@@ -2423,6 +2430,17 @@ def _ledger_recent_canonical(n: int) -> list[dict]:
     else:
         items = list(_conversation_ledger)
     return items[-n:] if n > 0 else []
+
+
+def _effective_interruption(handle_interrupted: object, fsm_observed_interrupted: bool) -> bool:
+    """Combine the TTS handle's interrupted flag with the FSM's observation.
+
+    The LiveKit handle sometimes reports interrupted=False even when the user
+    clearly barged in (the FSM logged active_speech_marked_interrupted=true). The
+    FSM's observation is authoritative for ledger ownership, so an interruption
+    from EITHER source counts.
+    """
+    return str(handle_interrupted).strip().lower() in {"true", "1", "yes"} or bool(fsm_observed_interrupted)
 
 
 def _ledger_downgrade_reason_for_outcome(

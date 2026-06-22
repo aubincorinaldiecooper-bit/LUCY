@@ -858,6 +858,33 @@ class InterruptionLedgerTests(unittest.TestCase):
         self.assertTrue(entry["suppressed"])
         self.assertEqual(agent._ledger_recent_canonical(5), [])
 
+    def test_effective_interruption_combines_handle_and_fsm(self):
+        # Handle says not-interrupted, but the FSM observed the barge-in → interrupted.
+        self.assertTrue(agent._effective_interruption("false", True))
+        self.assertTrue(agent._effective_interruption("unknown", True))
+        # Handle says interrupted → interrupted regardless of FSM.
+        self.assertTrue(agent._effective_interruption("true", False))
+        # Neither → not interrupted.
+        self.assertFalse(agent._effective_interruption("false", False))
+        self.assertFalse(agent._effective_interruption("unknown", False))
+
+    def test_fsm_observed_interruption_downgrades_ledger(self):
+        # The exact bug from the logs: handle interrupted=False but the user did
+        # barge in. The effective flag must yield an "interrupted" downgrade.
+        entry = agent._ledger_append(
+            "assistant", "cut-off reply", visible=True, suppressed=False,
+            turn_id=4, speech_id="sp4", provisional=True,
+        )
+        self.assertTrue(entry["canonical_for_context"])
+        effective = agent._effective_interruption("false", True)
+        reason = agent._ledger_downgrade_reason_for_outcome(
+            was_suppressed=False, interrupted=effective, generated_bytes=2048, playout_seconds=1.0,
+        )
+        self.assertEqual(reason, "interrupted")
+        agent._ledger_downgrade_for_outcome(turn_id=4, speech_id="sp4", reason=reason)
+        self.assertFalse(entry["canonical_for_context"])
+        self.assertTrue(entry["suppressed"])
+
     def test_completed_assistant_speech_stays_canonical(self):
         entry = agent._ledger_append(
             "assistant",
