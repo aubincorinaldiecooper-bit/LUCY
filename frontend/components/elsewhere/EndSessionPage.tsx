@@ -6,8 +6,6 @@ import { FeedbackForm } from "./FeedbackForm";
 import { PageTransition } from "./PageTransition";
 import { ShaderBackground } from "./ShaderBackground";
 
-const END_IMAGE = "https://res.cloudinary.com/dvsfba1ww/image/upload/q_auto/f_auto/v1780860202/ChatGPT_Image_Jun_7_2026_02_34_47_PM_uwszje.png";
-
 export function EndSessionPage({ onReturnHome }: { onReturnHome: () => void }) {
   return (
     <PageTransition>
@@ -19,11 +17,6 @@ export function EndSessionPage({ onReturnHome }: { onReturnHome: () => void }) {
         </nav>
         <div className="relative z-10 flex flex-1 flex-col items-center justify-center overflow-y-auto px-5 pb-6 pt-24 md:px-8">
           <div className="flex w-full max-w-lg flex-col items-center">
-            <motion.div initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.1, duration: 0.6 }} className="mb-6 w-full max-w-[360px]">
-              <div className="relative aspect-[4/3] w-full overflow-hidden rounded-2xl bg-white/5 ring-1 ring-white/10">
-                <img src={END_IMAGE} alt="Reflection and clarity" className="h-full w-full object-cover opacity-90" />
-              </div>
-            </motion.div>
             <motion.h2 initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.2, duration: 0.6 }} className="mb-4 text-center text-3xl font-extralight leading-[1.1] tracking-tight text-white md:text-4xl">What do you want Arche to be?</motion.h2>
             <motion.p initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.3, duration: 0.6 }} className="mb-8 max-w-md text-center text-sm font-light leading-relaxed text-white/70 md:text-base">We&apos;re building Arche with the people who use it first. Tell us what you want Arche to do, what was missing, and how we can make it better.</motion.p>
             <motion.div initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.4, duration: 0.6 }} className="mb-6 w-full max-w-sm">
