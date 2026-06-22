@@ -28,6 +28,10 @@ logger = logging.getLogger(__name__)
 GUEST_MEMORY_TTL_HOURS = 24
 INDEX_REBUILD_MAX_ROWS = 500
 
+# Set once the "simplemem not installed" warning has been logged, so it isn't
+# repeated for every per-session MemoryLayer instance.
+_SIMPLEMEM_UNAVAILABLE_LOGGED = False
+
 
 def memory_enabled() -> bool:
     return os.getenv("MEMORY_ENABLED", "false").strip().lower() in {"true", "1", "yes"}
@@ -181,7 +185,16 @@ class MemoryLayer:
             logger.info("memory_simplemem_initialized=true index_dir=%s memory_scope=%s", user_dir, self.identity.scope)
         except ImportError:
             self._simplemem_status = "unavailable"
-            logger.warning("memory_simplemem_unavailable=true reason=package_not_installed install_hint=pip_install_simplemem")
+            # Log once per process: a fresh MemoryLayer is created per session, so
+            # without this the same "not installed" warning repeats every session.
+            global _SIMPLEMEM_UNAVAILABLE_LOGGED
+            if not _SIMPLEMEM_UNAVAILABLE_LOGGED:
+                _SIMPLEMEM_UNAVAILABLE_LOGGED = True
+                logger.warning(
+                    "memory_simplemem_unavailable=true reason=package_not_installed "
+                    "install_hint=pip_install_simplemem note=logged_once_per_process "
+                    "(retrieval falls back to Postgres recency preload)"
+                )
         except Exception as exc:
             self._simplemem_status = "error"
             logger.warning("memory_simplemem_init_failed=true error_type=%s error=%s", type(exc).__name__, exc)

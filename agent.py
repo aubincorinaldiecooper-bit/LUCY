@@ -6741,7 +6741,9 @@ async def entrypoint(ctx: JobContext):
         resolved_livekit_turn_detection_mode = livekit_turn_detection_mode
     else:
         logger.warning(
-            "Unknown LIVEKIT_TURN_DETECTION_MODE=%s. Falling back to vad.",
+            "Unknown LIVEKIT_TURN_DETECTION_MODE=%s. Valid values: vad | stt | default. "
+            "Falling back to vad. (The audio end-of-turn detector is configured "
+            "separately via LIVEKIT_TURN_DETECTOR_ENABLED; 'audio' is not a valid mode here.)",
             livekit_turn_detection_mode,
         )
         resolved_livekit_turn_detection_mode = "vad"
