@@ -117,5 +117,35 @@ class GreetingPrerenderTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(agent._prerender_greeting_in_flight)
 
 
+class _FakeSession:
+    def __init__(self):
+        self.closed = False
+
+    async def close(self):
+        self.closed = True
+
+
+class _FakeTTSWithSession:
+    def __init__(self, session):
+        self._lucy_owned_http_session = session
+
+
+class CloseTtsOwnedSessionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_closes_owned_session(self):
+        session = _FakeSession()
+        await agent._close_tts_owned_session(_FakeTTSWithSession(session))
+        self.assertTrue(session.closed)
+
+    async def test_no_session_is_noop(self):
+        # A TTS without an owned session (non-debug build) must not error.
+        await agent._close_tts_owned_session(object())
+
+    async def test_already_closed_session_is_noop(self):
+        session = _FakeSession()
+        session.closed = True
+        await agent._close_tts_owned_session(_FakeTTSWithSession(session))
+        self.assertTrue(session.closed)
+
+
 if __name__ == "__main__":
     unittest.main()
