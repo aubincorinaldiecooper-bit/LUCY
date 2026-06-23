@@ -23,7 +23,8 @@ export async function sendAgentMailEmail(params: {
   if (!text && !html) throw new Error("sendAgentMailEmail requires text or html");
 
   const apiKey = requiredEnv("AGENTMAIL_API_KEY");
-  const inboxId = encodeURIComponent(requiredEnv("AGENTMAIL_INBOX_ID"));
+  const rawInboxId = requiredEnv("AGENTMAIL_INBOX_ID");
+  const inboxId = encodeURIComponent(rawInboxId);
   const fromEmail = requiredEnv("AGENTMAIL_FROM_EMAIL");
 
   const payload: Record<string, unknown> = { to, subject, reply_to: fromEmail };
@@ -43,6 +44,13 @@ export async function sendAgentMailEmail(params: {
 
   if (!response.ok) {
     const body = await response.text().catch(() => "");
-    throw new Error(`AgentMail send failed (${response.status}): ${body.slice(0, 500)}`);
+    // Include the (non-secret) inbox id and base URL so a 404 "Inbox not found"
+    // is self-diagnosing: it shows exactly which inbox the FRONTEND service tried,
+    // which is almost always a Railway env mismatch (the frontend's
+    // AGENTMAIL_INBOX_ID / AGENTMAIL_API_KEY not matching the working worker's).
+    throw new Error(
+      `AgentMail send failed (${response.status}) ` +
+        `inbox_id=${rawInboxId} base_url=${AGENTMAIL_BASE_URL}: ${body.slice(0, 500)}`
+    );
   }
 }
