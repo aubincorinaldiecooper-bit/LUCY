@@ -44,6 +44,15 @@ function HomePage() {
     setTimer(0);
   }, []);
 
+  // Leaving mid-session via the "Elsewhere" brand: end the call and go straight
+  // home (the landing view), skipping the feedback screen since the user is
+  // explicitly navigating away rather than wrapping up.
+  const handleLeaveSession = useCallback(async () => {
+    await disconnect();
+    setHadCall(false);
+    setTimer(0);
+  }, [disconnect]);
+
   const view = useMemo(() => {
     if (state === "initializing" || state === "connecting") return "preparing";
     if (isActiveCall) return "listening";
@@ -54,7 +63,9 @@ function HomePage() {
   return (
     <div className="min-h-screen bg-[#FAFAFA] font-sans text-[#1C1C1E] antialiased selection:bg-[#D4A373]/20">
       <AnimatePresence mode="wait">
-        {view === "landing" ? <LandingPage key="landing" onStartSession={handleStart} /> : null}
+        {view === "landing" ? (
+          <LandingPage key="landing" onStartSession={handleStart} onHome={handleReturnHome} />
+        ) : null}
         {view === "preparing" ? <PreparingPage key="preparing" onCancel={handleCancelPreparing} /> : null}
         {view === "listening" ? (
           <ListeningPage
@@ -63,6 +74,7 @@ function HomePage() {
             timer={timer}
             onToggleMute={() => void toggleMute()}
             onEnd={() => void handleEndCall()}
+            onLeaveHome={() => void handleLeaveSession()}
           />
         ) : null}
         {view === "ended" ? <EndSessionPage key="ended" onReturnHome={handleReturnHome} /> : null}
