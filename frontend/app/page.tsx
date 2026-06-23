@@ -9,10 +9,19 @@ import { PreparingPage } from "@/components/elsewhere/PreparingPage";
 import { useVoiceClient } from "@/hooks/useVoiceClient";
 
 function HomePage() {
-  const { state, connect, disconnect, toggleMute, isMuted } = useVoiceClient();
   const [selectedModelId] = useState("openai/gpt-4o");
   const [hadCall, setHadCall] = useState(false);
   const [timer, setTimer] = useState(0);
+
+  // The agent ended the session on its own (e.g. the 7-minute time limit): show
+  // the end screen, same as if the user had pressed End.
+  const handleServerDisconnect = useCallback(() => {
+    setHadCall(true);
+  }, []);
+
+  const { state, connect, disconnect, toggleMute, isMuted } = useVoiceClient({
+    onServerDisconnect: handleServerDisconnect,
+  });
 
   const isActiveCall = state === "connected" || state === "muted";
 

@@ -37,11 +37,17 @@ async function createSession(model?: string): Promise<SessionResponse> {
   return response.json() as Promise<SessionResponse>;
 }
 
-export function useVoiceClient() {
+export function useVoiceClient(options?: { onServerDisconnect?: () => void }) {
   const [state, setState] = useState<VoiceState>("idle");
   const [isMuted, setIsMuted] = useState(false);
   const roomRef = useRef<Room | null>(null);
   const connectAttemptRef = useRef(0);
+  // Distinguish a disconnect WE triggered (End button / leaving) from one the
+  // server initiated (e.g. the agent hit the session time limit and deleted the
+  // room). Only the latter should fire onServerDisconnect.
+  const userInitiatedDisconnectRef = useRef(false);
+  const onServerDisconnectRef = useRef<(() => void) | undefined>(options?.onServerDisconnect);
+  onServerDisconnectRef.current = options?.onServerDisconnect;
   const remoteAudioElsRef = useRef<Set<HTMLMediaElement>>(new Set());
   const audioContextRef = useRef<AudioContext | null>(null);
   const gainNodeRef = useRef<GainNode | null>(null);
@@ -134,6 +140,7 @@ export function useVoiceClient() {
 
   const disconnect = useCallback(async () => {
     connectAttemptRef.current += 1;
+    userInitiatedDisconnectRef.current = true;
     const room = roomRef.current;
     if (!room) {
       clearRemoteAudioElements();
@@ -153,6 +160,7 @@ export function useVoiceClient() {
     const attemptId = connectAttemptRef.current + 1;
     connectAttemptRef.current = attemptId;
     setState("initializing");
+    userInitiatedDisconnectRef.current = false;
     try {
       const session = await createSession(model);
       if (connectAttemptRef.current !== attemptId) return;
@@ -163,6 +171,12 @@ export function useVoiceClient() {
         clearRemoteAudioElements();
         roomRef.current = null;
         setState("idle");
+        // Server/agent ended the room (e.g. session time limit) rather than the
+        // user pressing End — surface it so the UI can show the end screen.
+        if (!userInitiatedDisconnectRef.current) {
+          onServerDisconnectRef.current?.();
+        }
+        userInitiatedDisconnectRef.current = false;
       });
       room.on(RoomEvent.TrackSubscribed, (track) => {
         if (track.kind !== Track.Kind.Audio) return;

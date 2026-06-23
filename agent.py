@@ -25,7 +25,7 @@ try:  # livekit-agents >= 1.6.1 exposes the audio end-of-turn detector here
     from livekit.agents import inference as _lk_inference
 except Exception:  # pragma: no cover - older SDKs
     _lk_inference = None
-from livekit import rtc
+from livekit import api, rtc
 from livekit.plugins import ai_coustics, deepgram, hume, mistralai, openai, silero
 from internet_search import (
     SEARCH_DISABLED_MESSAGE,
@@ -2664,6 +2664,25 @@ def _inject_coherence_note(turn_ctx: object, reason: str) -> bool:
 # 0 disables the hold (pure passthrough). Clamped to a sane ceiling.
 TTS_POST_SPEECH_HOLD_MS = env_int_clamped("TTS_POST_SPEECH_HOLD_MS", 0, 0, 5000)
 RUN_DB_MIGRATIONS_ON_STARTUP = env_bool("RUN_DB_MIGRATIONS_ON_STARTUP", False)
+
+# --- Session time limit -------------------------------------------------------
+# Hard cap on how long a single voice session runs. The worker speaks a short
+# heads-up SESSION_ENDING_WARNING_SECONDS before the cap, then (optionally) says
+# a brief goodbye and tears the room down so the client lands on the end screen.
+# Set SESSION_TIME_LIMIT_ENABLED=false (or SESSION_MAX_DURATION_SECONDS=0) to
+# disable. Times are seconds; default is a 7-minute session with a 30s warning.
+SESSION_TIME_LIMIT_ENABLED = env_bool("SESSION_TIME_LIMIT_ENABLED", True)
+SESSION_MAX_DURATION_SECONDS = float(os.getenv("SESSION_MAX_DURATION_SECONDS", "420") or "420")
+SESSION_ENDING_WARNING_SECONDS = float(os.getenv("SESSION_ENDING_WARNING_SECONDS", "30") or "30")
+SESSION_ENDING_WARNING_TEXT = (
+    os.getenv("SESSION_ENDING_WARNING_TEXT")
+    or "Hey, quick heads up — we've got about thirty seconds left for this one."
+).strip()
+SESSION_ENDING_GOODBYE_TEXT = (
+    os.getenv("SESSION_ENDING_GOODBYE_TEXT")
+    or "That's our time for now. Take care — talk soon."
+).strip()
+
 ENABLE_FIXED_GREETING = env_bool("ENABLE_FIXED_GREETING", True)
 GREETING_TEXT = (os.getenv("GREETING_TEXT") or "Yo. What’s going on?").strip() or "Yo. What’s going on?"
 GREETING_AUDIO_URL = (os.getenv("GREETING_AUDIO_URL") or "").strip()
@@ -6735,6 +6754,114 @@ def _memory_retrieval_policy_for_intent(intent: str | None) -> tuple[bool, str]:
     return False, "no_recall_intent"
 
 
+async def _terminate_room(ctx: JobContext) -> str:
+    """End the call for everyone so the client lands on the end screen.
+
+    Prefer deleting the room (disconnects ALL participants, including the user,
+    which fires RoomEvent.Disconnected on the client). Fall back to disconnecting
+    the agent's own participant if the server API isn't reachable.
+    """
+    room = getattr(ctx, "room", None)
+    room_name = getattr(room, "name", None)
+
+    # Newer livekit-agents expose a JobContext.delete_room() convenience.
+    ctx_delete_room = getattr(ctx, "delete_room", None)
+    if callable(ctx_delete_room):
+        try:
+            await ctx_delete_room()
+            logger.info("session_room_terminated=true strategy=ctx_delete_room room=%s", room_name)
+            return "ctx_delete_room"
+        except Exception as exc:
+            logger.warning(
+                "session_room_terminate_failed strategy=ctx_delete_room error=%s",
+                _redact_sensitive_text(exc),
+            )
+
+    lkapi = getattr(ctx, "api", None)
+    if lkapi is not None and room_name:
+        try:
+            await lkapi.room.delete_room(api.DeleteRoomRequest(room=room_name))
+            logger.info("session_room_terminated=true strategy=delete_room room=%s", room_name)
+            return "delete_room"
+        except Exception as exc:
+            logger.warning(
+                "session_room_terminate_failed strategy=delete_room error=%s",
+                _redact_sensitive_text(exc),
+            )
+    try:
+        if room is not None:
+            await room.disconnect()
+            logger.info("session_room_terminated=true strategy=room_disconnect room=%s", room_name)
+            return "room_disconnect"
+    except Exception as exc:
+        logger.warning(
+            "session_room_terminate_failed strategy=room_disconnect error=%s",
+            _redact_sensitive_text(exc),
+        )
+    return "none"
+
+
+async def _run_session_time_limit(session: AgentSession, ctx: JobContext) -> None:
+    """Enforce the hard session cap: speak a heads-up, then end the room.
+
+    Anchored to a monotonic start so the hard cut lands at SESSION_MAX_DURATION_SECONDS
+    regardless of how long the spoken lines take. Cancelled on shutdown.
+    """
+    if not SESSION_TIME_LIMIT_ENABLED or SESSION_MAX_DURATION_SECONDS <= 0:
+        return
+    limit = SESSION_MAX_DURATION_SECONDS
+    warn_at = limit - SESSION_ENDING_WARNING_SECONDS
+    started = time.monotonic()
+    logger.info(
+        "session_time_limit_armed=true limit_seconds=%s warning_seconds=%s warning_at_seconds=%s",
+        limit,
+        SESSION_ENDING_WARNING_SECONDS,
+        max(0.0, warn_at),
+    )
+    try:
+        if SESSION_ENDING_WARNING_TEXT and warn_at > 0:
+            await asyncio.sleep(warn_at)
+            logger.info(
+                "session_time_warning_speaking=true elapsed_seconds=%s remaining_seconds=%s",
+                _fmt_seconds(time.monotonic() - started),
+                _fmt_seconds(limit - (time.monotonic() - started)),
+            )
+            try:
+                await session.say(SESSION_ENDING_WARNING_TEXT, allow_interruptions=True)
+            except Exception as exc:
+                logger.warning(
+                    "session_time_warning_say_failed=true error=%s",
+                    _redact_sensitive_text(exc),
+                )
+
+        remaining = limit - (time.monotonic() - started)
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+
+        logger.info(
+            "session_time_limit_reached=true elapsed_seconds=%s; ending session",
+            _fmt_seconds(time.monotonic() - started),
+        )
+        if SESSION_ENDING_GOODBYE_TEXT:
+            try:
+                goodbye_handle = await session.say(
+                    SESSION_ENDING_GOODBYE_TEXT, allow_interruptions=False
+                )
+                wait_for_playout = getattr(goodbye_handle, "wait_for_playout", None)
+                if callable(wait_for_playout):
+                    await asyncio.wait_for(wait_for_playout(), timeout=8.0)
+            except Exception as exc:
+                logger.warning(
+                    "session_time_goodbye_say_failed=true error=%s",
+                    _redact_sensitive_text(exc),
+                )
+
+        await _terminate_room(ctx)
+    except asyncio.CancelledError:
+        logger.info("session_time_limit_cancelled=true (session ended before limit)")
+        raise
+
+
 async def entrypoint(ctx: JobContext):
     job_started_at = time.monotonic()
     logger.info(
@@ -7145,6 +7272,17 @@ async def entrypoint(ctx: JobContext):
         logger.info("Starting session without ai-coustics room_options")
         await session.start(room=ctx.room, agent=lucy_agent)
         session_started_at = time.monotonic()
+
+    # Arm the session time limit on a background clock: it speaks a heads-up
+    # ~SESSION_ENDING_WARNING_SECONDS before the cap, then ends the room.
+    if SESSION_TIME_LIMIT_ENABLED and SESSION_MAX_DURATION_SECONDS > 0:
+        session_timer_task = asyncio.create_task(_run_session_time_limit(session, ctx))
+
+        async def _cancel_session_timer() -> None:
+            if not session_timer_task.done():
+                session_timer_task.cancel()
+
+        ctx.add_shutdown_callback(_cancel_session_timer)
 
     greeting_agent_listening_at = 0.0
     for _ in range(50):
