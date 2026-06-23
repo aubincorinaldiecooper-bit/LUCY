@@ -2,17 +2,24 @@
 
 import { motion } from "framer-motion";
 import AccountLink from "@/components/auth/AccountLink";
+import { BrandHome } from "./BrandHome";
 import { PageTransition } from "./PageTransition";
 import { ShaderBackground } from "./ShaderBackground";
 
-export function LandingPage({ onStartSession }: { onStartSession: () => void }) {
+export function LandingPage({
+  onStartSession,
+  onHome,
+}: {
+  onStartSession: () => void;
+  onHome?: () => void;
+}) {
   return (
     <PageTransition>
       <section className="relative isolate flex h-screen w-screen overflow-hidden bg-black text-white">
         <ShaderBackground />
 
         <nav className="fixed left-0 right-0 top-0 z-40 flex w-full items-center justify-between px-6 py-5 md:px-10 lg:px-16">
-          <div className="text-sm font-light tracking-tight text-white/85">Elsewhere</div>
+          <BrandHome onClick={onHome} />
           <AccountLink variant="dark" />
         </nav>
 

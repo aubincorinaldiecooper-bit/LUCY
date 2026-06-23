@@ -2,6 +2,9 @@
 
 import { motion } from "framer-motion";
 import { Mic, MicOff, PhoneOff } from "lucide-react";
+import { useState } from "react";
+import { BrandHome } from "./BrandHome";
+import { ConfirmDialog } from "./ConfirmDialog";
 import { PageTransition } from "./PageTransition";
 
 function formatTime(seconds: number) {
@@ -15,21 +18,36 @@ export function ListeningPage({
   timer,
   onToggleMute,
   onEnd,
+  onLeaveHome,
 }: {
   isMuted: boolean;
   timer: number;
   onToggleMute: () => void;
   onEnd: () => void;
+  onLeaveHome: () => void;
 }) {
+  // Clicking the brand during a live session would leave the conversation, so
+  // confirm first to guard against an accidental tap.
+  const [confirmLeave, setConfirmLeave] = useState(false);
+
   return (
     <PageTransition>
       <div className="relative flex h-screen flex-1 flex-col overflow-hidden bg-black text-white">
         <nav className="fixed left-0 right-0 top-0 z-40 flex w-full items-center justify-between px-6 py-5 md:px-10 lg:px-16">
-          <div className="flex items-center gap-2.5">
-            <div className="h-3.5 w-3.5 rounded-full bg-gradient-to-br from-[#E0C9A8] to-[#C4A882]" />
-            <span className="text-sm font-light tracking-tight text-white/85">Elsewhere</span>
-          </div>
+          <BrandHome showDot onClick={() => setConfirmLeave(true)} ariaLabel="Leave session and go home" />
         </nav>
+        <ConfirmDialog
+          open={confirmLeave}
+          title="Leave this session?"
+          description="Your conversation with Arche will end and you'll return to the home screen."
+          confirmLabel="End & leave"
+          cancelLabel="Keep talking"
+          onCancel={() => setConfirmLeave(false)}
+          onConfirm={() => {
+            setConfirmLeave(false);
+            onLeaveHome();
+          }}
+        />
         <div className="relative z-10 flex flex-1 flex-col items-center justify-center px-6 pt-20">
           {/* Warm soft gradient blob — kept, tuned to glow on the dark backdrop. */}
           <div className="relative mb-8 flex h-[100px] w-[100px] items-center justify-center md:mb-10 md:h-[130px] md:w-[130px]" aria-hidden="true">

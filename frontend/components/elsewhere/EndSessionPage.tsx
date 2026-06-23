@@ -2,6 +2,7 @@
 
 import { motion } from "framer-motion";
 import AccountLink from "@/components/auth/AccountLink";
+import { BrandHome } from "./BrandHome";
 import { FeedbackForm } from "./FeedbackForm";
 import { PageTransition } from "./PageTransition";
 import { ShaderBackground } from "./ShaderBackground";
@@ -12,7 +13,7 @@ export function EndSessionPage({ onReturnHome }: { onReturnHome: () => void }) {
       <div className="relative flex h-screen flex-1 flex-col overflow-hidden bg-black text-white">
         <ShaderBackground />
         <nav className="fixed left-0 right-0 top-0 z-40 flex w-full items-center justify-between px-6 py-5 md:px-10 lg:px-16">
-          <div className="text-sm font-light tracking-tight text-white/85">Elsewhere</div>
+          <BrandHome onClick={onReturnHome} />
           <AccountLink variant="dark" />
         </nav>
         <div className="relative z-10 flex flex-1 flex-col items-center justify-center overflow-y-auto px-5 pb-6 pt-24 md:px-8">
