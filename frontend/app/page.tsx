@@ -6,24 +6,45 @@ import { EndSessionPage } from "@/components/elsewhere/EndSessionPage";
 import { LandingPage } from "@/components/elsewhere/LandingPage";
 import { ListeningPage } from "@/components/elsewhere/ListeningPage";
 import { PreparingPage } from "@/components/elsewhere/PreparingPage";
+import { SessionEndingDialog } from "@/components/elsewhere/SessionEndingDialog";
 import { useVoiceClient } from "@/hooks/useVoiceClient";
 
 function HomePage() {
   const [selectedModelId] = useState("openai/gpt-4o");
   const [hadCall, setHadCall] = useState(false);
   const [timer, setTimer] = useState(0);
+  // When the agent signals the session is ending, we anchor an absolute end time
+  // and tick toward it to drive the countdown popup.
+  const [endingAtMs, setEndingAtMs] = useState<number | null>(null);
+  const [nowMs, setNowMs] = useState(0);
 
   // The agent ended the session on its own (e.g. the 7-minute time limit): show
   // the end screen, same as if the user had pressed End.
   const handleServerDisconnect = useCallback(() => {
     setHadCall(true);
+    setEndingAtMs(null);
+  }, []);
+
+  const handleSessionEndingSoon = useCallback((secondsRemaining: number) => {
+    setEndingAtMs(Date.now() + secondsRemaining * 1000);
+    setNowMs(Date.now());
   }, []);
 
   const { state, connect, disconnect, toggleMute, isMuted } = useVoiceClient({
     onServerDisconnect: handleServerDisconnect,
+    onSessionEndingSoon: handleSessionEndingSoon,
   });
 
   const isActiveCall = state === "connected" || state === "muted";
+
+  useEffect(() => {
+    if (endingAtMs === null) return;
+    const id = setInterval(() => setNowMs(Date.now()), 500);
+    return () => clearInterval(id);
+  }, [endingAtMs]);
+
+  const endingSecondsLeft =
+    endingAtMs === null ? null : Math.max(0, Math.ceil((endingAtMs - nowMs) / 1000));
 
   useEffect(() => {
     if (!isActiveCall) return;
@@ -34,6 +55,7 @@ function HomePage() {
   const handleStart = useCallback(() => {
     setHadCall(false);
     setTimer(0);
+    setEndingAtMs(null);
     void connect(selectedModelId);
   }, [connect, selectedModelId]);
 
@@ -41,11 +63,13 @@ function HomePage() {
     void disconnect();
     setHadCall(false);
     setTimer(0);
+    setEndingAtMs(null);
   }, [disconnect]);
 
   const handleEndCall = useCallback(async () => {
     await disconnect();
     setHadCall(true);
+    setEndingAtMs(null);
   }, [disconnect]);
 
   const handleReturnHome = useCallback(() => {
@@ -88,6 +112,10 @@ function HomePage() {
         ) : null}
         {view === "ended" ? <EndSessionPage key="ended" onReturnHome={handleReturnHome} /> : null}
       </AnimatePresence>
+      <SessionEndingDialog
+        open={view === "listening" && endingSecondsLeft !== null}
+        secondsLeft={endingSecondsLeft ?? 0}
+      />
     </div>
   );
 }
