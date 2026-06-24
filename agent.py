@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import asyncio
 import inspect
+import json
 import logging
 import time
 import hashlib
@@ -2666,36 +2667,25 @@ TTS_POST_SPEECH_HOLD_MS = env_int_clamped("TTS_POST_SPEECH_HOLD_MS", 0, 0, 5000)
 RUN_DB_MIGRATIONS_ON_STARTUP = env_bool("RUN_DB_MIGRATIONS_ON_STARTUP", False)
 
 # --- Session time limit -------------------------------------------------------
-# Hard cap on how long a single voice session runs. The worker speaks a short
-# heads-up SESSION_ENDING_WARNING_SECONDS before the cap, then (optionally) says
-# a brief goodbye and tears the room down so the client lands on the end screen.
-# Set SESSION_TIME_LIMIT_ENABLED=false (or SESSION_MAX_DURATION_SECONDS=0) to
-# disable. Times are seconds; default is a 7-minute session with a 30s warning.
+# Hard cap on how long a single voice session runs. SESSION_ENDING_NOTICE_SECONDS
+# before the cap the worker sends a data message to the client so the UI can show
+# a "time remaining" popup that counts down; at the cap the worker (optionally)
+# says a brief goodbye and tears the room down so the client lands on the end
+# screen. Set SESSION_TIME_LIMIT_ENABLED=false (or SESSION_MAX_DURATION_SECONDS=0)
+# to disable. Times are seconds; default is a 7-minute session with a 1-min popup.
 SESSION_TIME_LIMIT_ENABLED = env_bool("SESSION_TIME_LIMIT_ENABLED", True)
 SESSION_MAX_DURATION_SECONDS = float(os.getenv("SESSION_MAX_DURATION_SECONDS", "420") or "420")
-SESSION_ENDING_WARNING_SECONDS = float(os.getenv("SESSION_ENDING_WARNING_SECONDS", "30") or "30")
-SESSION_ENDING_WARNING_TEXT = (
-    os.getenv("SESSION_ENDING_WARNING_TEXT")
-    or "Hey, quick heads up — we've got about thirty seconds left for this one."
-).strip()
-# "generate" = Arche improvises the heads-up live via the LLM (dynamic, on-persona,
-# varies each session). "fixed" = always speak SESSION_ENDING_WARNING_TEXT verbatim.
-# In generate mode SESSION_ENDING_WARNING_TEXT is still used as a fallback if the
-# live generation fails.
-SESSION_ENDING_WARNING_MODE = (os.getenv("SESSION_ENDING_WARNING_MODE") or "generate").strip().lower()
-SESSION_ENDING_WARNING_INSTRUCTION = (
-    os.getenv("SESSION_ENDING_WARNING_INSTRUCTION")
-    or (
-        "The session is almost over — only about 30 seconds left. In one short, "
-        "natural sentence in your own voice, gently let the user know you'll need "
-        "to wrap up soon. Do not be abrupt, do not list options, do not ask a new "
-        "question."
-    )
-).strip()
+# How long before the cap to notify the client (drives the on-screen countdown
+# popup). Default 60 = a one-minute "time remaining" popup.
+SESSION_ENDING_NOTICE_SECONDS = float(os.getenv("SESSION_ENDING_NOTICE_SECONDS", "60") or "60")
+# Optional spoken send-off right at the cap. Set to empty to end silently (the
+# popup already communicates the ending); this is NOT a verbal countdown.
 SESSION_ENDING_GOODBYE_TEXT = (
     os.getenv("SESSION_ENDING_GOODBYE_TEXT")
     or "That's our time for now. Take care — talk soon."
 ).strip()
+# LiveKit data-message topic for the client-side ending popup.
+SESSION_ENDING_NOTICE_TOPIC = (os.getenv("SESSION_ENDING_NOTICE_TOPIC") or "session").strip() or "session"
 
 ENABLE_FIXED_GREETING = env_bool("ENABLE_FIXED_GREETING", True)
 GREETING_TEXT = (os.getenv("GREETING_TEXT") or "Yo. What’s going on?").strip() or "Yo. What’s going on?"
@@ -6815,67 +6805,68 @@ async def _terminate_room(ctx: JobContext) -> str:
     return "none"
 
 
-async def _speak_session_warning(session: AgentSession) -> str:
-    """Deliver the "almost out of time" heads-up.
+async def _publish_session_ending_notice(ctx: JobContext, seconds_remaining: float) -> bool:
+    """Tell the client the session is about to end so it can show the countdown popup.
 
-    In "generate" mode Arche improvises the line live (dynamic + on-persona) via
-    session.generate_reply; the fixed SESSION_ENDING_WARNING_TEXT is the fallback
-    if generation isn't available or fails. Returns the path used for logging.
+    Sent as a reliable LiveKit data message; the frontend listens for it and runs
+    an on-screen countdown. Best-effort: a failure here never blocks the hard end.
     """
-    if SESSION_ENDING_WARNING_MODE == "generate":
-        generate_reply = getattr(session, "generate_reply", None)
-        if callable(generate_reply) and SESSION_ENDING_WARNING_INSTRUCTION:
-            try:
-                await generate_reply(instructions=SESSION_ENDING_WARNING_INSTRUCTION)
-                return "generate"
-            except Exception as exc:
-                logger.warning(
-                    "session_time_warning_generate_failed=true error=%s; falling back to fixed text",
-                    _redact_sensitive_text(exc),
-                )
-    if SESSION_ENDING_WARNING_TEXT:
+    room = getattr(ctx, "room", None)
+    local_participant = getattr(room, "local_participant", None)
+    publish = getattr(local_participant, "publish_data", None)
+    if not callable(publish):
+        logger.warning("session_ending_notice_skipped=true reason=no_local_participant")
+        return False
+    payload = json.dumps(
+        {"type": "session_ending", "seconds_remaining": int(round(seconds_remaining))}
+    ).encode("utf-8")
+    try:
+        await publish(payload, reliable=True, topic=SESSION_ENDING_NOTICE_TOPIC)
+        return True
+    except TypeError:
+        # Older rtc signatures don't accept a topic kwarg.
         try:
-            await session.say(SESSION_ENDING_WARNING_TEXT, allow_interruptions=True)
-            return "fixed"
+            await publish(payload, reliable=True)
+            return True
         except Exception as exc:
-            logger.warning(
-                "session_time_warning_say_failed=true error=%s",
-                _redact_sensitive_text(exc),
-            )
-    return "none"
+            logger.warning("session_ending_notice_failed=true error=%s", _redact_sensitive_text(exc))
+            return False
+    except Exception as exc:
+        logger.warning("session_ending_notice_failed=true error=%s", _redact_sensitive_text(exc))
+        return False
 
 
 async def _run_session_time_limit(session: AgentSession, ctx: JobContext) -> None:
-    """Enforce the hard session cap: speak a heads-up, then end the room.
+    """Enforce the hard session cap.
 
-    Anchored to a monotonic start so the hard cut lands at SESSION_MAX_DURATION_SECONDS
-    regardless of how long the spoken lines take. Cancelled on shutdown.
+    Sends the client an ending notice SESSION_ENDING_NOTICE_SECONDS before the cap
+    (drives the on-screen countdown popup), then optionally says a brief goodbye
+    and tears the room down. Anchored to a monotonic start so the hard cut lands at
+    SESSION_MAX_DURATION_SECONDS regardless of how long the goodbye takes. Cancelled
+    on shutdown.
     """
     if not SESSION_TIME_LIMIT_ENABLED or SESSION_MAX_DURATION_SECONDS <= 0:
         return
     limit = SESSION_MAX_DURATION_SECONDS
-    warn_at = limit - SESSION_ENDING_WARNING_SECONDS
+    notice_at = limit - SESSION_ENDING_NOTICE_SECONDS
     started = time.monotonic()
     logger.info(
-        "session_time_limit_armed=true limit_seconds=%s warning_seconds=%s warning_at_seconds=%s",
+        "session_time_limit_armed=true limit_seconds=%s notice_seconds=%s notice_at_seconds=%s",
         limit,
-        SESSION_ENDING_WARNING_SECONDS,
-        max(0.0, warn_at),
+        SESSION_ENDING_NOTICE_SECONDS,
+        max(0.0, notice_at),
     )
     try:
-        warning_enabled = warn_at > 0 and (
-            SESSION_ENDING_WARNING_MODE == "generate" or bool(SESSION_ENDING_WARNING_TEXT)
-        )
-        if warning_enabled:
-            await asyncio.sleep(warn_at)
+        if notice_at > 0 and SESSION_ENDING_NOTICE_SECONDS > 0:
+            await asyncio.sleep(notice_at)
+            remaining_at_notice = limit - (time.monotonic() - started)
+            ok = await _publish_session_ending_notice(ctx, remaining_at_notice)
             logger.info(
-                "session_time_warning_speaking=true mode=%s elapsed_seconds=%s remaining_seconds=%s",
-                SESSION_ENDING_WARNING_MODE,
+                "session_ending_notice_published=%s seconds_remaining=%s elapsed_seconds=%s",
+                ok,
+                _fmt_seconds(remaining_at_notice),
                 _fmt_seconds(time.monotonic() - started),
-                _fmt_seconds(limit - (time.monotonic() - started)),
             )
-            warning_path = await _speak_session_warning(session)
-            logger.info("session_time_warning_delivered=true path=%s", warning_path)
 
         remaining = limit - (time.monotonic() - started)
         if remaining > 0:
@@ -7316,8 +7307,9 @@ async def entrypoint(ctx: JobContext):
         await session.start(room=ctx.room, agent=lucy_agent)
         session_started_at = time.monotonic()
 
-    # Arm the session time limit on a background clock: it speaks a heads-up
-    # ~SESSION_ENDING_WARNING_SECONDS before the cap, then ends the room.
+    # Arm the session time limit on a background clock: it sends the client an
+    # ending notice ~SESSION_ENDING_NOTICE_SECONDS before the cap (for the on-screen
+    # countdown popup), then ends the room at the cap.
     if SESSION_TIME_LIMIT_ENABLED and SESSION_MAX_DURATION_SECONDS > 0:
         session_timer_task = asyncio.create_task(_run_session_time_limit(session, ctx))
 
