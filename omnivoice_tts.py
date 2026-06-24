@@ -282,3 +282,16 @@ class _OmniVoiceChunkedStream(tts.ChunkedStream):
         )
         output_emitter.push(audio)
         output_emitter.flush()
+
+
+def find_omnivoice_tts(tts_obj: object) -> "OmniVoiceTTS | None":
+    """Return the OmniVoiceTTS inside a session TTS, whether bare or wrapped in a
+    FallbackAdapter, so callers can update its voice/language at runtime."""
+    if isinstance(tts_obj, OmniVoiceTTS):
+        return tts_obj
+    children = getattr(tts_obj, "_tts_instances", None)
+    if isinstance(children, (list, tuple)):
+        for child in children:
+            if isinstance(child, OmniVoiceTTS):
+                return child
+    return None
