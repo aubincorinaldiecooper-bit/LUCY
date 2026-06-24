@@ -90,7 +90,9 @@ from transcript_context import (
     transcript_context_llm_model,
     transcript_context_llm_timeout_ms,
 )
-from omnivoice_tts import OmniVoiceConfig, OmniVoiceTTS
+from omnivoice_tts import OmniVoiceConfig, OmniVoiceTTS, find_omnivoice_tts
+from omnivoice_voice_pool import get_session_selector
+from omnivoice_language import detect_language_request, language_name
 
 
 load_dotenv()
@@ -175,6 +177,13 @@ STT_PROVIDER = os.getenv("STT_PROVIDER", "mistral").strip().lower()
 # Active/session language Arche is configured to operate in. Logged at turn commit
 # so a transcript-language candidate can be compared against the intended language.
 SESSION_LANGUAGE = (os.getenv("SESSION_LANGUAGE") or os.getenv("DEEPGRAM_STT_LANGUAGE") or "en").strip() or "en"
+# Mutable active language for the current session: starts at SESSION_LANGUAGE and
+# changes when the user asks Arche to switch (e.g. "speak French"). Drives the
+# OmniVoice synthesis language and an LLM directive to reply in that language.
+_active_session_language = SESSION_LANGUAGE
+# The OmniVoiceTTS for this session (bare or inside the FallbackAdapter), so a
+# runtime voice/language switch can reach it. None when OmniVoice isn't active.
+_session_omnivoice_tts: "OmniVoiceTTS | None" = None
 VAD_PROVIDER = os.getenv("VAD_PROVIDER", "ai_coustics").strip().lower()
 LIVEKIT_TURN_DETECTION_MODE = os.getenv("LIVEKIT_TURN_DETECTION_MODE", "vad").strip().lower()
 # LiveKit audio end-of-turn detector (livekit-agents >= 1.6.1: inference.TurnDetector).
@@ -3609,6 +3618,64 @@ def build_tts():
     return tts.FallbackAdapter([primary, fallback])
 
 
+def _init_session_voice_and_language(session_tts: object) -> None:
+    """Pick one stable voice preset for this session and prime the active language.
+
+    Run once at session start. Finds the OmniVoiceTTS (bare or wrapped), selects a
+    preset from the rotating pool (stable for the whole session), and points it at
+    the active language. No-op when OmniVoice isn't the active provider. Best-effort
+    — any failure leaves OmniVoice on its default voice rather than breaking start.
+    """
+    global _session_omnivoice_tts, _active_session_language
+    _active_session_language = SESSION_LANGUAGE
+    _session_omnivoice_tts = find_omnivoice_tts(session_tts)
+    if _session_omnivoice_tts is None:
+        return
+    preset = None
+    try:
+        preset = get_session_selector().select()
+    except Exception as exc:  # noqa: BLE001 - pool issues must not break the session
+        logger.warning("omnivoice_voice_pool_select_failed=true error=%s", _redact_sensitive_text(exc))
+    if preset is not None:
+        _session_omnivoice_tts.update_options(voice=preset.id, language=_active_session_language)
+    else:
+        _session_omnivoice_tts.update_options(language=_active_session_language)
+    logger.info(
+        "omnivoice_session_voice_selected=true voice_preset_id=%s voice_preset_name=%s active_language=%s pool_used=%s",
+        preset.id if preset else "default",
+        preset.name if preset else "",
+        _active_session_language,
+        preset is not None,
+    )
+
+
+def _maybe_switch_language(user_text: str) -> tuple[str, str] | None:
+    """If the user asked to switch language, update active state + OmniVoice.
+
+    Returns (code, English name) on a switch (so the caller can nudge the LLM),
+    else None. Skips no-op requests for the already-active language.
+    """
+    global _active_session_language
+    detected = detect_language_request(user_text)
+    if detected is None:
+        return None
+    code, name = detected
+    if code == _active_session_language:
+        return None
+    previous = _active_session_language
+    _active_session_language = code
+    if _session_omnivoice_tts is not None:
+        _session_omnivoice_tts.update_options(language=code)
+    logger.info(
+        "language_switch_request=true from_language=%s to_language=%s to_language_name=%s omnivoice_active=%s",
+        previous,
+        code,
+        name,
+        _session_omnivoice_tts is not None,
+    )
+    return code, name
+
+
 async def _close_tts_owned_session(tts_obj: object) -> None:
     """Close http sessions/handles a build owns for this TTS instance.
 
@@ -5621,6 +5688,20 @@ class LucyAgent(Agent):
 
     def llm_node(self, chat_ctx, tools, model_settings):
         datetime_user_text = _extract_latest_user_text_from_chat_ctx(chat_ctx)
+        # Honor a user request to switch languages: update the active language +
+        # OmniVoice, and nudge the LLM to reply in it (skip if no real change).
+        language_switch = _maybe_switch_language(datetime_user_text)
+        if language_switch is not None:
+            _lang_code, _lang_name = language_switch
+            chat_ctx = chat_ctx.copy()
+            chat_ctx.add_message(
+                role="system",
+                content=(
+                    f"The user asked you to speak {_lang_name}. Respond only in {_lang_name} "
+                    "from now on — including this reply — until they ask for another language. "
+                    "Do not announce the switch or comment on their language."
+                ),
+            )
         datetime_intent = detect_datetime_intent(datetime_user_text)
         if datetime_intent and self.runtime_context is not None:
             async def _datetime_guard_stream():
@@ -7311,6 +7392,8 @@ async def entrypoint(ctx: JobContext):
     )
 
     session_tts = build_tts()
+    # Pick this session's stable voice preset and prime the active language.
+    _init_session_voice_and_language(session_tts)
     # If this TTS owns a debug http_session, close it on shutdown so the
     # long-lived session doesn't leak it the way the pre-render did.
     try:
