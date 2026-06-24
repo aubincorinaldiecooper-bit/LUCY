@@ -21,6 +21,19 @@ class DetectLanguageRequestTests(unittest.TestCase):
         self.assertEqual(lang.detect_language_request("habla español por favor"), ("es", "Spanish"))
         self.assertEqual(lang.detect_language_request("parle français"), ("fr", "French"))
 
+    def test_beta_priority_languages(self):
+        # Explicit beta targets + Google-Translate-set coverage.
+        self.assertEqual(lang.detect_language_request("can you speak Yoruba"), ("yo", "Yoruba"))
+        self.assertEqual(lang.detect_language_request("switch to Igbo"), ("ig", "Igbo"))
+        self.assertEqual(lang.detect_language_request("respond in Vietnamese"), ("vi", "Vietnamese"))
+        self.assertEqual(lang.detect_language_request("talk to me in Swahili"), ("sw", "Swahili"))
+        self.assertEqual(lang.detect_language_request("speak Zulu"), ("zu", "Zulu"))
+        self.assertEqual(lang.detect_language_request("respond in Tagalog"), ("tl", "Filipino"))
+
+    def test_aliases_map_to_codes(self):
+        self.assertEqual(lang.detect_language_request("switch to Farsi"), ("fa", "Persian"))
+        self.assertEqual(lang.detect_language_request("speak Mandarin"), ("zh", "Chinese"))
+
     def test_no_false_positive_on_casual_mention(self):
         self.assertIsNone(lang.detect_language_request("I learned French in high school"))
         self.assertIsNone(lang.detect_language_request("my family speaks three languages"))
