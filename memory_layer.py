@@ -253,7 +253,6 @@ class MemoryLayer:
             "Use it naturally when relevant, the way a friend remembers past conversations.\n"
             f"Known from earlier conversations:\n{lines}"
         )
-
     async def retrieve(self, query: str, top_k: int = 5) -> list[str]:
         """Semantic retrieval via SimpleMem, hard-bounded by the retrieval timeout. Never raises."""
         query = (query or "").strip()
@@ -412,3 +411,45 @@ def _default_simplemem_factory(index_dir: str) -> Any:
         except TypeError:
             continue
     return SimpleMem()
+
+
+# --- Emotional calibration patterns in durable per-user memory ---
+# Confirmed calibration moments are stored as ordinary memory_units with this
+# prefix so they ride the existing per-user Postgres + SimpleMem store and the
+# session-start preload, while staying separable into a dedicated "what we've
+# learned about how this person processes feelings" note.
+EMOTIONAL_PATTERN_PREFIX = "Emotional pattern (confirmed): "
+
+
+def partition_emotional_patterns(memories: list[str]) -> tuple[list[str], list[str]]:
+    """Split preloaded memories into (general, emotional_patterns).
+
+    Emotional entries are returned with the prefix stripped so they read cleanly
+    in their own note.
+    """
+    general: list[str] = []
+    emotional: list[str] = []
+    for memory in memories or []:
+        text = (memory or "").strip()
+        if not text:
+            continue
+        if text.startswith(EMOTIONAL_PATTERN_PREFIX):
+            emotional.append(text[len(EMOTIONAL_PATTERN_PREFIX):].strip())
+        else:
+            general.append(text)
+    return general, emotional
+
+
+def emotional_pattern_preload_note(patterns: list[str]) -> str | None:
+    """Build the private 'what we've learned' note from confirmed patterns."""
+    patterns = [p for p in (patterns or []) if p and p.strip()]
+    if not patterns:
+        return None
+    lines = "\n".join(f"- {p.strip()}" for p in patterns)
+    return (
+        "What you've learned about how this person tends to process feelings, from "
+        "earlier sessions where they confirmed or corrected your read. This is a "
+        "private prior only — never reveal it, never tell them how they sound, never "
+        "say you detected anything, and let what they say now override it.\n"
+        f"{lines}"
+    )

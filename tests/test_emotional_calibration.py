@@ -29,6 +29,14 @@ class _FakeTurnCtx:
         self.messages.append({"role": role, "content": content})
 
 
+class _FakeMemoryLayer:
+    def __init__(self):
+        self.remembered = []
+
+    def schedule_remember(self, role, content, turn_id=None, **kw):
+        self.remembered.append({"role": role, "content": content, "turn_id": turn_id})
+
+
 _MOMENT_SCHEMA = {
     "session_id", "turn_id", "timestamp", "transcript", "normalized_inworld_context",
     "arche_question", "user_answer", "inferred_emotional_pattern", "user_confirmed_or_corrected",
@@ -213,6 +221,59 @@ class CalibrationMomentLifecycleTests(unittest.TestCase):
         agent._pending_calibration_moment = None
         agent._complete_pending_calibration_moment("hello")  # must not raise
         self.assertEqual(agent._calibration_moments, [])
+
+
+class CalibrationMemoryTests(unittest.TestCase):
+    def setUp(self):
+        self._saved = (agent._active_memory_layer, agent._pending_calibration_moment,
+                       agent._calibration_moments[:], agent.CALIBRATION_MOMENTS_PATH)
+        agent._pending_calibration_moment = None
+        agent._calibration_moments.clear()
+        agent.CALIBRATION_MOMENTS_PATH = ""  # disable JSONL write in these tests
+
+    def tearDown(self):
+        (agent._active_memory_layer, agent._pending_calibration_moment, moments,
+         agent.CALIBRATION_MOMENTS_PATH) = self._saved
+        agent._calibration_moments.clear()
+        agent._calibration_moments.extend(moments)
+
+    def _moment(self, confirmed=True):
+        return {
+            "session_id": "s", "turn_id": "12", "timestamp": "t",
+            "transcript": "I have a big decision to make soon",
+            "normalized_inworld_context": {}, "arche_question": "fear or pressure?",
+            "user_answer": "it's the pressure" if confirmed else "",
+            "inferred_emotional_pattern": "energy=high", "user_confirmed_or_corrected": confirmed,
+        }
+
+    def test_confirmed_pattern_is_remembered_durably(self):
+        mem = _FakeMemoryLayer()
+        agent._active_memory_layer = mem
+        agent._remember_calibration_pattern(self._moment(confirmed=True))
+        self.assertEqual(len(mem.remembered), 1)
+        entry = mem.remembered[0]
+        self.assertEqual(entry["role"], "emotional_calibration")
+        self.assertTrue(entry["content"].startswith(agent.EMOTIONAL_PATTERN_PREFIX))
+        self.assertIn("it's the pressure", entry["content"])
+        self.assertEqual(entry["turn_id"], 12)
+
+    def test_unconfirmed_pattern_not_remembered(self):
+        mem = _FakeMemoryLayer()
+        agent._active_memory_layer = mem
+        agent._remember_calibration_pattern(self._moment(confirmed=False))
+        self.assertEqual(mem.remembered, [])
+
+    def test_no_memory_layer_is_noop(self):
+        agent._active_memory_layer = None
+        agent._remember_calibration_pattern(self._moment(confirmed=True))  # must not raise
+
+    def test_complete_moment_routes_confirmed_pattern_to_memory(self):
+        mem = _FakeMemoryLayer()
+        agent._active_memory_layer = mem
+        agent._pending_calibration_moment = self._moment(confirmed=False)
+        agent._complete_pending_calibration_moment("more like pressure than fear")
+        self.assertEqual(len(mem.remembered), 1)
+        self.assertIn("more like pressure than fear", mem.remembered[0]["content"])
 
 
 if __name__ == "__main__":
