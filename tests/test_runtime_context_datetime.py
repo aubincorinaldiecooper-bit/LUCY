@@ -29,7 +29,9 @@ class DatetimeGuardFreshnessTests(unittest.TestCase):
         at_318 = runtime_context.answer_datetime_intent(self.ctx, "time", now=_toronto(15, 18))
         self.assertIn("3:18 PM", at_318)
         self.assertNotIn("3:15", at_318)
-        self.assertIn("America/Toronto", at_318)
+        # The spoken answer must not name the raw IANA zone — just the time.
+        self.assertNotIn("America/Toronto", at_318)
+        self.assertNotIn("/", at_318)
 
     def test_snapshot_recomputes_per_call(self):
         date_318, time_318 = runtime_context.current_datetime_snapshot(self.ctx, now=_toronto(15, 18))

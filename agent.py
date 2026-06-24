@@ -2683,6 +2683,17 @@ SESSION_ENDING_GOODBYE_TEXT = (
     os.getenv("SESSION_ENDING_GOODBYE_TEXT")
     or "That's our time for now. Take care — talk soon."
 ).strip()
+# The heads-up and goodbye are spoken through the same gate that drops any
+# utterance created while the user is talking, so each waits out in-progress user
+# speech before speaking. Reserve a little room before the hard cap for a
+# late-spoken heads-up to finish, and cap how long the goodbye may wait for a
+# pause (the room tears down right after it).
+SESSION_ENDING_WARNING_PLAYBACK_RESERVE_SECONDS = float(
+    os.getenv("SESSION_ENDING_WARNING_PLAYBACK_RESERVE_SECONDS", "6") or "6"
+)
+SESSION_ENDING_GOODBYE_CLEAR_WAIT_SECONDS = float(
+    os.getenv("SESSION_ENDING_GOODBYE_CLEAR_WAIT_SECONDS", "3") or "3"
+)
 
 ENABLE_FIXED_GREETING = env_bool("ENABLE_FIXED_GREETING", True)
 GREETING_TEXT = (os.getenv("GREETING_TEXT") or "Yo. What’s going on?").strip() or "Yo. What’s going on?"
@@ -6842,6 +6853,56 @@ async def _terminate_room(ctx: JobContext) -> str:
     return "none"
 
 
+async def _say_session_line_when_clear(
+    session: AgentSession,
+    text: str,
+    *,
+    deadline: float,
+    label: str,
+    started: float,
+) -> bool:
+    """Speak a session-management line, waiting out any in-progress user speech.
+
+    The assistant-speech gate drops any utterance created while the user is
+    talking (assistant_speech_start_blocked_reason=user_speaking), which
+    previously swallowed the time-limit heads-up whenever the user happened to be
+    mid-sentence — the user literally would not hear it. Poll the live user state
+    and only say the line once they pause, then say it non-interruptibly so the
+    heads-up can't be cut off. Bounded by `deadline` (monotonic) so retrying can
+    never push past the hard cap; if the user never pauses in time we log and skip
+    rather than block the end.
+    """
+    poll_seconds = 0.25
+    while _latest_user_state_for_greeting == "speaking":
+        now = time.monotonic()
+        if now >= deadline:
+            logger.warning(
+                "session_time_%s_skipped=true reason=user_speaking_through_deadline elapsed_seconds=%s",
+                label,
+                _fmt_seconds(now - started),
+            )
+            return False
+        await asyncio.sleep(min(poll_seconds, max(0.0, deadline - now)))
+    try:
+        handle = await session.say(text, allow_interruptions=False)
+        wait_for_playout = getattr(handle, "wait_for_playout", None)
+        if callable(wait_for_playout):
+            await asyncio.wait_for(wait_for_playout(), timeout=8.0)
+        logger.info(
+            "session_time_%s_spoken=true elapsed_seconds=%s",
+            label,
+            _fmt_seconds(time.monotonic() - started),
+        )
+        return True
+    except Exception as exc:
+        logger.warning(
+            "session_time_%s_say_failed=true error=%s",
+            label,
+            _redact_sensitive_text(exc),
+        )
+        return False
+
+
 async def _run_session_time_limit(session: AgentSession, ctx: JobContext) -> None:
     """Enforce the hard session cap: speak a heads-up, then end the room.
 
@@ -6867,13 +6928,16 @@ async def _run_session_time_limit(session: AgentSession, ctx: JobContext) -> Non
                 _fmt_seconds(time.monotonic() - started),
                 _fmt_seconds(limit - (time.monotonic() - started)),
             )
-            try:
-                await session.say(SESSION_ENDING_WARNING_TEXT, allow_interruptions=True)
-            except Exception as exc:
-                logger.warning(
-                    "session_time_warning_say_failed=true error=%s",
-                    _redact_sensitive_text(exc),
-                )
+            # Hold a few seconds back from the hard cap so a heads-up spoken late
+            # (after waiting out the user) still finishes before the goodbye.
+            warning_deadline = started + limit - SESSION_ENDING_WARNING_PLAYBACK_RESERVE_SECONDS
+            await _say_session_line_when_clear(
+                session,
+                SESSION_ENDING_WARNING_TEXT,
+                deadline=warning_deadline,
+                label="warning",
+                started=started,
+            )
 
         remaining = limit - (time.monotonic() - started)
         if remaining > 0:
@@ -6884,18 +6948,16 @@ async def _run_session_time_limit(session: AgentSession, ctx: JobContext) -> Non
             _fmt_seconds(time.monotonic() - started),
         )
         if SESSION_ENDING_GOODBYE_TEXT:
-            try:
-                goodbye_handle = await session.say(
-                    SESSION_ENDING_GOODBYE_TEXT, allow_interruptions=False
-                )
-                wait_for_playout = getattr(goodbye_handle, "wait_for_playout", None)
-                if callable(wait_for_playout):
-                    await asyncio.wait_for(wait_for_playout(), timeout=8.0)
-            except Exception as exc:
-                logger.warning(
-                    "session_time_goodbye_say_failed=true error=%s",
-                    _redact_sensitive_text(exc),
-                )
+            # The goodbye runs through the same speech gate, so briefly wait out
+            # any in-progress user speech before saying it; bounded tightly since
+            # the room tears down right after.
+            await _say_session_line_when_clear(
+                session,
+                SESSION_ENDING_GOODBYE_TEXT,
+                deadline=time.monotonic() + SESSION_ENDING_GOODBYE_CLEAR_WAIT_SECONDS,
+                label="goodbye",
+                started=started,
+            )
 
         await _terminate_room(ctx)
     except asyncio.CancelledError:

@@ -184,12 +184,16 @@ def answer_datetime_intent(
     current_time = local_now.strftime("%I:%M %p").lstrip("0")
     weekday = local_now.strftime("%A")
     date_phrase = f"{weekday}, {local_now.strftime('%B')} {_ordinal_day(local_now.day)}, {local_now.year}"
+    # The clock is already computed in the user's own timezone (resolved from
+    # their browser/IP at session start), so speak the time itself and never name
+    # the IANA zone — "It’s 10:30 PM" reads naturally, "in America/Toronto" does
+    # not.
     if intent == "time":
-        return f"It’s {current_time} in {runtime_context.session_timezone}."
+        return f"It’s {current_time}."
     if intent == "month":
-        return f"It’s {local_now.strftime('%B')} in {runtime_context.session_timezone}."
+        return f"It’s {local_now.strftime('%B')}."
     if intent == "year":
         return f"It’s {local_now.year}."
     if intent == "part_of_day":
-        return f"It’s {_part_of_day(local_now.hour)} in {runtime_context.session_timezone}."
+        return f"It’s {_part_of_day(local_now.hour)}."
     return f"It’s {date_phrase}."
