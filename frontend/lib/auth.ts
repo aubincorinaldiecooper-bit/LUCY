@@ -36,8 +36,19 @@ if (!process.env.DATABASE_URL) {
   );
 }
 
+// Optionally set the session cookie on a parent domain so it's shared across
+// hosts (e.g. www.sinestudios.space AND the apex sinestudios.space, or any
+// subdomain). Without this the cookie is host-only, so signing in on www and
+// then browsing the apex (or vice-versa) looks "signed out" and forces a
+// re-sign-in. Set AUTH_COOKIE_DOMAIN=.sinestudios.space to enable; leave unset
+// to keep the default host-only behavior.
+const authCookieDomain = process.env.AUTH_COOKIE_DOMAIN?.trim();
+
 export const auth = betterAuth({
   database: new Pool({ connectionString: process.env.DATABASE_URL }),
+  ...(authCookieDomain
+    ? { advanced: { crossSubDomainCookies: { enabled: true, domain: authCookieDomain } } }
+    : {}),
   plugins: [
     magicLink({
       // Token lifetime in seconds (Better Auth default is 300 = 5 minutes).
