@@ -24,6 +24,8 @@ class NormalizeTests(unittest.TestCase):
         n = ivp.normalize_voice_profile(None)
         self.assertEqual((n.energy, n.tension, n.certainty), ("medium", "medium", "medium"))
         self.assertEqual(n.emotion_confidence, 0.0)
+        self.assertIn("confidence", n.to_dict())
+        self.assertNotIn("emotion_confidence", n.to_dict())
 
     def test_high_confidence_emotion_drives_dims(self):
         n = ivp.normalize_voice_profile(
@@ -102,15 +104,39 @@ class ConfigTests(unittest.TestCase):
     def test_from_env(self):
         with mock.patch.dict(
             os.environ,
-            {"INWORLD_VOICE_PROFILE_ENABLED": "true", "INWORLD_API_KEY": "abc",
-             "INWORLD_VOICE_PROFILE_THRESHOLD": "0.6"},
+            {"INWORLD_ENABLED": "true", "INWORLD_VOICE_PROFILE_ENABLED": "true", "INWORLD_API_KEY": "abc",
+             "INWORLD_VOICE_PROFILE_THRESHOLD": "0.6", "INWORLD_MODEL_ID": "inworld/inworld-stt-1"},
             clear=False,
         ):
             c = ivp.InworldConfig.from_env()
         self.assertTrue(c.enabled)
         self.assertEqual(c.api_key, "abc")
         self.assertEqual(c.voice_profile_threshold, 0.6)
+        self.assertEqual(c.model_id, "inworld/inworld-stt-1")
         self.assertTrue(c.ws_url.startswith("wss://api.inworld.ai"))
+
+
+class ShadowTests(unittest.TestCase):
+    def test_disabled_without_global_inworld_flag(self):
+        with mock.patch.dict(
+            os.environ,
+            {"INWORLD_ENABLED": "false", "INWORLD_VOICE_PROFILE_ENABLED": "true", "INWORLD_API_KEY": "abc"},
+            clear=False,
+        ):
+            self.assertIsNone(ivp.build_inworld_shadow_from_env())
+
+    def test_context_for_turn_returns_latest_profile_and_latency(self):
+        cfg = ivp.InworldConfig(
+            enabled=True, ws_url="wss://x", api_key="k", model_id="inworld/inworld-stt-1",
+            voice_profile_threshold=0.4, sample_rate=16000, emotion_confidence_floor=0.5,
+        )
+        shadow = ivp.InworldVoiceProfileShadow(cfg)
+        shadow.latest_profile = ivp.NormalizedVoiceProfile(energy="low", confidence=0.7)
+        shadow.latest_received_at = 12.0
+        profile, reason, latency = shadow.context_for_turn(10.0)
+        self.assertEqual(profile.energy, "low")
+        self.assertEqual(reason, "none")
+        self.assertEqual(latency, 2.0)
 
 
 if __name__ == "__main__":
