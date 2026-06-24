@@ -6781,21 +6781,61 @@ async def _terminate_room(ctx: JobContext) -> str:
                 _redact_sensitive_text(exc),
             )
 
-    lkapi = getattr(ctx, "api", None)
-    if lkapi is not None and room_name:
+    # JobContext.api when present.
+    ctx_api = getattr(ctx, "api", None)
+    if ctx_api is not None and room_name:
         try:
-            await lkapi.room.delete_room(api.DeleteRoomRequest(room=room_name))
-            logger.info("session_room_terminated=true strategy=delete_room room=%s", room_name)
-            return "delete_room"
+            await ctx_api.room.delete_room(api.DeleteRoomRequest(room=room_name))
+            logger.info("session_room_terminated=true strategy=ctx_api_delete_room room=%s", room_name)
+            return "ctx_api_delete_room"
         except Exception as exc:
             logger.warning(
-                "session_room_terminate_failed strategy=delete_room error=%s",
+                "session_room_terminate_failed strategy=ctx_api_delete_room error=%s",
                 _redact_sensitive_text(exc),
             )
+
+    # Reliable path: build a server API client from the worker's LiveKit creds
+    # (the same creds server.py uses to create rooms) and delete the room. This
+    # forcibly disconnects the USER, which is what actually ends the call.
+    lk_url = os.getenv("LIVEKIT_URL")
+    lk_key = os.getenv("LIVEKIT_API_KEY")
+    lk_secret = os.getenv("LIVEKIT_API_SECRET")
+    if room_name and lk_url and lk_key and lk_secret:
+        lkapi = api.LiveKitAPI(url=lk_url, api_key=lk_key, api_secret=lk_secret)
+        try:
+            await lkapi.room.delete_room(api.DeleteRoomRequest(room=room_name))
+            logger.info("session_room_terminated=true strategy=env_api_delete_room room=%s", room_name)
+            return "env_api_delete_room"
+        except Exception as exc:
+            logger.warning(
+                "session_room_terminate_failed strategy=env_api_delete_room error=%s",
+                _redact_sensitive_text(exc),
+            )
+        finally:
+            try:
+                await lkapi.aclose()
+            except Exception:
+                pass
+    else:
+        logger.warning(
+            "session_room_terminate_env_api_unavailable room_name_present=%s livekit_url_present=%s "
+            "livekit_key_present=%s livekit_secret_present=%s",
+            bool(room_name),
+            bool(lk_url),
+            bool(lk_key),
+            bool(lk_secret),
+        )
+
+    # Last resort: disconnecting our own participant removes the AGENT but leaves
+    # the user in the room, so the call may not actually end. Logged as degraded.
     try:
         if room is not None:
             await room.disconnect()
-            logger.info("session_room_terminated=true strategy=room_disconnect room=%s", room_name)
+            logger.warning(
+                "session_room_terminated=degraded strategy=room_disconnect_agent_only room=%s "
+                "(user may remain connected)",
+                room_name,
+            )
             return "room_disconnect"
     except Exception as exc:
         logger.warning(
