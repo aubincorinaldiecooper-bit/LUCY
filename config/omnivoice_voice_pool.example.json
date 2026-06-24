@@ -1,0 +1,7 @@
+{
+  "presets": [
+    {"id": "REPLACE_WITH_OMNIVOICE_PRESET_ID_1", "name": "Maya",  "weight": 1.0, "language": "en", "tags": ["young", "warm", "natural", "conversational"]},
+    {"id": "REPLACE_WITH_OMNIVOICE_PRESET_ID_2", "name": "Theo",  "weight": 1.0, "language": "en", "tags": ["young", "warm", "natural", "conversational"]},
+    {"id": "REPLACE_WITH_OMNIVOICE_PRESET_ID_3", "name": "Nora",  "weight": 1.0, "language": "en", "tags": ["young", "warm", "natural", "conversational"]}
+  ]
+}
