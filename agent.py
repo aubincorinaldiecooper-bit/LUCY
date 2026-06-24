@@ -2667,25 +2667,22 @@ TTS_POST_SPEECH_HOLD_MS = env_int_clamped("TTS_POST_SPEECH_HOLD_MS", 0, 0, 5000)
 RUN_DB_MIGRATIONS_ON_STARTUP = env_bool("RUN_DB_MIGRATIONS_ON_STARTUP", False)
 
 # --- Session time limit -------------------------------------------------------
-# Hard cap on how long a single voice session runs. SESSION_ENDING_NOTICE_SECONDS
-# before the cap the worker sends a data message to the client so the UI can show
-# a "time remaining" popup that counts down; at the cap the worker (optionally)
-# says a brief goodbye and tears the room down so the client lands on the end
-# screen. Set SESSION_TIME_LIMIT_ENABLED=false (or SESSION_MAX_DURATION_SECONDS=0)
-# to disable. Times are seconds; default is a 7-minute session with a 1-min popup.
+# Hard cap on how long a single voice session runs. The worker speaks a short
+# heads-up SESSION_ENDING_WARNING_SECONDS before the cap, then (optionally) says
+# a brief goodbye and tears the room down so the client lands on the end screen.
+# Set SESSION_TIME_LIMIT_ENABLED=false (or SESSION_MAX_DURATION_SECONDS=0) to
+# disable. Times are seconds; default is a 7-minute session with a 30s warning.
 SESSION_TIME_LIMIT_ENABLED = env_bool("SESSION_TIME_LIMIT_ENABLED", True)
 SESSION_MAX_DURATION_SECONDS = float(os.getenv("SESSION_MAX_DURATION_SECONDS", "420") or "420")
-# How long before the cap to notify the client (drives the on-screen countdown
-# popup). Default 60 = a one-minute "time remaining" popup.
-SESSION_ENDING_NOTICE_SECONDS = float(os.getenv("SESSION_ENDING_NOTICE_SECONDS", "60") or "60")
-# Optional spoken send-off right at the cap. Set to empty to end silently (the
-# popup already communicates the ending); this is NOT a verbal countdown.
+SESSION_ENDING_WARNING_SECONDS = float(os.getenv("SESSION_ENDING_WARNING_SECONDS", "30") or "30")
+SESSION_ENDING_WARNING_TEXT = (
+    os.getenv("SESSION_ENDING_WARNING_TEXT")
+    or "Hey, quick heads up — we've got about thirty seconds left for this one."
+).strip()
 SESSION_ENDING_GOODBYE_TEXT = (
     os.getenv("SESSION_ENDING_GOODBYE_TEXT")
     or "That's our time for now. Take care — talk soon."
 ).strip()
-# LiveKit data-message topic for the client-side ending popup.
-SESSION_ENDING_NOTICE_TOPIC = (os.getenv("SESSION_ENDING_NOTICE_TOPIC") or "session").strip() or "session"
 
 ENABLE_FIXED_GREETING = env_bool("ENABLE_FIXED_GREETING", True)
 GREETING_TEXT = (os.getenv("GREETING_TEXT") or "Yo. What’s going on?").strip() or "Yo. What’s going on?"
@@ -6781,21 +6778,61 @@ async def _terminate_room(ctx: JobContext) -> str:
                 _redact_sensitive_text(exc),
             )
 
-    lkapi = getattr(ctx, "api", None)
-    if lkapi is not None and room_name:
+    # JobContext.api when present.
+    ctx_api = getattr(ctx, "api", None)
+    if ctx_api is not None and room_name:
         try:
-            await lkapi.room.delete_room(api.DeleteRoomRequest(room=room_name))
-            logger.info("session_room_terminated=true strategy=delete_room room=%s", room_name)
-            return "delete_room"
+            await ctx_api.room.delete_room(api.DeleteRoomRequest(room=room_name))
+            logger.info("session_room_terminated=true strategy=ctx_api_delete_room room=%s", room_name)
+            return "ctx_api_delete_room"
         except Exception as exc:
             logger.warning(
-                "session_room_terminate_failed strategy=delete_room error=%s",
+                "session_room_terminate_failed strategy=ctx_api_delete_room error=%s",
                 _redact_sensitive_text(exc),
             )
+
+    # Reliable path: build a server API client from the worker's LiveKit creds
+    # (the same creds server.py uses to create rooms) and delete the room. This
+    # forcibly disconnects the USER, which is what actually ends the call.
+    lk_url = os.getenv("LIVEKIT_URL")
+    lk_key = os.getenv("LIVEKIT_API_KEY")
+    lk_secret = os.getenv("LIVEKIT_API_SECRET")
+    if room_name and lk_url and lk_key and lk_secret:
+        lkapi = api.LiveKitAPI(url=lk_url, api_key=lk_key, api_secret=lk_secret)
+        try:
+            await lkapi.room.delete_room(api.DeleteRoomRequest(room=room_name))
+            logger.info("session_room_terminated=true strategy=env_api_delete_room room=%s", room_name)
+            return "env_api_delete_room"
+        except Exception as exc:
+            logger.warning(
+                "session_room_terminate_failed strategy=env_api_delete_room error=%s",
+                _redact_sensitive_text(exc),
+            )
+        finally:
+            try:
+                await lkapi.aclose()
+            except Exception:
+                pass
+    else:
+        logger.warning(
+            "session_room_terminate_env_api_unavailable room_name_present=%s livekit_url_present=%s "
+            "livekit_key_present=%s livekit_secret_present=%s",
+            bool(room_name),
+            bool(lk_url),
+            bool(lk_key),
+            bool(lk_secret),
+        )
+
+    # Last resort: disconnecting our own participant removes the AGENT but leaves
+    # the user in the room, so the call may not actually end. Logged as degraded.
     try:
         if room is not None:
             await room.disconnect()
-            logger.info("session_room_terminated=true strategy=room_disconnect room=%s", room_name)
+            logger.warning(
+                "session_room_terminated=degraded strategy=room_disconnect_agent_only room=%s "
+                "(user may remain connected)",
+                room_name,
+            )
             return "room_disconnect"
     except Exception as exc:
         logger.warning(
@@ -6805,68 +6842,38 @@ async def _terminate_room(ctx: JobContext) -> str:
     return "none"
 
 
-async def _publish_session_ending_notice(ctx: JobContext, seconds_remaining: float) -> bool:
-    """Tell the client the session is about to end so it can show the countdown popup.
-
-    Sent as a reliable LiveKit data message; the frontend listens for it and runs
-    an on-screen countdown. Best-effort: a failure here never blocks the hard end.
-    """
-    room = getattr(ctx, "room", None)
-    local_participant = getattr(room, "local_participant", None)
-    publish = getattr(local_participant, "publish_data", None)
-    if not callable(publish):
-        logger.warning("session_ending_notice_skipped=true reason=no_local_participant")
-        return False
-    payload = json.dumps(
-        {"type": "session_ending", "seconds_remaining": int(round(seconds_remaining))}
-    ).encode("utf-8")
-    try:
-        await publish(payload, reliable=True, topic=SESSION_ENDING_NOTICE_TOPIC)
-        return True
-    except TypeError:
-        # Older rtc signatures don't accept a topic kwarg.
-        try:
-            await publish(payload, reliable=True)
-            return True
-        except Exception as exc:
-            logger.warning("session_ending_notice_failed=true error=%s", _redact_sensitive_text(exc))
-            return False
-    except Exception as exc:
-        logger.warning("session_ending_notice_failed=true error=%s", _redact_sensitive_text(exc))
-        return False
-
-
 async def _run_session_time_limit(session: AgentSession, ctx: JobContext) -> None:
-    """Enforce the hard session cap.
+    """Enforce the hard session cap: speak a heads-up, then end the room.
 
-    Sends the client an ending notice SESSION_ENDING_NOTICE_SECONDS before the cap
-    (drives the on-screen countdown popup), then optionally says a brief goodbye
-    and tears the room down. Anchored to a monotonic start so the hard cut lands at
-    SESSION_MAX_DURATION_SECONDS regardless of how long the goodbye takes. Cancelled
-    on shutdown.
+    Anchored to a monotonic start so the hard cut lands at SESSION_MAX_DURATION_SECONDS
+    regardless of how long the spoken lines take. Cancelled on shutdown.
     """
     if not SESSION_TIME_LIMIT_ENABLED or SESSION_MAX_DURATION_SECONDS <= 0:
         return
     limit = SESSION_MAX_DURATION_SECONDS
-    notice_at = limit - SESSION_ENDING_NOTICE_SECONDS
+    warn_at = limit - SESSION_ENDING_WARNING_SECONDS
     started = time.monotonic()
     logger.info(
-        "session_time_limit_armed=true limit_seconds=%s notice_seconds=%s notice_at_seconds=%s",
+        "session_time_limit_armed=true limit_seconds=%s warning_seconds=%s warning_at_seconds=%s",
         limit,
-        SESSION_ENDING_NOTICE_SECONDS,
-        max(0.0, notice_at),
+        SESSION_ENDING_WARNING_SECONDS,
+        max(0.0, warn_at),
     )
     try:
-        if notice_at > 0 and SESSION_ENDING_NOTICE_SECONDS > 0:
-            await asyncio.sleep(notice_at)
-            remaining_at_notice = limit - (time.monotonic() - started)
-            ok = await _publish_session_ending_notice(ctx, remaining_at_notice)
+        if SESSION_ENDING_WARNING_TEXT and warn_at > 0:
+            await asyncio.sleep(warn_at)
             logger.info(
-                "session_ending_notice_published=%s seconds_remaining=%s elapsed_seconds=%s",
-                ok,
-                _fmt_seconds(remaining_at_notice),
+                "session_time_warning_speaking=true elapsed_seconds=%s remaining_seconds=%s",
                 _fmt_seconds(time.monotonic() - started),
+                _fmt_seconds(limit - (time.monotonic() - started)),
             )
+            try:
+                await session.say(SESSION_ENDING_WARNING_TEXT, allow_interruptions=True)
+            except Exception as exc:
+                logger.warning(
+                    "session_time_warning_say_failed=true error=%s",
+                    _redact_sensitive_text(exc),
+                )
 
         remaining = limit - (time.monotonic() - started)
         if remaining > 0:
@@ -7307,9 +7314,8 @@ async def entrypoint(ctx: JobContext):
         await session.start(room=ctx.room, agent=lucy_agent)
         session_started_at = time.monotonic()
 
-    # Arm the session time limit on a background clock: it sends the client an
-    # ending notice ~SESSION_ENDING_NOTICE_SECONDS before the cap (for the on-screen
-    # countdown popup), then ends the room at the cap.
+    # Arm the session time limit on a background clock: it speaks a heads-up
+    # ~SESSION_ENDING_WARNING_SECONDS before the cap, then ends the room.
     if SESSION_TIME_LIMIT_ENABLED and SESSION_MAX_DURATION_SECONDS > 0:
         session_timer_task = asyncio.create_task(_run_session_time_limit(session, ctx))
 

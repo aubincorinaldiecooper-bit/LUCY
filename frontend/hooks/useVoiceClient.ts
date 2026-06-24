@@ -37,10 +37,7 @@ async function createSession(model?: string): Promise<SessionResponse> {
   return response.json() as Promise<SessionResponse>;
 }
 
-export function useVoiceClient(options?: {
-  onServerDisconnect?: () => void;
-  onSessionEndingSoon?: (secondsRemaining: number) => void;
-}) {
+export function useVoiceClient(options?: { onServerDisconnect?: () => void }) {
   const [state, setState] = useState<VoiceState>("idle");
   const [isMuted, setIsMuted] = useState(false);
   const roomRef = useRef<Room | null>(null);
@@ -51,12 +48,6 @@ export function useVoiceClient(options?: {
   const userInitiatedDisconnectRef = useRef(false);
   const onServerDisconnectRef = useRef<(() => void) | undefined>(options?.onServerDisconnect);
   onServerDisconnectRef.current = options?.onServerDisconnect;
-  // The agent sends a "session_ending" data message ~1 min before the cap so the
-  // UI can show a countdown popup.
-  const onSessionEndingSoonRef = useRef<((secondsRemaining: number) => void) | undefined>(
-    options?.onSessionEndingSoon,
-  );
-  onSessionEndingSoonRef.current = options?.onSessionEndingSoon;
   const remoteAudioElsRef = useRef<Set<HTMLMediaElement>>(new Set());
   const audioContextRef = useRef<AudioContext | null>(null);
   const gainNodeRef = useRef<GainNode | null>(null);
@@ -186,21 +177,6 @@ export function useVoiceClient(options?: {
           onServerDisconnectRef.current?.();
         }
         userInitiatedDisconnectRef.current = false;
-      });
-      room.on(RoomEvent.DataReceived, (payload: Uint8Array, _participant, _kind, topic) => {
-        if (topic && topic !== "session") return;
-        try {
-          const msg = JSON.parse(new TextDecoder().decode(payload)) as {
-            type?: string;
-            seconds_remaining?: number;
-          };
-          if (msg?.type === "session_ending") {
-            const secs = Number(msg.seconds_remaining);
-            onSessionEndingSoonRef.current?.(Number.isFinite(secs) && secs > 0 ? secs : 60);
-          }
-        } catch {
-          // Ignore non-JSON / unrelated data messages.
-        }
       });
       room.on(RoomEvent.TrackSubscribed, (track) => {
         if (track.kind !== Track.Kind.Audio) return;
