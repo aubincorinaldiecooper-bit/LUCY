@@ -60,7 +60,14 @@ from interaction_state import (
     build_audio_environment_decision,
     classify_turn_kind,
 )
-from memory_layer import MemoryLayer, identity_from_metadata, memory_enabled
+from memory_layer import (
+    EMOTIONAL_PATTERN_PREFIX,
+    MemoryLayer,
+    emotional_pattern_preload_note,
+    identity_from_metadata,
+    memory_enabled,
+    partition_emotional_patterns,
+)
 from runtime_context import (
     RuntimeContext,
     answer_datetime_intent,
@@ -2947,6 +2954,32 @@ def _log_livekit_tts_source_inspection() -> None:
     logger.info("LiveKit Hume TTS.stream signature=%s source_excerpt(max_4000): %s", hume_stream_sig, hume_stream_src)
 
 
+def _log_memory_identity_readiness() -> None:
+    """One-line startup readiness check so the Railway config is verifiable at a
+    glance: whether long-term memory, per-user identity, and the SimpleMem index
+    are actually active. Logs presence only (never secret values)."""
+    try:
+        import importlib.util
+        simplemem_installed = importlib.util.find_spec("simplemem") is not None
+    except Exception:  # noqa: BLE001 - readiness check must never raise
+        simplemem_installed = False
+    logger.info(
+        "memory_identity_readiness: memory_enabled=%s database_url_present=%s "
+        "session_identity_shared_secret_present=%s simplemem_installed=%s "
+        "simplemem_index_dir=%s memory_preload_limit=%s "
+        "note=%s",
+        memory_enabled(),
+        bool(os.getenv("DATABASE_URL")),
+        bool(os.getenv("SESSION_IDENTITY_SHARED_SECRET")),
+        simplemem_installed,
+        os.getenv("SIMPLEMEM_INDEX_DIR", "/data/simplemem"),
+        os.getenv("MEMORY_PRELOAD_LIMIT", "10"),
+        "set MEMORY_ENABLED=true and a shared SESSION_IDENTITY_SHARED_SECRET on both "
+        "frontend+backend for per-user cross-session memory; simplemem optional "
+        "(falls back to Postgres recency)",
+    )
+
+
 def _run_db_migrations_on_startup() -> None:
     logger.info("database_migrations_startup_enabled=%s", RUN_DB_MIGRATIONS_ON_STARTUP)
     if not RUN_DB_MIGRATIONS_ON_STARTUP:
@@ -4267,6 +4300,36 @@ def _persist_calibration_moment(moment: dict[str, Any]) -> None:
         )
 
 
+def _remember_calibration_pattern(moment: dict[str, Any]) -> None:
+    """Store a confirmed calibration moment in durable per-user memory so a
+    returning signed-in user's confirmed emotional patterns inform future sessions
+    via the normal memory preload. Best-effort; never raises. Guests are scoped to
+    the room (per-session) so this only persists across sessions for accounts."""
+    if not moment.get("user_confirmed_or_corrected") or _active_memory_layer is None:
+        return
+    transcript = (moment.get("transcript") or "").strip()
+    question = (moment.get("arche_question") or "").strip()
+    answer = (moment.get("user_answer") or "").strip()
+    content = (
+        f"{EMOTIONAL_PATTERN_PREFIX}when processing \"{transcript[:160]}\", "
+        f"you asked \"{question}\" and they said: \"{answer[:200]}\"."
+    )
+    try:
+        turn_raw = str(moment.get("turn_id") or "")
+        _active_memory_layer.schedule_remember(
+            role="emotional_calibration",
+            content=content,
+            turn_id=int(turn_raw) if turn_raw.isdigit() else None,
+        )
+        logger.info("emotional_calibration_pattern_remembered=true turn_id=%s", moment.get("turn_id"))
+    except Exception as exc:
+        logger.warning(
+            "emotional_calibration_pattern_remember_failed=true error_type=%s error=%s",
+            type(exc).__name__,
+            _redact_sensitive_text(exc),
+        )
+
+
 def _complete_pending_calibration_moment(user_answer: str) -> None:
     global _pending_calibration_moment
     if _pending_calibration_moment is None:
@@ -4276,6 +4339,7 @@ def _complete_pending_calibration_moment(user_answer: str) -> None:
     moment["user_confirmed_or_corrected"] = bool(user_answer.strip())
     _calibration_moments.append(moment)
     _persist_calibration_moment(moment)
+    _remember_calibration_pattern(moment)
     logger.info(
         "emotional_calibration_moment_stored=true turn_id=%s session_id=%s user_answer_present=%s total_moments=%s",
         moment.get("turn_id"),
@@ -7327,6 +7391,7 @@ async def entrypoint(ctx: JobContext):
         os.getenv("RAILWAY_ENVIRONMENT_NAME", "n/a"),
     )
     _run_db_migrations_on_startup()
+    _log_memory_identity_readiness()
     _log_livekit_tts_source_inspection()
     openrouter_model = os.getenv("OPENROUTER_MODEL", OPENROUTER_DEFAULT_MODEL)
     openrouter_api_key_present = bool(os.getenv("OPENROUTER_API_KEY", "").strip())
@@ -7573,12 +7638,18 @@ async def entrypoint(ctx: JobContext):
         except asyncio.TimeoutError:
             preloaded_memories = []
             logger.warning("memory_preload status=timeout timeout_seconds=2.0")
-        memory_preload_note = MemoryLayer.preload_note(preloaded_memories)
+        # Split confirmed emotional-calibration patterns out of the general
+        # memories into their own private "what we've learned" note, and combine.
+        general_memories, emotional_patterns = partition_emotional_patterns(preloaded_memories)
+        general_note = MemoryLayer.preload_note(general_memories)
+        emotional_note = emotional_pattern_preload_note(emotional_patterns)
+        memory_preload_note = "\n\n".join(n for n in (general_note, emotional_note) if n) or None
         logger.info(
-            "Memory layer startup: memory_enabled=true memory_scope=%s memory_identity_present=%s preloaded_memory_count=%s preload_note_present=%s",
+            "Memory layer startup: memory_enabled=true memory_scope=%s memory_identity_present=%s preloaded_memory_count=%s emotional_pattern_count=%s preload_note_present=%s",
             memory_identity.scope,
             memory_identity.present,
-            len(preloaded_memories),
+            len(general_memories),
+            len(emotional_patterns),
             bool(memory_preload_note),
         )
         try:
