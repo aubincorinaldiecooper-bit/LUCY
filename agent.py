@@ -2678,6 +2678,20 @@ SESSION_ENDING_WARNING_TEXT = (
     os.getenv("SESSION_ENDING_WARNING_TEXT")
     or "Hey, quick heads up — we've got about thirty seconds left for this one."
 ).strip()
+# "generate" = Arche improvises the heads-up live via the LLM (dynamic, on-persona,
+# varies each session). "fixed" = always speak SESSION_ENDING_WARNING_TEXT verbatim.
+# In generate mode SESSION_ENDING_WARNING_TEXT is still used as a fallback if the
+# live generation fails.
+SESSION_ENDING_WARNING_MODE = (os.getenv("SESSION_ENDING_WARNING_MODE") or "generate").strip().lower()
+SESSION_ENDING_WARNING_INSTRUCTION = (
+    os.getenv("SESSION_ENDING_WARNING_INSTRUCTION")
+    or (
+        "The session is almost over — only about 30 seconds left. In one short, "
+        "natural sentence in your own voice, gently let the user know you'll need "
+        "to wrap up soon. Do not be abrupt, do not list options, do not ask a new "
+        "question."
+    )
+).strip()
 SESSION_ENDING_GOODBYE_TEXT = (
     os.getenv("SESSION_ENDING_GOODBYE_TEXT")
     or "That's our time for now. Take care — talk soon."
@@ -6801,6 +6815,36 @@ async def _terminate_room(ctx: JobContext) -> str:
     return "none"
 
 
+async def _speak_session_warning(session: AgentSession) -> str:
+    """Deliver the "almost out of time" heads-up.
+
+    In "generate" mode Arche improvises the line live (dynamic + on-persona) via
+    session.generate_reply; the fixed SESSION_ENDING_WARNING_TEXT is the fallback
+    if generation isn't available or fails. Returns the path used for logging.
+    """
+    if SESSION_ENDING_WARNING_MODE == "generate":
+        generate_reply = getattr(session, "generate_reply", None)
+        if callable(generate_reply) and SESSION_ENDING_WARNING_INSTRUCTION:
+            try:
+                await generate_reply(instructions=SESSION_ENDING_WARNING_INSTRUCTION)
+                return "generate"
+            except Exception as exc:
+                logger.warning(
+                    "session_time_warning_generate_failed=true error=%s; falling back to fixed text",
+                    _redact_sensitive_text(exc),
+                )
+    if SESSION_ENDING_WARNING_TEXT:
+        try:
+            await session.say(SESSION_ENDING_WARNING_TEXT, allow_interruptions=True)
+            return "fixed"
+        except Exception as exc:
+            logger.warning(
+                "session_time_warning_say_failed=true error=%s",
+                _redact_sensitive_text(exc),
+            )
+    return "none"
+
+
 async def _run_session_time_limit(session: AgentSession, ctx: JobContext) -> None:
     """Enforce the hard session cap: speak a heads-up, then end the room.
 
@@ -6819,20 +6863,19 @@ async def _run_session_time_limit(session: AgentSession, ctx: JobContext) -> Non
         max(0.0, warn_at),
     )
     try:
-        if SESSION_ENDING_WARNING_TEXT and warn_at > 0:
+        warning_enabled = warn_at > 0 and (
+            SESSION_ENDING_WARNING_MODE == "generate" or bool(SESSION_ENDING_WARNING_TEXT)
+        )
+        if warning_enabled:
             await asyncio.sleep(warn_at)
             logger.info(
-                "session_time_warning_speaking=true elapsed_seconds=%s remaining_seconds=%s",
+                "session_time_warning_speaking=true mode=%s elapsed_seconds=%s remaining_seconds=%s",
+                SESSION_ENDING_WARNING_MODE,
                 _fmt_seconds(time.monotonic() - started),
                 _fmt_seconds(limit - (time.monotonic() - started)),
             )
-            try:
-                await session.say(SESSION_ENDING_WARNING_TEXT, allow_interruptions=True)
-            except Exception as exc:
-                logger.warning(
-                    "session_time_warning_say_failed=true error=%s",
-                    _redact_sensitive_text(exc),
-                )
+            warning_path = await _speak_session_warning(session)
+            logger.info("session_time_warning_delivered=true path=%s", warning_path)
 
         remaining = limit - (time.monotonic() - started)
         if remaining > 0:
