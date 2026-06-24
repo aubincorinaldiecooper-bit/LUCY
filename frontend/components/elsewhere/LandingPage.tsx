@@ -23,12 +23,12 @@ export function LandingPage({
           <AccountLink variant="dark" />
         </nav>
 
-        <div className="relative z-10 mx-auto flex w-full max-w-7xl flex-col items-start justify-center gap-6 px-6 pb-20 pt-32 sm:gap-8 sm:pt-40 md:px-10 lg:px-16">
+        <div className="relative z-10 mx-auto flex w-full max-w-3xl flex-col items-center justify-center gap-6 px-6 pb-20 pt-32 text-center sm:gap-8 sm:pt-40 md:px-10 lg:px-16">
           <motion.h1
             initial={{ opacity: 0, y: 18 }}
             animate={{ opacity: 1, y: 0 }}
             transition={{ delay: 0.2, duration: 0.75, ease: "easeOut" }}
-            className="max-w-2xl text-left text-5xl font-extralight leading-[1.05] tracking-tight text-white sm:text-6xl md:text-7xl"
+            className="text-5xl font-extralight leading-[1.05] tracking-tight text-white sm:text-6xl md:text-7xl"
           >
             Turn scattered thoughts into direction.
           </motion.h1>
@@ -37,7 +37,7 @@ export function LandingPage({
             initial={{ opacity: 0, y: 18 }}
             animate={{ opacity: 1, y: 0 }}
             transition={{ delay: 0.3, duration: 0.75, ease: "easeOut" }}
-            className="max-w-xl text-left text-base font-light leading-relaxed tracking-tight text-white/75 sm:text-lg"
+            className="max-w-xl text-base font-light leading-relaxed tracking-tight text-white/75 sm:text-lg"
           >
             Elsewhere helps you work through decisions, organize what is competing for your attention, and leave with a clearer next step.
           </motion.p>
@@ -46,7 +46,7 @@ export function LandingPage({
             initial={{ opacity: 0, y: 18 }}
             animate={{ opacity: 1, y: 0 }}
             transition={{ delay: 0.4, duration: 0.75, ease: "easeOut" }}
-            className="flex flex-wrap items-center gap-3 pt-2"
+            className="flex flex-wrap items-center justify-center gap-3 pt-2"
           >
             <button
               type="button"
@@ -61,7 +61,7 @@ export function LandingPage({
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             transition={{ delay: 0.5, duration: 0.7 }}
-            className="pt-4 text-left text-[10px] font-extralight tracking-tight text-white/55 md:text-xs"
+            className="pt-4 text-[10px] font-extralight tracking-tight text-white/55 md:text-xs"
           >
             By continuing, you agree to the <span className="underline decoration-white/20 underline-offset-2">Terms</span> and <span className="underline decoration-white/20 underline-offset-2">Privacy Policy</span>.
           </motion.p>

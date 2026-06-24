@@ -3,7 +3,7 @@ import AuthPanel from "@/components/auth/AuthPanel";
 import { ShaderBackground } from "@/components/elsewhere/ShaderBackground";
 
 export const metadata = {
-  title: "Sign in to Lucy",
+  title: "Sign in to Elsewhere",
 };
 
 export default function SignInPage() {
@@ -20,7 +20,7 @@ export default function SignInPage() {
         </Link>
       </nav>
       <div className="relative z-10 w-full max-w-sm">
-        <h1 className="mb-2 text-3xl font-extralight tracking-tight text-white">Sign in to Lucy</h1>
+        <h1 className="mb-2 text-3xl font-extralight tracking-tight text-white">Sign in to Elsewhere</h1>
         <p className="mb-6 text-sm font-light text-white/70">
           We&apos;ll email you a magic link — no password needed.
         </p>

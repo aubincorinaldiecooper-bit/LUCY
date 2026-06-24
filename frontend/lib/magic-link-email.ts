@@ -1,8 +1,8 @@
 // Magic-link email content. Kept in one place so the copy/branding is easy to
 // find and edit. Table-based layout with inline styles for broad email-client
 // support (Gmail/Outlook/Apple Mail). Override the brand name with
-// AUTH_EMAIL_BRAND if you want something other than "Lucy".
-const BRAND = process.env.AUTH_EMAIL_BRAND?.trim() || "Lucy";
+// AUTH_EMAIL_BRAND if you want something other than "Elsewhere".
+const BRAND = process.env.AUTH_EMAIL_BRAND?.trim() || "Elsewhere";
 
 function escapeHtml(value: string): string {
   return value
@@ -36,7 +36,7 @@ export function buildMagicLinkEmail(url: string): {
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#0b0b0f;padding:32px 12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
       <tr>
         <td align="center">
-          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:440px;background:#15151c;border-radius:16px;padding:36px 32px;">
+          <table role="presentation" align="center" width="100%" cellpadding="0" cellspacing="0" style="max-width:440px;margin:0 auto;background:#15151c;border-radius:16px;padding:36px 32px;">
             <tr><td style="color:#ffffff;font-size:20px;font-weight:600;padding-bottom:10px;">${escapeHtml(BRAND)}</td></tr>
             <tr><td style="color:#cfcfd6;font-size:15px;line-height:22px;padding-bottom:24px;">Tap the button below to sign in. This link works once and expires in 5 minutes.</td></tr>
             <tr>
