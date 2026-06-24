@@ -21,7 +21,7 @@ import aiohttp
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from livekit.agents import Agent, AgentSession, InterruptionOptions, JobContext, StopResponse, TurnHandlingOptions, WorkerOptions, cli, function_tool, room_io
+from livekit.agents import Agent, AgentSession, InterruptionOptions, JobContext, StopResponse, TurnHandlingOptions, WorkerOptions, cli, function_tool, room_io, tts
 try:  # livekit-agents >= 1.6.1 exposes the audio end-of-turn detector here
     from livekit.agents import inference as _lk_inference
 except Exception:  # pragma: no cover - older SDKs
@@ -90,6 +90,7 @@ from transcript_context import (
     transcript_context_llm_model,
     transcript_context_llm_timeout_ms,
 )
+from omnivoice_tts import OmniVoiceConfig, OmniVoiceTTS
 
 
 load_dotenv()
@@ -166,6 +167,10 @@ if "SYSTEM_PROMPT" in os.environ:
     logger.warning("SYSTEM_PROMPT env override detected; code-level prompt edits may not affect production unless Railway SYSTEM_PROMPT is updated; mirror the runtime capability contract in Railway SYSTEM_PROMPT for consistency")
 
 TTS_PROVIDER = os.getenv("TTS_PROVIDER", "deepgram").strip().lower()
+# When the primary provider fails/times out/returns invalid audio, LiveKit's
+# tts.FallbackAdapter moves on to this provider so the session never goes silent.
+# Currently wired for the omnivoice -> hume path; empty/"none" disables fallback.
+TTS_FALLBACK_PROVIDER = (os.getenv("TTS_FALLBACK_PROVIDER", "hume") or "").strip().lower()
 STT_PROVIDER = os.getenv("STT_PROVIDER", "mistral").strip().lower()
 # Active/session language Arche is configured to operate in. Logged at turn commit
 # so a transcript-language candidate can be compared against the intended language.
@@ -3285,15 +3290,37 @@ async def _render_greeting_wav_bytes(started_at: float) -> bytes | None:
     return wav_bytes
 
 
-def build_tts():
+def _build_single_tts(provider: str):
+    """Build a single TTS plugin instance for one provider name (no fallback)."""
     global _last_hume_model_version, _last_hume_description_applied, _last_hume_voice_present, _last_hume_voice_kind, _last_hume_instant_mode, _last_hume_speed, _last_hume_trailing_silence, _last_hume_style_context_applied, _last_hume_tts_build_started_at, _last_hume_tts_build_completed_at, _last_hume_tts_debug_http
-    if TTS_PROVIDER == "deepgram":
+    if provider == "deepgram":
         logger.info("Using Deepgram TTS provider")
         return deepgram.TTS(
             model=os.getenv("DEEPGRAM_TTS_MODEL", "aura-2-asteria-en")
         )
 
-    if TTS_PROVIDER == "hume":
+    if provider == "omnivoice":
+        omni_cfg = OmniVoiceConfig.from_env()
+        usable, reason = omni_cfg.is_usable()
+        logger.info(
+            "Using OmniVoice TTS provider: omnivoice_enabled=%s omnivoice_url_present=%s device=%s default_language=%s expressive_tags_enabled=%s audio_format=%s sample_rate=%s usable=%s reason=%s",
+            omni_cfg.enabled,
+            bool(omni_cfg.base_url),
+            omni_cfg.device,
+            omni_cfg.default_language,
+            omni_cfg.expressive_tags_enabled,
+            omni_cfg.audio_format,
+            omni_cfg.sample_rate,
+            usable,
+            reason,
+        )
+        if not usable:
+            # Don't hand back a provider that can't synthesize; surface it so the
+            # caller can decide (build_tts falls back to the configured fallback).
+            raise RuntimeError(f"OmniVoice TTS not usable: {reason}")
+        return OmniVoiceTTS(config=omni_cfg)
+
+    if provider == "hume":
         _last_hume_tts_build_started_at = time.monotonic()
         logger.info("Using Hume TTS provider")
 
@@ -3541,23 +3568,77 @@ def build_tts():
         )
         return tts_instance
 
-    raise RuntimeError("Unsupported TTS_PROVIDER. Use 'deepgram' or 'hume'.")
+    raise RuntimeError("Unsupported TTS_PROVIDER. Use 'deepgram', 'hume', or 'omnivoice'.")
 
 
-async def _close_tts_owned_session(tts: object) -> None:
-    """Close a debug http_session that build_tts created for this TTS instance.
+def build_tts():
+    """Build the session TTS, wrapping the primary in a FallbackAdapter when a
+    distinct fallback provider is configured.
 
-    The Hume plugin won't close a caller-provided session, so we must — otherwise
-    every build leaks an aiohttp ClientSession/connector.
+    Only the omnivoice path is wrapped today: a sidecar-backed OmniVoice can fail,
+    time out, or return invalid audio, and we never want the session to go silent,
+    so it degrades to Hume via LiveKit's tts.FallbackAdapter. Hume/Deepgram are
+    returned bare, exactly as before (no behavior change for the existing path).
+    If OmniVoice can't even be built (disabled / no URL), we fall straight to the
+    fallback provider so a misconfigured worker still speaks.
     """
-    session = getattr(tts, "_lucy_owned_http_session", None)
-    if session is None:
-        return
+    fallback_enabled = (
+        TTS_PROVIDER == "omnivoice"
+        and TTS_FALLBACK_PROVIDER not in ("", "none", TTS_PROVIDER)
+    )
+    if not fallback_enabled:
+        return _build_single_tts(TTS_PROVIDER)
+
     try:
-        if not getattr(session, "closed", True):
-            await session.close()
-    except Exception:  # noqa: BLE001 - cleanup is best-effort
-        pass
+        primary = _build_single_tts(TTS_PROVIDER)
+    except Exception as exc:  # noqa: BLE001 - degrade to fallback instead of crashing
+        logger.warning(
+            "TTS primary build failed; using fallback provider only: tts_provider=%s tts_fallback_provider=%s error=%s",
+            TTS_PROVIDER,
+            TTS_FALLBACK_PROVIDER,
+            _redact_sensitive_text(exc),
+        )
+        return _build_single_tts(TTS_FALLBACK_PROVIDER)
+
+    fallback = _build_single_tts(TTS_FALLBACK_PROVIDER)
+    logger.info(
+        "TTS provider selected: tts_provider=%s tts_fallback_provider=%s fallback_adapter_enabled=true",
+        TTS_PROVIDER,
+        TTS_FALLBACK_PROVIDER,
+    )
+    return tts.FallbackAdapter([primary, fallback])
+
+
+async def _close_tts_owned_session(tts_obj: object) -> None:
+    """Close http sessions/handles a build owns for this TTS instance.
+
+    Three things to clean up, all best-effort:
+      - the Hume debug http_session build_tts created (_lucy_owned_http_session),
+      - an OmniVoiceTTS's own aiohttp session (via its aclose()),
+      - children of a FallbackAdapter (recurse), since FallbackAdapter.aclose()
+        does not close the wrapped providers' sessions.
+    The Hume/Deepgram plugins won't close a caller-provided session, so without
+    this every build leaks an aiohttp ClientSession/connector.
+    """
+    # Recurse into a FallbackAdapter's wrapped providers.
+    children = getattr(tts_obj, "_tts_instances", None)
+    if isinstance(children, (list, tuple)):
+        for child in children:
+            await _close_tts_owned_session(child)
+
+    if isinstance(tts_obj, OmniVoiceTTS):
+        try:
+            await tts_obj.aclose()
+        except Exception:  # noqa: BLE001 - cleanup is best-effort
+            pass
+
+    session = getattr(tts_obj, "_lucy_owned_http_session", None)
+    if session is not None:
+        try:
+            if not getattr(session, "closed", True):
+                await session.close()
+        except Exception:  # noqa: BLE001 - cleanup is best-effort
+            pass
 
 app = FastAPI()
 
