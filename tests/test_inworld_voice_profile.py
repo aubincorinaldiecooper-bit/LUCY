@@ -115,6 +115,24 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(c.model_id, "inworld/inworld-stt-1")
         self.assertTrue(c.ws_url.startswith("wss://api.inworld.ai"))
 
+    def test_auth_scheme_defaults_to_basic(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("INWORLD_AUTH_SCHEME", None)
+            self.assertEqual(ivp.InworldConfig.from_env().auth_scheme, "Basic")
+        with mock.patch.dict(os.environ, {"INWORLD_AUTH_SCHEME": "Bearer"}, clear=False):
+            self.assertEqual(ivp.InworldConfig.from_env().auth_scheme, "Bearer")
+
+    def test_model_id_alias(self):
+        # Both INWORLD_MODEL_ID and the legacy INWORLD_STT_MODEL_ID are accepted.
+        with mock.patch.dict(os.environ, {"INWORLD_STT_MODEL_ID": "legacy/model"}, clear=False):
+            os.environ.pop("INWORLD_MODEL_ID", None)
+            self.assertEqual(ivp.InworldConfig.from_env().model_id, "legacy/model")
+        with mock.patch.dict(
+            os.environ, {"INWORLD_MODEL_ID": "new/model", "INWORLD_STT_MODEL_ID": "legacy/model"},
+            clear=False,
+        ):
+            self.assertEqual(ivp.InworldConfig.from_env().model_id, "new/model")
+
 
 class ShadowTests(unittest.TestCase):
     def test_disabled_without_global_inworld_flag(self):

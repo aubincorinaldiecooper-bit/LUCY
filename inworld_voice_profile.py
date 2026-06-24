@@ -70,6 +70,9 @@ class InworldConfig:
     sample_rate: int
     # Below this, the top emotion is treated as unreliable -> neutral profile.
     emotion_confidence_floor: float
+    # Inworld's base64 clientId:clientSecret key is a Basic credential (matches the
+    # working snippet); override to "Bearer" only if you use a bearer token.
+    auth_scheme: str = "Basic"
 
     @classmethod
     def from_env(cls) -> "InworldConfig":
@@ -84,6 +87,7 @@ class InworldConfig:
             emotion_confidence_floor=float(
                 os.getenv("INWORLD_EMOTION_CONFIDENCE_FLOOR", "0.5") or "0.5"
             ),
+            auth_scheme=(os.getenv("INWORLD_AUTH_SCHEME") or "Basic").strip() or "Basic",
         )
 
     def is_usable(self) -> tuple[bool, str]:
@@ -283,7 +287,7 @@ class InworldVoiceProfileShadow:
         try:
             ws = await session.ws_connect(
                 self.config.ws_url,
-                headers={"Authorization": f"Bearer {self.config.api_key}"},
+                headers={"Authorization": f"{self.config.auth_scheme} {self.config.api_key}"},
                 heartbeat=20,
             )
         except Exception:
