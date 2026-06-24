@@ -1,3 +1,4 @@
+import asyncio
 import os
 import types
 import unittest
@@ -59,27 +60,66 @@ class SessionTimeLimitTests(unittest.IsolatedAsyncioTestCase):
                 "SESSION_ENDING_WARNING_SECONDS",
                 "SESSION_ENDING_WARNING_TEXT",
                 "SESSION_ENDING_GOODBYE_TEXT",
+                "SESSION_ENDING_WARNING_PLAYBACK_RESERVE_SECONDS",
+                "SESSION_ENDING_GOODBYE_CLEAR_WAIT_SECONDS",
             )
         }
+        self._orig_user_state = agent._latest_user_state_for_greeting
         agent.SESSION_TIME_LIMIT_ENABLED = True
         agent.SESSION_MAX_DURATION_SECONDS = 0.2
         agent.SESSION_ENDING_WARNING_SECONDS = 0.1
         agent.SESSION_ENDING_WARNING_TEXT = "thirty seconds left"
         agent.SESSION_ENDING_GOODBYE_TEXT = "that's our time"
+        # The tiny test durations would otherwise fall behind the playback
+        # reserve; zero it so the heads-up still gets a turn to speak.
+        agent.SESSION_ENDING_WARNING_PLAYBACK_RESERVE_SECONDS = 0.0
+        agent.SESSION_ENDING_GOODBYE_CLEAR_WAIT_SECONDS = 0.1
+        # Default to a non-speaking user so lines speak immediately.
+        agent._latest_user_state_for_greeting = "listening"
 
     def tearDown(self):
         for k, v in self._orig.items():
             setattr(agent, k, v)
+        agent._latest_user_state_for_greeting = self._orig_user_state
 
     async def test_warns_then_says_goodbye_then_terminates(self):
         session = _FakeSession()
         ctx = _FakeCtx()
         await agent._run_session_time_limit(session, ctx)
 
-        # Warning first (interruptible), goodbye second (not interruptible).
+        # Warning first, goodbye second — both spoken non-interruptibly so the
+        # speech gate can't drop them and a barge-in can't cut them off.
         self.assertEqual([t for t, _ in session.said], ["thirty seconds left", "that's our time"])
-        self.assertTrue(session.said[0][1])  # warning allows interruptions
-        self.assertFalse(session.said[1][1])  # goodbye does not
+        self.assertFalse(session.said[0][1])  # warning is not interruptible
+        self.assertFalse(session.said[1][1])  # goodbye is not interruptible
+        self.assertEqual(ctx.deleted, 1)
+
+    async def test_warning_waits_for_user_to_stop_then_speaks(self):
+        # User is mid-sentence when the heads-up fires; it must wait for the
+        # pause rather than being dropped by the speech gate.
+        agent._latest_user_state_for_greeting = "speaking"
+        session = _FakeSession()
+        ctx = _FakeCtx()
+
+        async def _release_user():
+            await asyncio.sleep(0.05)
+            agent._latest_user_state_for_greeting = "listening"
+
+        await asyncio.gather(
+            agent._run_session_time_limit(session, ctx),
+            _release_user(),
+        )
+        self.assertIn("thirty seconds left", [t for t, _ in session.said])
+        self.assertEqual(ctx.deleted, 1)
+
+    async def test_warning_skipped_when_user_talks_through_deadline(self):
+        # User never pauses before the cap -> skip the heads-up but still end.
+        agent._latest_user_state_for_greeting = "speaking"
+        agent.SESSION_ENDING_GOODBYE_CLEAR_WAIT_SECONDS = 0.0
+        session = _FakeSession()
+        ctx = _FakeCtx()
+        await agent._run_session_time_limit(session, ctx)
+        self.assertNotIn("thirty seconds left", [t for t, _ in session.said])
         self.assertEqual(ctx.deleted, 1)
 
     async def test_disabled_does_nothing(self):
