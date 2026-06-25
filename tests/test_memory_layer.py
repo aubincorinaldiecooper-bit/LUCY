@@ -113,6 +113,47 @@ class MemoryLayerRetrievalTests(unittest.IsolatedAsyncioTestCase):
         layer, _ = make_layer()
         self.assertEqual(await layer.retrieve("   "), [])
 
+    async def test_retrieve_uses_pgvector_when_available(self):
+        calls = []
+
+        def reader(sql, params):
+            calls.append((sql, params))
+            if "pg_extension" in sql:
+                return [(True,)]
+            return [("User said: vector memory",)]
+
+        backend = FakeSimpleMem(query_result=["simplemem fallback"] )
+        layer = MemoryLayer(
+            MemoryIdentity(guest_id="g"),
+            db_url="postgresql://fake",
+            simplemem_factory=lambda index_dir: backend,
+            db_reader=reader,
+            db_writer=lambda sql, params: None,
+            embedder=lambda text: [0.1, 0.2, 0.3],
+            vector_enabled=True,
+        )
+        self.assertEqual(await layer.retrieve("what do you remember?"), ["User said: vector memory"])
+        self.assertTrue(any("embedding <=>" in sql for sql, _ in calls))
+        self.assertEqual(backend.added_texts, [])
+
+    async def test_retrieve_falls_back_to_simplemem_when_pgvector_unavailable(self):
+        def reader(sql, params):
+            if "pg_extension" in sql:
+                return [(False,)]
+            return []
+
+        backend = FakeSimpleMem(query_result=["simplemem memory"] )
+        layer = MemoryLayer(
+            MemoryIdentity(guest_id="g"),
+            db_url="postgresql://fake",
+            simplemem_factory=lambda index_dir: backend,
+            db_reader=reader,
+            db_writer=lambda sql, params: None,
+            embedder=lambda text: [0.1, 0.2, 0.3],
+            vector_enabled=True,
+        )
+        self.assertEqual(await layer.retrieve("anything"), ["simplemem memory"])
+
 
 class MemoryLayerPreloadTests(unittest.IsolatedAsyncioTestCase):
     async def test_preload_returns_contents(self):
@@ -178,6 +219,60 @@ class MemoryLayerWriteTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(*list(layer._background_tasks))
         self.assertEqual(written, [])
 
+    async def test_remember_writes_pgvector_embedding_when_available(self):
+        written = []
+
+        def reader(sql, params):
+            if "pg_extension" in sql:
+                return [(True,)]
+            return []
+
+        backend = FakeSimpleMem()
+        layer = MemoryLayer(
+            MemoryIdentity(guest_id="g"),
+            db_url="postgresql://fake",
+            simplemem_factory=lambda index_dir: backend,
+            db_reader=reader,
+            db_writer=lambda sql, params: written.append((sql, params)),
+            embedder=lambda text: [0.1, 0.2, 0.3],
+            vector_enabled=True,
+        )
+        layer.schedule_remember(role="user", content="I love tea", turn_id=3)
+        await asyncio.gather(*list(layer._background_tasks))
+        self.assertEqual(len(written), 1)
+        self.assertIn("embedding", written[0][0])
+        self.assertEqual(written[0][1][-2], "[0.1,0.2,0.3]")
+        self.assertEqual(written[0][1][-1], "text-embedding-3-small")
+        self.assertEqual(len(backend.added_texts), 1)
+
+    async def test_pgvector_write_failure_falls_back_to_text_insert(self):
+        written = []
+
+        def reader(sql, params):
+            if "pg_extension" in sql:
+                return [(True,)]
+            return []
+
+        def writer(sql, params):
+            written.append((sql, params))
+            if "embedding" in sql:
+                raise RuntimeError("vector unavailable")
+
+        layer = MemoryLayer(
+            MemoryIdentity(guest_id="g"),
+            db_url="postgresql://fake",
+            simplemem_factory=lambda index_dir: FakeSimpleMem(),
+            db_reader=reader,
+            db_writer=writer,
+            embedder=lambda text: [0.1, 0.2, 0.3],
+            vector_enabled=True,
+        )
+        layer.schedule_remember(role="user", content="fallback please", turn_id=4)
+        await asyncio.gather(*list(layer._background_tasks))
+        self.assertEqual(len(written), 2)
+        self.assertIn("embedding", written[0][0])
+        self.assertNotIn("embedding", written[1][0])
+
     async def test_db_write_failure_does_not_block_simplemem_write(self):
         backend = FakeSimpleMem()
 
@@ -211,6 +306,14 @@ class MemoryConfigTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("MEMORY_ENABLED", None)
             self.assertFalse(memory_layer.memory_enabled())
+
+    def test_vector_disabled_by_default(self):
+        import os
+        from unittest.mock import patch
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MEMORY_VECTOR_ENABLED", None)
+            self.assertFalse(memory_layer.memory_vector_enabled())
 
     def test_retrieval_timeout_clamped(self):
         import os

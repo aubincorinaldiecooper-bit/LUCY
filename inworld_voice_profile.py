@@ -287,7 +287,7 @@ class InworldVoiceProfileShadow:
         try:
             ws = await session.ws_connect(
                 self.config.ws_url,
-                headers={"Authorization": f"{self.config.auth_scheme} {self.config.api_key}"},
+                headers={"Authorization": f"Bearer {self.config.api_key}"},
                 heartbeat=20,
             )
         except Exception:

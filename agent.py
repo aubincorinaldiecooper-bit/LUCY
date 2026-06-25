@@ -4300,36 +4300,6 @@ def _persist_calibration_moment(moment: dict[str, Any]) -> None:
         )
 
 
-def _remember_calibration_pattern(moment: dict[str, Any]) -> None:
-    """Store a confirmed calibration moment in durable per-user memory so a
-    returning signed-in user's confirmed emotional patterns inform future sessions
-    via the normal memory preload. Best-effort; never raises. Guests are scoped to
-    the room (per-session) so this only persists across sessions for accounts."""
-    if not moment.get("user_confirmed_or_corrected") or _active_memory_layer is None:
-        return
-    transcript = (moment.get("transcript") or "").strip()
-    question = (moment.get("arche_question") or "").strip()
-    answer = (moment.get("user_answer") or "").strip()
-    content = (
-        f"{EMOTIONAL_PATTERN_PREFIX}when processing \"{transcript[:160]}\", "
-        f"you asked \"{question}\" and they said: \"{answer[:200]}\"."
-    )
-    try:
-        turn_raw = str(moment.get("turn_id") or "")
-        _active_memory_layer.schedule_remember(
-            role="emotional_calibration",
-            content=content,
-            turn_id=int(turn_raw) if turn_raw.isdigit() else None,
-        )
-        logger.info("emotional_calibration_pattern_remembered=true turn_id=%s", moment.get("turn_id"))
-    except Exception as exc:
-        logger.warning(
-            "emotional_calibration_pattern_remember_failed=true error_type=%s error=%s",
-            type(exc).__name__,
-            _redact_sensitive_text(exc),
-        )
-
-
 def _complete_pending_calibration_moment(user_answer: str) -> None:
     global _pending_calibration_moment
     if _pending_calibration_moment is None:
@@ -4339,7 +4309,6 @@ def _complete_pending_calibration_moment(user_answer: str) -> None:
     moment["user_confirmed_or_corrected"] = bool(user_answer.strip())
     _calibration_moments.append(moment)
     _persist_calibration_moment(moment)
-    _remember_calibration_pattern(moment)
     logger.info(
         "emotional_calibration_moment_stored=true turn_id=%s session_id=%s user_answer_present=%s total_moments=%s",
         moment.get("turn_id"),
