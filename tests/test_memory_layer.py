@@ -355,3 +355,70 @@ class EmotionalPatternPreloadTests(unittest.TestCase):
         import memory_layer as ml
         self.assertIsNone(ml.emotional_pattern_preload_note([]))
         self.assertIsNone(ml.emotional_pattern_preload_note(["   "]))
+
+
+class SemanticMemoryTests(unittest.IsolatedAsyncioTestCase):
+    def _layer(self, *, embed_vec, reader_rows=None, writer_calls=None, enabled=True):
+        import memory_layer as ml
+
+        async def _embed(text, **_):
+            return embed_vec
+
+        def _reader(sql, params):
+            self._last_read = {"sql": sql, "params": params}
+            return reader_rows or []
+
+        def _writer(sql, params):
+            (writer_calls if writer_calls is not None else []).append({"sql": sql, "params": params})
+
+        return ml.MemoryLayer(
+            ml.MemoryIdentity(clerk_user_id="user-1"),
+            db_url="postgresql://x",
+            semantic_enabled=enabled,
+            embed_fn=_embed,
+            db_reader=_reader,
+            db_writer=_writer,
+        )
+
+    async def test_semantic_retrieve_returns_relevant_rows(self):
+        layer = self._layer(embed_vec=[0.1, 0.2], reader_rows=[("memory A",), ("memory B",)])
+        out = await layer.retrieve("how am I feeling about work")
+        self.assertEqual(out, ["memory A", "memory B"])
+        # used a pgvector nearest-neighbour query with the embedded vector literal
+        self.assertIn("ORDER BY embedding <=> %s::vector", self._last_read["sql"])
+        self.assertIn("[0.1,0.2]", self._last_read["params"])
+
+    async def test_no_embedding_falls_back(self):
+        # embed returns None -> semantic unavailable -> None -> falls through to
+        # SimpleMem (absent) -> [] (does not raise)
+        layer = self._layer(embed_vec=None)
+        self.assertEqual(await layer.retrieve("anything"), [])
+
+    async def test_db_error_falls_back(self):
+        import memory_layer as ml
+
+        async def _embed(_, **__):
+            return [0.5]
+
+        def _reader(sql, params):
+            raise RuntimeError("no pgvector column")
+
+        layer = ml.MemoryLayer(
+            ml.MemoryIdentity(clerk_user_id="user-1"),
+            db_url="postgresql://x", semantic_enabled=True, embed_fn=_embed, db_reader=_reader,
+        )
+        self.assertEqual(await layer.retrieve("anything"), [])  # graceful
+
+    async def test_embed_and_store_writes_vector_when_enabled(self):
+        calls = []
+        layer = self._layer(embed_vec=[0.3, 0.4], writer_calls=calls)
+        await layer._embed_and_store("Lucy replied: take a breath")
+        self.assertEqual(len(calls), 1)
+        self.assertIn("UPDATE memory_units SET embedding = %s::vector", calls[0]["sql"])
+        self.assertIn("[0.3,0.4]", calls[0]["params"])
+
+    async def test_embed_and_store_noop_when_disabled(self):
+        calls = []
+        layer = self._layer(embed_vec=[0.3, 0.4], writer_calls=calls, enabled=False)
+        await layer._embed_and_store("anything")
+        self.assertEqual(calls, [])

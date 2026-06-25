@@ -23,12 +23,23 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from memory_embeddings import (
+    embed_text,
+    semantic_retrieval_enabled,
+    semantic_timeout_ms,
+    to_pgvector_literal,
+)
+
 logger = logging.getLogger(__name__)
 
 GUEST_MEMORY_TTL_HOURS = 24
 INDEX_REBUILD_MAX_ROWS = 500
 DEFAULT_MEMORY_EMBEDDING_MODEL = "text-embedding-3-small"
 DEFAULT_MEMORY_EMBEDDING_DIMENSIONS = 1536
+
+
+class _SemanticUnavailable(Exception):
+    """Internal: semantic recall can't run (no embedding) -> fall back to recency."""
 
 # Set once the "simplemem not installed" warning has been logged, so it isn't
 # repeated for every per-session MemoryLayer instance.
@@ -180,6 +191,13 @@ class MemoryLayer:
         self._simplemem: Any = None
         self._simplemem_status = "not_initialized"
         self._background_tasks: set[asyncio.Task] = set()
+        # pgvector semantic recall: embed memories on write and find the most
+        # relevant (not just most recent) on retrieve. Off unless enabled + a key.
+        self._semantic_enabled = (
+            semantic_retrieval_enabled() if semantic_enabled is None else semantic_enabled
+        )
+        self._embed_fn = embed_fn or embed_text
+        self._semantic_timeout_ms = semantic_timeout_ms()
 
     # ---------- backends ----------
 
@@ -432,6 +450,7 @@ class MemoryLayer:
                 await self._write_postgres_memory(compact, role, turn_id, modality, media_url)
             except Exception as exc:
                 logger.warning("memory_write status=error target=postgres error_type=%s error=%s", type(exc).__name__, exc)
+            await self._embed_and_store(compact)
         backend = self._get_simplemem()
         if backend is not None:
             try:
