@@ -51,12 +51,16 @@ export function useVoiceClient(options?: { onServerDisconnect?: () => void }) {
   const remoteAudioElsRef = useRef<Set<HTMLMediaElement>>(new Set());
   const audioContextRef = useRef<AudioContext | null>(null);
   const gainNodeRef = useRef<GainNode | null>(null);
+  const compressorNodeRef = useRef<DynamicsCompressorNode | null>(null);
   const mediaSourceNodesRef = useRef<Map<HTMLMediaElement, AudioNode>>(new Map());
 
   const getRemoteAudioGain = useCallback(() => {
-    const raw = Number.parseFloat(process.env.NEXT_PUBLIC_REMOTE_AUDIO_GAIN ?? "1.35");
-    if (!Number.isFinite(raw)) return 1.35;
-    return Math.max(1.0, Math.min(2.0, raw));
+    // Makeup gain applied AFTER the compressor. Because the compressor tames
+    // peaks, this can safely sit above 1.0 without clipping; default 2.0
+    // (~+6 dB) and a 4.0 ceiling give real perceived loudness headroom.
+    const raw = Number.parseFloat(process.env.NEXT_PUBLIC_REMOTE_AUDIO_GAIN ?? "2.0");
+    if (!Number.isFinite(raw)) return 2.0;
+    return Math.max(1.0, Math.min(4.0, raw));
   }, []);
 
   const setupAudioGainForTrack = useCallback((track: RemoteTrack, audioElement: HTMLMediaElement) => {
@@ -71,9 +75,25 @@ export function useVoiceClient(options?: { onServerDisconnect?: () => void }) {
       const audioContext = audioContextRef.current ?? new AudioContextCtor();
       audioContextRef.current = audioContext;
 
+      // Signal chain: MediaStream source -> compressor -> makeup gain -> output.
+      // The compressor raises perceived loudness (evens out the moderate Hume
+      // output level) and protects against clipping when the makeup gain is
+      // pushed above 1.0.
+      let compressorNode = compressorNodeRef.current;
+      if (!compressorNode) {
+        compressorNode = audioContext.createDynamicsCompressor();
+        compressorNode.threshold.value = -24; // dB: start compressing here
+        compressorNode.knee.value = 30;        // soft knee for natural feel
+        compressorNode.ratio.value = 4;         // gentle 4:1 compression
+        compressorNode.attack.value = 0.003;
+        compressorNode.release.value = 0.25;
+        compressorNodeRef.current = compressorNode;
+      }
+
       let gainNode = gainNodeRef.current;
       if (!gainNode) {
         gainNode = audioContext.createGain();
+        compressorNode.connect(gainNode);
         gainNode.connect(audioContext.destination);
         gainNodeRef.current = gainNode;
       }
@@ -83,11 +103,11 @@ export function useVoiceClient(options?: { onServerDisconnect?: () => void }) {
         // createMediaElementSource inserts a media-element buffer whose
         // end-of-stream handling clips the tail of each response (confirmed:
         // server delivers full audio + trailing silence, cut is downstream).
-        // A MediaStreamAudioSourceNode plays the raw track and avoids that,
-        // while still allowing >1x gain. The element stays attached but muted
-        // only to keep the WebRTC audio pipeline pulling frames.
+        // A MediaStreamAudioSourceNode plays the raw track and avoids that.
+        // The element stays attached but muted only to keep the WebRTC audio
+        // pipeline pulling frames.
         const sourceNode = audioContext.createMediaStreamSource(new MediaStream([mediaStreamTrack]));
-        sourceNode.connect(gainNode);
+        sourceNode.connect(compressorNode);
         mediaSourceNodesRef.current.set(audioElement, sourceNode);
         audioElement.muted = true;
       }
@@ -130,6 +150,15 @@ export function useVoiceClient(options?: { onServerDisconnect?: () => void }) {
         // best-effort disconnect
       }
       gainNodeRef.current = null;
+    }
+
+    if (compressorNodeRef.current) {
+      try {
+        compressorNodeRef.current.disconnect();
+      } catch {
+        // best-effort disconnect
+      }
+      compressorNodeRef.current = null;
     }
 
     if (audioContextRef.current) {
