@@ -14,6 +14,7 @@ import wave
 import io
 import subprocess
 import sys
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, AsyncIterable
 
@@ -42,6 +43,7 @@ from internet_search import (
     search_timeout_seconds,
 )
 from audiointeraction_shadow import AudioInteractionShadow, audiointeraction_mode, build_shadow_from_env
+from inworld_voice_profile import InworldVoiceProfileShadow, build_inworld_shadow_from_env
 from hume_evi_bridge import run_hume_evi_bridge, voice_engine
 from interaction_state import (
     ASSISTANT_SPEAKING,
@@ -168,7 +170,7 @@ SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT)
 if "SYSTEM_PROMPT" in os.environ:
     logger.warning("SYSTEM_PROMPT env override detected; code-level prompt edits may not affect production unless Railway SYSTEM_PROMPT is updated; mirror the runtime capability contract in Railway SYSTEM_PROMPT for consistency")
 
-TTS_PROVIDER = os.getenv("TTS_PROVIDER", "deepgram").strip().lower()
+TTS_PROVIDER = os.getenv("TTS_PROVIDER", "hume").strip().lower()
 # When the primary provider fails/times out/returns invalid audio, LiveKit's
 # tts.FallbackAdapter moves on to this provider so the session never goes silent.
 # Currently wired for the omnivoice -> hume path; empty/"none" disables fallback.
@@ -317,10 +319,16 @@ _AUDIO_ENV_WINDOW_SECONDS = 12.0
 _interaction_state = InteractionStateMachine()
 _active_memory_layer: MemoryLayer | None = None
 _audiointeraction_shadow: AudioInteractionShadow | None = None
+_inworld_voice_profile_shadow: InworldVoiceProfileShadow | None = None
 _held_turn_fragment_text = ""
 _held_turn_fragment_created_at = 0.0
 _held_turn_fragment_classification = ""
 _held_turn_fragment_incomplete = False
+_calibration_session_id = "unknown"
+_pending_calibration_moment: dict[str, Any] | None = None
+_calibration_moments: list[dict[str, Any]] = []
+_last_calibration_question_turn_id = -1000
+CALIBRATION_MOMENTS_PATH = (os.getenv("CALIBRATION_MOMENTS_PATH") or "logs/calibration_moments.jsonl").strip()
 
 
 def _next_turn_id() -> int:
@@ -1230,6 +1238,8 @@ def attach_session_diagnostics(session: AgentSession) -> None:
     speech_latency_audits: dict[str, dict[str, float | int | str | None]] = {}
     assistant_speech_turn_ids: dict[str, int] = {}
     assistant_speech_llm_turn_ids: dict[str, int] = {}
+    active_speech_interrupted_at: dict[str, float] = {}
+    last_assistant_speech_outcome: dict[str, object] | None = None
 
     def _resolve_speech_handle(event_or_handle: object) -> object:
         for attr in ("speech_handle", "handle", "speech"):
@@ -1289,6 +1299,14 @@ def attach_session_diagnostics(session: AgentSession) -> None:
         stale_speech_ids.discard(speech_id)
         while speech_id in stale_speech_id_order:
             stale_speech_id_order.remove(speech_id)
+
+    def _speech_produced_audio(speech_id: str, started_at: float | None = None, hume_coverage: object | None = None) -> bool:
+        if started_at is not None:
+            return True
+        if speech_id in agent_speaking_at:
+            return True
+        coverage = hume_coverage if hume_coverage is not None else _hume_speech_audio_coverages.get(speech_id)
+        return bool(getattr(coverage, "byte_count", 0) or getattr(coverage, "frame_count", 0))
 
     def _extract_user_new_state(state_event: object) -> str:
         new_state = getattr(state_event, "new_state", None)
@@ -1501,6 +1519,8 @@ def attach_session_diagnostics(session: AgentSession) -> None:
 
             assistant_speech_turn_ids[speech_id] = speech_turn_id
             assistant_speech_llm_turn_ids[speech_id] = speech_llm_turn_id
+            was_stale_before_cleanup = speech_id in stale_speech_ids
+            produced_audio = _speech_produced_audio(speech_id, speech_start_times.get(speech_id))
             _mark_speech_stale(speech_id)
             suppressed_speech_ids.add(speech_id)
             active_speech_handles.pop(speech_id, None)
@@ -1513,6 +1533,16 @@ def attach_session_diagnostics(session: AgentSession) -> None:
             assistant_speech_finished_at.setdefault(speech_id, time.monotonic())
             if pending_user_handoff_speech_id == speech_id:
                 pending_user_handoff_speech_id = None
+            logger.info(
+                "speech_handle_cleanup reason=%s speech_id=%s was_stale=%s was_active=%s produced_audio=%s marked_interrupted=%s cleanup_action=%s",
+                cleanup_reason,
+                speech_id,
+                was_stale_before_cleanup,
+                True,
+                produced_audio,
+                cleanup_result.startswith("cancel_requested"),
+                cleanup_result,
+            )
             logger.info(
                 "Assistant speech cleanup item: turn_id=%s cleanup_reason=%s speech_id=%s current_new_speech_id=%s attempted_method=%s cleanup_result=%s active_count_after_item=%s stale_speech_ids=%s",
                 _current_turn_id,
@@ -1549,17 +1579,40 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                 len(suppressed_speech_ids),
                 len(stale_speech_ids),
             )
-        for speech_id in active_speech_handles:
+        for speech_id in list(active_speech_handles.keys()):
+            was_active = speech_id in active_speech_handles
+            was_stale = speech_id in stale_speech_ids
+            produced_audio = _speech_produced_audio(speech_id, speech_start_times.get(speech_id))
+            if reason == "agent_returned_to_listening" and produced_audio:
+                logger.info(
+                    "speech_handle_cleanup reason=%s speech_id=%s was_stale=%s was_active=%s produced_audio=%s marked_interrupted=%s cleanup_action=defer_until_done_callback",
+                    reason,
+                    speech_id,
+                    was_stale,
+                    was_active,
+                    produced_audio,
+                    False,
+                )
+                continue
             _mark_speech_stale(speech_id)
-        active_speech_handles.clear()
-        speech_start_times.clear()
-        speech_latency_audits.clear()
-        _hume_speech_audio_coverages.clear()
-        assistant_speech_turn_ids.clear()
-        assistant_speech_llm_turn_ids.clear()
-        suppressed_speech_ids.clear()
+            suppressed_speech_ids.add(speech_id)
+            active_speech_handles.pop(speech_id, None)
+            speech_start_times.pop(speech_id, None)
+            speech_latency_audits.pop(speech_id, None)
+            _hume_speech_audio_coverages.pop(speech_id, None)
+            assistant_speech_turn_ids.pop(speech_id, None)
+            assistant_speech_llm_turn_ids.pop(speech_id, None)
+            logger.info(
+                "speech_handle_cleanup reason=%s speech_id=%s was_stale=%s was_active=%s produced_audio=%s marked_interrupted=%s cleanup_action=mark_stale_suppressed",
+                reason,
+                speech_id,
+                was_stale,
+                was_active,
+                produced_audio,
+                False,
+            )
         _prune_stale_speech_ids()
-        _latest_active_assistant_count_for_hume = 0
+        _latest_active_assistant_count_for_hume = len(active_speech_handles)
 
 
     @session.on("speech_created")
@@ -1603,9 +1656,26 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                     cleanup_result = f"cancel_failed:{method_name}:{result}"
             assistant_speech_turn_ids[speech_id] = speech_turn_id
             assistant_speech_llm_turn_ids[speech_id] = speech_llm_turn_id
+            was_stale_before_cleanup = speech_id in stale_speech_ids
+            produced_audio = _speech_produced_audio(speech_id, speech_start_times.get(speech_id))
             _mark_speech_stale(speech_id)
             suppressed_speech_ids.add(speech_id)
             assistant_speech_finished_at.setdefault(speech_id, time.monotonic())
+            logger.warning(
+                "real_user_interruption=true speech_id=%s evidence=%s",
+                speech_id,
+                "user_speaking_before_assistant_start",
+            )
+            logger.info(
+                "speech_handle_cleanup reason=%s speech_id=%s was_stale=%s was_active=%s produced_audio=%s marked_interrupted=%s cleanup_action=%s",
+                "user_speaking_before_assistant_start",
+                speech_id,
+                was_stale_before_cleanup,
+                False,
+                produced_audio,
+                cleanup_result.startswith("cancel_requested"),
+                cleanup_result,
+            )
             # Enforce: a speech object created while the user is speaking must not
             # reach audio playout (the FSM also only enters SPEAKING on real
             # playout). Block here and record it as a gated high-risk action.
@@ -1780,7 +1850,7 @@ def attach_session_diagnostics(session: AgentSession) -> None:
         add_done_callback = getattr(resolved_handle, "add_done_callback", None)
         if callable(add_done_callback):
             def _on_done(done_event_or_handle: object) -> None:
-                nonlocal pending_user_handoff_speech_id
+                nonlocal pending_user_handoff_speech_id, last_assistant_speech_outcome
                 global _latest_active_assistant_count_for_hume
                 done_resolved_handle = _resolve_speech_handle(done_event_or_handle)
                 done_id = _speech_id(done_resolved_handle)
@@ -1794,11 +1864,33 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                 suppressed_speech_ids.discard(done_id)
                 _unmark_speech_stale(done_id)
                 interrupted = _safe_attr(done_resolved_handle, "interrupted", "unknown")
+                hume_coverage_for_audio = _hume_speech_audio_coverages.get(done_id)
+                produced_audio = _speech_produced_audio(done_id, started_at, hume_coverage_for_audio)
                 # The TTS handle can report interrupted=False even when the FSM
                 # observed the user barging in. The FSM observation is
-                # authoritative for ledger ownership, so combine them.
+                # authoritative for ledger ownership, so combine them, but stale
+                # zero-audio cleanup is reconciliation rather than interruption.
                 fsm_observed_interrupted = _interaction_state.was_speech_interrupted(done_id)
-                effective_interrupted = _effective_interruption(interrupted, fsm_observed_interrupted)
+                effective_interrupted = _effective_interruption_for_speech(
+                    interrupted,
+                    fsm_observed_interrupted,
+                    was_stale=was_stale,
+                    produced_audio=produced_audio,
+                )
+                if effective_interrupted:
+                    evidence = "fsm_observed_interrupted" if fsm_observed_interrupted else "handle_interrupted"
+                    logger.warning("real_user_interruption=true speech_id=%s evidence=%s", done_id, evidence)
+                elif was_stale and not produced_audio:
+                    logger.info("stale_speech_finished_without_interruption=true speech_id=%s", done_id)
+                logger.info(
+                    "speech_handle_cleanup reason=%s speech_id=%s was_stale=%s was_active=%s produced_audio=%s marked_interrupted=%s",
+                    "done_callback",
+                    done_id,
+                    was_stale,
+                    was_active,
+                    produced_audio,
+                    effective_interrupted,
+                )
                 speaking_at = agent_speaking_at.get(done_id)
                 listening_at = agent_listening_at.get(done_id)
                 speech_duration_seconds = (finished_at - started_at) if started_at is not None else -1.0
@@ -1860,6 +1952,8 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                     latest_user_state,
                 )
                 hume_coverage = _hume_speech_audio_coverages.pop(done_id, None)
+                generated_duration = None
+                generated_bytes = getattr(hume_coverage, "byte_count", None) if hume_coverage is not None else None
                 if hume_coverage is not None:
                     generated_duration = _hume_generated_audio_duration_seconds(hume_coverage)
                     playout_duration = speech_duration_seconds if speech_duration_seconds >= 0 else None
@@ -1913,6 +2007,36 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                 start_count = hume_request_count_at_speech_start.get(done_id, -1)
                 finish_count = hume_request_count_at_speech_finish.get(done_id, _hume_tts_request_counter)
                 hume_requests_during = finish_count - start_count if start_count >= 0 and finish_count >= 0 else -1
+                interruption_at = active_speech_interrupted_at.pop(done_id, None)
+                tail_outcome = _classify_assistant_tail_outcome(
+                    interrupted=bool(effective_interrupted),
+                    interruption_at=interruption_at,
+                    playout_started_at=speaking_at,
+                    playout_completed_at=finished_at if produced_audio else None,
+                    generated_audio_duration_seconds=generated_duration,
+                    hume_requests_during_speech=hume_requests_during,
+                )
+                playout_duration_for_report = speech_duration_seconds if speech_duration_seconds >= 0 else None
+                last_assistant_speech_outcome = {
+                    "previous_speech_id": done_id,
+                    "generated_audio_duration_seconds": generated_duration,
+                    "playout_duration_seconds": playout_duration_for_report,
+                    "interrupted": bool(effective_interrupted),
+                    **tail_outcome,
+                }
+                logger.info(
+                    "assistant_tail_diagnostic speech_id=%s generated_audio_duration_seconds=%s playout_duration_seconds=%s interrupted=%s interruption_before_playout_complete=%s interruption_after_playout_complete=%s assistant_playout_completed_normally=%s assistant_tail_cut_likely=%s interruption_timing=%s suppressed_or_ghost_handle=%s",
+                    done_id,
+                    _fmt_seconds(generated_duration),
+                    _fmt_seconds(playout_duration_for_report),
+                    bool(effective_interrupted),
+                    tail_outcome["interruption_before_playout_complete"],
+                    tail_outcome["interruption_after_playout_complete"],
+                    tail_outcome["assistant_playout_completed_normally"],
+                    tail_outcome["assistant_tail_cut_likely"],
+                    tail_outcome["interruption_timing"],
+                    tail_outcome["suppressed_or_ghost_handle"],
+                )
                 base_audit = speech_latency_audit or {}
                 latency_audit = _build_voice_latency_audit(
                     turn_id=int(base_audit.get("turn_id", _current_turn_id) or _current_turn_id),
@@ -2049,6 +2173,15 @@ def attach_session_diagnostics(session: AgentSession) -> None:
             last_user_listening_at = latest_user_state_timestamp
         if latest_user_state == "speaking":
             pre_state = _interaction_state.state
+            interrupted_ids = set(active_speech_handles.keys())
+            active_fsm_speech_id = getattr(_interaction_state, "active_speech_id", None)
+            if active_fsm_speech_id:
+                interrupted_ids.add(active_fsm_speech_id)
+            current_speech = getattr(session, "current_speech", None)
+            if current_speech is not None:
+                interrupted_ids.add(_speech_id(current_speech))
+            for interrupted_id in interrupted_ids:
+                active_speech_interrupted_at.setdefault(interrupted_id, latest_user_state_timestamp)
             _record_audio_env_event("speech_start", latest_user_state_timestamp)
             _interaction_state.on_user_speech_started()
             # Latch a barge-in that begins while the assistant is still thinking
@@ -2198,6 +2331,18 @@ def attach_session_diagnostics(session: AgentSession) -> None:
             return
         logger.info("Conversation item added: role=%s interrupted=%s", role, interrupted)
         if str(role).strip().lower() == "user":
+            feedback = _user_feedback_marker(_extract_text_for_debug(target))
+            if feedback and last_assistant_speech_outcome is not None:
+                logger.info(
+                    "assistant_tail_user_feedback_report user_feedback=%s previous_speech_id=%s generated_audio_duration_seconds=%s playout_duration_seconds=%s interrupted=%s interruption_timing=%s assistant_tail_cut_likely=%s",
+                    feedback,
+                    last_assistant_speech_outcome.get("previous_speech_id", "n/a"),
+                    _fmt_seconds(last_assistant_speech_outcome.get("generated_audio_duration_seconds")),
+                    _fmt_seconds(last_assistant_speech_outcome.get("playout_duration_seconds")),
+                    last_assistant_speech_outcome.get("interrupted"),
+                    last_assistant_speech_outcome.get("interruption_timing"),
+                    last_assistant_speech_outcome.get("assistant_tail_cut_likely"),
+                )
             _reset_search_state_for_turn()
             logger.info("Search state reset for new user turn: search_in_progress=%s search_tool_called=%s", _search_in_progress, _search_tool_called)
 
@@ -2456,6 +2601,94 @@ def _effective_interruption(handle_interrupted: object, fsm_observed_interrupted
     from EITHER source counts.
     """
     return str(handle_interrupted).strip().lower() in {"true", "1", "yes"} or bool(fsm_observed_interrupted)
+
+
+def _effective_interruption_for_speech(
+    handle_interrupted: object,
+    fsm_observed_interrupted: bool,
+    *,
+    was_stale: bool,
+    produced_audio: bool,
+) -> bool:
+    """Return true only for real interruptions, not stale zero-audio reconciliation."""
+    if was_stale and not produced_audio:
+        return False
+    return _effective_interruption(handle_interrupted, fsm_observed_interrupted)
+
+
+def _classify_assistant_tail_outcome(
+    *,
+    interrupted: bool,
+    interruption_at: float | None,
+    playout_started_at: float | None,
+    playout_completed_at: float | None,
+    generated_audio_duration_seconds: float | None,
+    hume_requests_during_speech: int | None,
+) -> dict[str, object]:
+    hume_request_count_allows_audio = hume_requests_during_speech is None or hume_requests_during_speech != 0
+    produced_hume_audio = hume_request_count_allows_audio and bool(
+        generated_audio_duration_seconds and generated_audio_duration_seconds > 0
+    )
+    if not produced_hume_audio:
+        return {
+            "interruption_before_playout_complete": False,
+            "interruption_after_playout_complete": False,
+            "assistant_playout_completed_normally": False,
+            "assistant_tail_cut_likely": False,
+            "interruption_timing": "none",
+            "suppressed_or_ghost_handle": True,
+        }
+    estimated_generated_end = None
+    if playout_started_at is not None and generated_audio_duration_seconds is not None:
+        estimated_generated_end = playout_started_at + generated_audio_duration_seconds
+    completion_boundary = playout_completed_at if playout_completed_at is not None else estimated_generated_end
+    interruption_before = False
+    interruption_after = False
+    timing = "none"
+    if interrupted and interruption_at is not None and completion_boundary is not None:
+        # Small tolerance prevents a final VAD edge at the exact end from being
+        # misread as a user-facing tail cut.
+        if interruption_at < (completion_boundary - 0.05):
+            interruption_before = True
+            timing = "before_playout_complete"
+        else:
+            interruption_after = True
+            timing = "after_playout_complete"
+    elif interrupted:
+        timing = "before_playout_complete" if playout_completed_at is None else "after_playout_complete"
+        interruption_before = timing == "before_playout_complete"
+        interruption_after = timing == "after_playout_complete"
+    completed_normally = produced_hume_audio and not interruption_before
+    return {
+        "interruption_before_playout_complete": interruption_before,
+        "interruption_after_playout_complete": interruption_after,
+        "assistant_playout_completed_normally": completed_normally,
+        "assistant_tail_cut_likely": interruption_before,
+        "interruption_timing": timing,
+        "suppressed_or_ghost_handle": False,
+    }
+
+
+def _user_feedback_marker(text: str) -> str | None:
+    lowered = (text or "").strip().lower()
+    if not lowered:
+        return None
+    clean_patterns = (
+        "no cutoff",
+        "no cut off",
+        "ended clean",
+        "ended cleanly",
+        "didn't sound like a tail",
+        "did not sound like a tail",
+        "wasn't cut off",
+        "was not cut off",
+    )
+    if any(pattern in lowered for pattern in clean_patterns):
+        return "clean"
+    cutoff_patterns = ("hard clip", "cutoff", "cut off", "tail response", "tail end")
+    if any(pattern in lowered for pattern in cutoff_patterns):
+        return "cutoff"
+    return None
 
 
 def _ledger_downgrade_reason_for_outcome(
@@ -4231,13 +4464,172 @@ def _inject_response_mode_note(turn_ctx: object, turn_kind: str, detected_intent
         return False
 
 
-async def _tee_audio_to_shadow(audio, shadow: AudioInteractionShadow):
+async def _tee_audio_to_shadows(audio, *shadows):
     async for frame in audio:
-        try:
-            shadow.feed_frame(frame)
-        except Exception:
-            pass
+        for shadow in shadows:
+            if shadow is None:
+                continue
+            try:
+                shadow.feed_frame(frame)
+            except Exception:
+                pass
         yield frame
+
+
+def _persist_calibration_moment(moment: dict[str, Any]) -> None:
+    if not CALIBRATION_MOMENTS_PATH:
+        return
+    try:
+        path = Path(CALIBRATION_MOMENTS_PATH)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(moment, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception as exc:
+        logger.warning(
+            "emotional_calibration_moment_store_failed=true error_type=%s error=%s",
+            type(exc).__name__,
+            _redact_sensitive_text(exc),
+        )
+
+
+def _complete_pending_calibration_moment(user_answer: str) -> None:
+    global _pending_calibration_moment
+    if _pending_calibration_moment is None:
+        return
+    moment = dict(_pending_calibration_moment)
+    moment["user_answer"] = user_answer
+    moment["user_confirmed_or_corrected"] = bool(user_answer.strip())
+    _calibration_moments.append(moment)
+    _persist_calibration_moment(moment)
+    logger.info(
+        "emotional_calibration_moment_stored=true turn_id=%s session_id=%s user_answer_present=%s total_moments=%s",
+        moment.get("turn_id"),
+        moment.get("session_id"),
+        bool(user_answer.strip()),
+        len(_calibration_moments),
+    )
+    _pending_calibration_moment = None
+
+
+def _calibration_question_for_turn(transcript: str, profile, turn_id: int) -> tuple[str | None, str]:
+    if profile is None:
+        return None, "no_inworld_context"
+    if turn_id - _last_calibration_question_turn_id < 3:
+        return None, "cadence_limit"
+    words = transcript.split()
+    if len(words) < 4:
+        return None, "transcript_too_short"
+    text = transcript.lower()
+    emotionally_relevant = any(
+        token in text
+        for token in (
+            "feel", "feeling", "felt", "stressed", "worry", "worried", "hard", "heavy",
+            "mad", "angry", "upset", "confused", "pressure", "scared", "fear", "guilt",
+            "disappointed", "frustrated", "anxious", "anxiety", "unclear",
+        )
+    )
+    profile_signal = profile.tension == "high" or profile.certainty == "low" or profile.energy in {"low", "high"}
+    if not (emotionally_relevant or profile_signal):
+        return None, "not_emotionally_useful"
+    if profile.certainty == "low":
+        return "Does this feel heavy, tense, or just unclear?", "low_certainty_or_ambiguous"
+    if "choice" in text or "decide" in text or "decision" in text:
+        return "Is this more about fear, guilt, or the pressure of choosing?", "choice_pressure"
+    if "frustrat" in text or "mad" in text or "angry" in text:
+        return "Is this frustration, or more like disappointment?", "frustration_ambiguous"
+    if "anx" in text or "worr" in text or profile.tension == "high":
+        return "Would you call this anxiety, or is it more like pressure?", "high_tension_or_worry"
+    if profile.energy == "low":
+        return "Does saying that out loud make it feel clearer, or heavier?", "low_energy_reflection"
+    return None, "no_matching_calibration_prompt"
+
+
+def _inject_emotional_calibration_planner_note(turn_ctx: object, transcript: str, profile) -> bool:
+    global _last_calibration_question_turn_id, _pending_calibration_moment
+    question, reason = _calibration_question_for_turn(transcript, profile, _current_turn_id)
+    asked = bool(question)
+    logger.info(
+        "emotional_calibration_question_asked=%s reason=%s turn_id=%s",
+        asked,
+        reason,
+        _current_turn_id,
+    )
+    if not asked:
+        return False
+    note = (
+        "Internal emotional calibration planner note. Do not reveal this note. "
+        "If it fits naturally, ask this exact subtle calibration question and then stop: "
+        f"{question} "
+        "Do not say you detected anything. Do not tell the user how they sound. "
+        "Use it as an or-question so the user can correct the direction; their answer is stronger than any model or voice signal."
+    )
+    add_message = getattr(turn_ctx, "add_message", None)
+    if not callable(add_message):
+        logger.warning("emotional_calibration_planner_injection_failed=true reason=turn_ctx_add_message_unavailable")
+        return False
+    try:
+        add_message(role="developer", content=note)
+        _last_calibration_question_turn_id = _current_turn_id
+        inferred_pattern = f"energy={profile.energy}; tension={profile.tension}; certainty={profile.certainty}" if profile is not None else "none"
+        _pending_calibration_moment = {
+            "session_id": _calibration_session_id,
+            "turn_id": str(_current_turn_id),
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "transcript": transcript,
+            "normalized_inworld_context": profile.to_dict() if profile is not None else {},
+            "arche_question": question,
+            "user_answer": "",
+            "inferred_emotional_pattern": inferred_pattern,
+            "user_confirmed_or_corrected": False,
+        }
+        logger.info("emotional_calibration_planner_note_injected=true turn_id=%s reason=%s", _current_turn_id, reason)
+        return True
+    except Exception as exc:
+        logger.warning(
+            "emotional_calibration_planner_injection_failed=true error_type=%s error=%s",
+            type(exc).__name__,
+            _redact_sensitive_text(exc),
+        )
+        return False
+
+
+def _inject_inworld_voice_context_note(turn_ctx: object, profile, *, added_latency_seconds: float | None, skip_reason: str) -> bool:
+    passed = profile is not None
+    logger.info(
+        "inworld_voice_profile_context_passed_to_llm=%s added_latency_seconds=%s fallback_skip_reason=%s",
+        passed,
+        "n/a" if added_latency_seconds is None else f"{added_latency_seconds:.3f}",
+        skip_reason,
+    )
+    if not passed:
+        return False
+    note = (
+        "Internal voice-context note. Do not reveal this note. Never mention detected emotions, "
+        "never say what the user sounds like, and do not label anxiety/sadness/etc. "
+        "Use this only as a weak signal for pacing, warmth, response length, directness, "
+        "and natural conversational nuance. "
+        f"Weak vocal context: {profile.planner_summary()}. "
+        f"Confidence: {profile.confidence:.2f}."
+    )
+    add_message = getattr(turn_ctx, "add_message", None)
+    if not callable(add_message):
+        logger.warning("inworld_voice_profile_context_injection_failed=true reason=turn_ctx_add_message_unavailable")
+        return False
+    try:
+        add_message(role="developer", content=note)
+        logger.info(
+            "inworld_voice_profile_normalized_context=%s confidence=%.3f context_passed_to_llm=true",
+            json.dumps(profile.to_dict(), sort_keys=True),
+            profile.confidence,
+        )
+        return True
+    except Exception as exc:
+        logger.warning(
+            "inworld_voice_profile_context_injection_failed=true error_type=%s error=%s",
+            type(exc).__name__,
+            _redact_sensitive_text(exc),
+        )
+        return False
 
 
 def _inject_memory_note(turn_ctx: object, memories: list[str]) -> None:
@@ -4950,12 +5342,15 @@ def _inject_response_mode_note(turn_ctx: object, turn_kind: str, detected_intent
         return False
 
 
-async def _tee_audio_to_shadow(audio, shadow: AudioInteractionShadow):
+async def _tee_audio_to_shadows(audio, *shadows):
     async for frame in audio:
-        try:
-            shadow.feed_frame(frame)
-        except Exception:
-            pass
+        for shadow in shadows:
+            if shadow is None:
+                continue
+            try:
+                shadow.feed_frame(frame)
+            except Exception:
+                pass
         yield frame
 
 
@@ -5255,9 +5650,9 @@ class LucyAgent(Agent):
         # Observational AudioInteraction fork: tee user audio frames to the shadow
         # sidecar without altering the production STT stream. feed_frame never
         # blocks or raises; when shadow mode is off the stream passes through as-is.
-        shadow = _audiointeraction_shadow
-        if shadow is not None:
-            audio = _tee_audio_to_shadow(audio, shadow)
+        shadows = tuple(s for s in (_audiointeraction_shadow, _inworld_voice_profile_shadow) if s is not None)
+        if shadows:
+            audio = _tee_audio_to_shadows(audio, *shadows)
         async for event in Agent.default.stt_node(self, audio, model_settings):
             yield event
 
@@ -6353,6 +6748,7 @@ class LucyAgent(Agent):
         _last_llm_completed_text_hash = "empty"
         _last_llm_completed_at = 0.0
         _last_user_message_text = _extract_text_for_debug(new_message).strip()
+        _complete_pending_calibration_moment(_last_user_message_text)
         _last_tts_received_text_hash = "empty"
         _current_candidate_id, _candidate_drift_suspected, _candidate_latest_final_hash = _bind_candidate_for_commit(_last_user_message_text)
         logger.info(
@@ -6427,6 +6823,25 @@ class LucyAgent(Agent):
                 False,
                 False,
             )
+        inworld_profile = None
+        if _inworld_voice_profile_shadow is not None:
+            try:
+                inworld_profile, skip_reason, added_latency_seconds = _inworld_voice_profile_shadow.context_for_turn(_last_turn_committed_at)
+                _inject_inworld_voice_context_note(
+                    turn_ctx,
+                    inworld_profile,
+                    added_latency_seconds=added_latency_seconds,
+                    skip_reason=skip_reason,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "inworld_voice_profile_context_failed=true fallback_skip_reason=%s error=%s",
+                    type(exc).__name__,
+                    _redact_sensitive_text(exc),
+                )
+        else:
+            logger.info("inworld_voice_profile_context_passed_to_llm=false fallback_skip_reason=disabled")
+        _inject_emotional_calibration_planner_note(turn_ctx, _last_user_message_text, inworld_profile)
         policy_context = transcript_context if transcript_context_layer_enabled() else detect_transcript_context(_last_user_message_text)
         turn_policy = _make_turn_policy_decision(
             _last_user_message_text,
@@ -7260,9 +7675,9 @@ async def entrypoint(ctx: JobContext):
 
     interruption_options: InterruptionOptions = {
         "enabled": env_bool("LIVEKIT_INTERRUPTION_ENABLED", True),
-        "min_words": int(os.getenv("LIVEKIT_INTERRUPTION_MIN_WORDS", "1")),
-        "min_duration": float(os.getenv("LIVEKIT_INTERRUPTION_MIN_DURATION", "0.6")),
-        "resume_false_interruption": env_bool("LIVEKIT_RESUME_FALSE_INTERRUPTION", False),
+        "min_words": int(os.getenv("LIVEKIT_INTERRUPTION_MIN_WORDS", "2")),
+        "min_duration": float(os.getenv("LIVEKIT_INTERRUPTION_MIN_DURATION", "0.65")),
+        "resume_false_interruption": env_bool("LIVEKIT_RESUME_FALSE_INTERRUPTION", True),
         "false_interruption_timeout": float(os.getenv("LIVEKIT_FALSE_INTERRUPTION_TIMEOUT", "1.8")),
     }
     logger.info("Resolved interruption config: %s", interruption_options)
@@ -7336,7 +7751,17 @@ async def entrypoint(ctx: JobContext):
         True,
     )
 
-    global _active_memory_layer, _audiointeraction_shadow
+    global _active_memory_layer, _audiointeraction_shadow, _inworld_voice_profile_shadow, _calibration_session_id
+    _calibration_session_id = str(_safe_attr(_safe_attr(ctx, "room"), "name") or "unknown")
+    logger.info(
+        "tts_runtime_selection hume_active=%s tts_provider=%s tts_fallback_provider=%s omnivoice_inactive=%s omnivoice_enabled=%s omnivoice_expressive_planner_enabled=%s",
+        TTS_PROVIDER == "hume",
+        TTS_PROVIDER,
+        TTS_FALLBACK_PROVIDER,
+        TTS_PROVIDER != "omnivoice",
+        env_bool("OMNIVOICE_ENABLED", False),
+        env_bool("OMNIVOICE_EXPRESSIVE_PLANNER_ENABLED", False),
+    )
     _audiointeraction_shadow = build_shadow_from_env()
     if _audiointeraction_shadow is not None:
         _audiointeraction_shadow.start()
@@ -7351,6 +7776,16 @@ async def entrypoint(ctx: JobContext):
             logger.warning("audiointeraction_shutdown_callback_unavailable=true error_type=%s error=%s", type(exc).__name__, exc)
     else:
         logger.info("AudioInteraction shadow startup: audiointeraction_mode=%s shadow_active=false", audiointeraction_mode())
+
+    _inworld_voice_profile_shadow = build_inworld_shadow_from_env()
+    if _inworld_voice_profile_shadow is not None:
+        _inworld_voice_profile_shadow.start()
+        try:
+            ctx.add_shutdown_callback(_inworld_voice_profile_shadow.aclose)
+        except Exception as exc:
+            logger.warning("inworld_voice_profile_shutdown_callback_unavailable=true error_type=%s error=%s", type(exc).__name__, exc)
+    else:
+        logger.info("inworld_voice_profile_startup shadow_active=false")
 
     memory_layer_instance: MemoryLayer | None = None
     memory_preload_note: str | None = None
