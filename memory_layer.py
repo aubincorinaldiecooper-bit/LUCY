@@ -23,10 +23,21 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from memory_embeddings import (
+    embed_text,
+    semantic_retrieval_enabled,
+    semantic_timeout_ms,
+    to_pgvector_literal,
+)
+
 logger = logging.getLogger(__name__)
 
 GUEST_MEMORY_TTL_HOURS = 24
 INDEX_REBUILD_MAX_ROWS = 500
+
+
+class _SemanticUnavailable(Exception):
+    """Internal: semantic recall can't run (no embedding) -> fall back to recency."""
 
 # Set once the "simplemem not installed" warning has been logged, so it isn't
 # repeated for every per-session MemoryLayer instance.
@@ -142,6 +153,8 @@ class MemoryLayer:
         simplemem_factory: Callable[[str], Any] | None = None,
         db_reader: Callable[[str, tuple], list[tuple]] | None = None,
         db_writer: Callable[[str, tuple], None] | None = None,
+        semantic_enabled: bool | None = None,
+        embed_fn: Callable[[str], Any] | None = None,
     ) -> None:
         self.identity = identity
         self.session_id = session_id
@@ -156,6 +169,13 @@ class MemoryLayer:
         self._simplemem: Any = None
         self._simplemem_status = "not_initialized"
         self._background_tasks: set[asyncio.Task] = set()
+        # pgvector semantic recall: embed memories on write and find the most
+        # relevant (not just most recent) on retrieve. Off unless enabled + a key.
+        self._semantic_enabled = (
+            semantic_retrieval_enabled() if semantic_enabled is None else semantic_enabled
+        )
+        self._embed_fn = embed_fn or embed_text
+        self._semantic_timeout_ms = semantic_timeout_ms()
 
     # ---------- backends ----------
 
@@ -254,10 +274,15 @@ class MemoryLayer:
             f"Known from earlier conversations:\n{lines}"
         )
     async def retrieve(self, query: str, top_k: int = 5) -> list[str]:
-        """Semantic retrieval via SimpleMem, hard-bounded by the retrieval timeout. Never raises."""
+        """Most-relevant memories for `query`. Prefers pgvector semantic recall when
+        enabled, else falls back to the SimpleMem index. Hard-bounded; never raises."""
         query = (query or "").strip()
         if not query:
             return []
+        if self._semantic_enabled and self._db_url and self.identity.present:
+            items = await self._semantic_retrieve(query, top_k)
+            if items is not None:  # None = semantic unavailable -> fall through
+                return items
         backend = self._get_simplemem()
         if backend is None:
             return []
@@ -289,6 +314,58 @@ class MemoryLayer:
                 exc,
             )
             return []
+
+    async def _semantic_retrieve(self, query: str, top_k: int) -> list[str] | None:
+        """pgvector nearest-neighbour recall. Returns items, [] for no matches, or
+        None when semantic recall is unavailable (caller falls back). The whole
+        embed+query is bounded by the semantic timeout so a turn never stalls."""
+        started_at = time.monotonic()
+
+        async def _run() -> list[str]:
+            vector = await self._embed_fn(query)
+            if not vector:
+                raise _SemanticUnavailable("no_embedding")
+            rows = await asyncio.to_thread(
+                self._db_reader,
+                """
+                SELECT content FROM memory_units
+                WHERE deleted_at IS NULL
+                  AND embedding IS NOT NULL
+                  AND (ttl_expires_at IS NULL OR ttl_expires_at > now())
+                  AND ((clerk_user_id IS NOT NULL AND clerk_user_id = %s)
+                       OR (guest_id IS NOT NULL AND guest_id = %s))
+                ORDER BY embedding <=> %s::vector
+                LIMIT %s
+                """,
+                (self.identity.clerk_user_id, self.identity.guest_id, to_pgvector_literal(vector), top_k),
+            )
+            return [str(row[0]).strip() for row in rows if row and str(row[0]).strip()]
+
+        try:
+            items = await asyncio.wait_for(_run(), timeout=self._semantic_timeout_ms / 1000)
+        except _SemanticUnavailable:
+            return None
+        except asyncio.TimeoutError:
+            logger.warning(
+                "memory_retrieval status=timeout backend=pgvector timeout_ms=%s duration_seconds=%.3f",
+                self._semantic_timeout_ms,
+                time.monotonic() - started_at,
+            )
+            return None
+        except Exception as exc:
+            # e.g. embedding column / pgvector not present -> fall back, don't break.
+            logger.warning(
+                "memory_retrieval status=error backend=pgvector error_type=%s error=%s",
+                type(exc).__name__,
+                exc,
+            )
+            return None
+        logger.info(
+            "memory_retrieval status=ok backend=pgvector memory_count=%s duration_seconds=%.3f",
+            len(items),
+            time.monotonic() - started_at,
+        )
+        return items
 
     # ---------- write path ----------
 
@@ -338,6 +415,7 @@ class MemoryLayer:
                 )
             except Exception as exc:
                 logger.warning("memory_write status=error target=postgres error_type=%s error=%s", type(exc).__name__, exc)
+            await self._embed_and_store(compact)
         backend = self._get_simplemem()
         if backend is not None:
             try:
@@ -348,6 +426,33 @@ class MemoryLayer:
                     await asyncio.to_thread(backend.add_text, compact, tags)
             except Exception as exc:
                 logger.warning("memory_write status=error target=simplemem error_type=%s error=%s", type(exc).__name__, exc)
+
+    async def _embed_and_store(self, compact: str) -> None:
+        """Best-effort: embed a just-written memory and store its vector by
+        content_hash. A separate UPDATE so the base insert is never affected; any
+        failure (semantic off, no key, no pgvector column) is swallowed."""
+        if not self._semantic_enabled or not self._db_url:
+            return
+        try:
+            vector = await self._embed_fn(compact)
+            if not vector:
+                return
+            await asyncio.to_thread(
+                self._db_writer,
+                """
+                UPDATE memory_units SET embedding = %s::vector
+                WHERE content_hash = %s AND embedding IS NULL
+                  AND ((clerk_user_id IS NOT NULL AND clerk_user_id = %s)
+                       OR (guest_id IS NOT NULL AND guest_id = %s))
+                """,
+                (to_pgvector_literal(vector), _content_hash(compact),
+                 self.identity.clerk_user_id, self.identity.guest_id),
+            )
+        except Exception as exc:
+            logger.warning(
+                "memory_write status=error target=embedding error_type=%s error=%s",
+                type(exc).__name__, exc,
+            )
 
     async def rebuild_index_if_empty(self) -> None:
         """Re-ingest recent Postgres memories when the container has a fresh/empty index."""
