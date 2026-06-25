@@ -858,6 +858,20 @@ class InterruptionLedgerTests(unittest.TestCase):
         self.assertTrue(entry["suppressed"])
         self.assertEqual(agent._ledger_recent_canonical(5), [])
 
+    def test_stale_zero_audio_speech_is_not_effective_interruption(self):
+        self.assertFalse(
+            agent._effective_interruption_for_speech(
+                "true", True, was_stale=True, produced_audio=False
+            )
+        )
+
+    def test_produced_audio_stale_speech_can_still_be_interrupted(self):
+        self.assertTrue(
+            agent._effective_interruption_for_speech(
+                "false", True, was_stale=True, produced_audio=True
+            )
+        )
+
     def test_effective_interruption_combines_handle_and_fsm(self):
         # Handle says not-interrupted, but the FSM observed the barge-in → interrupted.
         self.assertTrue(agent._effective_interruption("false", True))

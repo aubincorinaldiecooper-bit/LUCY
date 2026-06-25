@@ -1305,6 +1305,14 @@ def attach_session_diagnostics(session: AgentSession) -> None:
         while speech_id in stale_speech_id_order:
             stale_speech_id_order.remove(speech_id)
 
+    def _speech_produced_audio(speech_id: str, started_at: float | None = None, hume_coverage: object | None = None) -> bool:
+        if started_at is not None:
+            return True
+        if speech_id in agent_speaking_at:
+            return True
+        coverage = hume_coverage if hume_coverage is not None else _hume_speech_audio_coverages.get(speech_id)
+        return bool(getattr(coverage, "byte_count", 0) or getattr(coverage, "frame_count", 0))
+
     def _extract_user_new_state(state_event: object) -> str:
         new_state = getattr(state_event, "new_state", None)
         if new_state is not None:
@@ -1516,6 +1524,8 @@ def attach_session_diagnostics(session: AgentSession) -> None:
 
             assistant_speech_turn_ids[speech_id] = speech_turn_id
             assistant_speech_llm_turn_ids[speech_id] = speech_llm_turn_id
+            was_stale_before_cleanup = speech_id in stale_speech_ids
+            produced_audio = _speech_produced_audio(speech_id, speech_start_times.get(speech_id))
             _mark_speech_stale(speech_id)
             suppressed_speech_ids.add(speech_id)
             active_speech_handles.pop(speech_id, None)
@@ -1528,6 +1538,16 @@ def attach_session_diagnostics(session: AgentSession) -> None:
             assistant_speech_finished_at.setdefault(speech_id, time.monotonic())
             if pending_user_handoff_speech_id == speech_id:
                 pending_user_handoff_speech_id = None
+            logger.info(
+                "speech_handle_cleanup reason=%s speech_id=%s was_stale=%s was_active=%s produced_audio=%s marked_interrupted=%s cleanup_action=%s",
+                cleanup_reason,
+                speech_id,
+                was_stale_before_cleanup,
+                True,
+                produced_audio,
+                cleanup_result.startswith("cancel_requested"),
+                cleanup_result,
+            )
             logger.info(
                 "Assistant speech cleanup item: turn_id=%s cleanup_reason=%s speech_id=%s current_new_speech_id=%s attempted_method=%s cleanup_result=%s active_count_after_item=%s stale_speech_ids=%s",
                 _current_turn_id,
@@ -1564,17 +1584,40 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                 len(suppressed_speech_ids),
                 len(stale_speech_ids),
             )
-        for speech_id in active_speech_handles:
+        for speech_id in list(active_speech_handles.keys()):
+            was_active = speech_id in active_speech_handles
+            was_stale = speech_id in stale_speech_ids
+            produced_audio = _speech_produced_audio(speech_id, speech_start_times.get(speech_id))
+            if reason == "agent_returned_to_listening" and produced_audio:
+                logger.info(
+                    "speech_handle_cleanup reason=%s speech_id=%s was_stale=%s was_active=%s produced_audio=%s marked_interrupted=%s cleanup_action=defer_until_done_callback",
+                    reason,
+                    speech_id,
+                    was_stale,
+                    was_active,
+                    produced_audio,
+                    False,
+                )
+                continue
             _mark_speech_stale(speech_id)
-        active_speech_handles.clear()
-        speech_start_times.clear()
-        speech_latency_audits.clear()
-        _hume_speech_audio_coverages.clear()
-        assistant_speech_turn_ids.clear()
-        assistant_speech_llm_turn_ids.clear()
-        suppressed_speech_ids.clear()
+            suppressed_speech_ids.add(speech_id)
+            active_speech_handles.pop(speech_id, None)
+            speech_start_times.pop(speech_id, None)
+            speech_latency_audits.pop(speech_id, None)
+            _hume_speech_audio_coverages.pop(speech_id, None)
+            assistant_speech_turn_ids.pop(speech_id, None)
+            assistant_speech_llm_turn_ids.pop(speech_id, None)
+            logger.info(
+                "speech_handle_cleanup reason=%s speech_id=%s was_stale=%s was_active=%s produced_audio=%s marked_interrupted=%s cleanup_action=mark_stale_suppressed",
+                reason,
+                speech_id,
+                was_stale,
+                was_active,
+                produced_audio,
+                False,
+            )
         _prune_stale_speech_ids()
-        _latest_active_assistant_count_for_hume = 0
+        _latest_active_assistant_count_for_hume = len(active_speech_handles)
 
 
     @session.on("speech_created")
@@ -1618,9 +1661,26 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                     cleanup_result = f"cancel_failed:{method_name}:{result}"
             assistant_speech_turn_ids[speech_id] = speech_turn_id
             assistant_speech_llm_turn_ids[speech_id] = speech_llm_turn_id
+            was_stale_before_cleanup = speech_id in stale_speech_ids
+            produced_audio = _speech_produced_audio(speech_id, speech_start_times.get(speech_id))
             _mark_speech_stale(speech_id)
             suppressed_speech_ids.add(speech_id)
             assistant_speech_finished_at.setdefault(speech_id, time.monotonic())
+            logger.warning(
+                "real_user_interruption=true speech_id=%s evidence=%s",
+                speech_id,
+                "user_speaking_before_assistant_start",
+            )
+            logger.info(
+                "speech_handle_cleanup reason=%s speech_id=%s was_stale=%s was_active=%s produced_audio=%s marked_interrupted=%s cleanup_action=%s",
+                "user_speaking_before_assistant_start",
+                speech_id,
+                was_stale_before_cleanup,
+                False,
+                produced_audio,
+                cleanup_result.startswith("cancel_requested"),
+                cleanup_result,
+            )
             # Enforce: a speech object created while the user is speaking must not
             # reach audio playout (the FSM also only enters SPEAKING on real
             # playout). Block here and record it as a gated high-risk action.
@@ -1809,11 +1869,33 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                 suppressed_speech_ids.discard(done_id)
                 _unmark_speech_stale(done_id)
                 interrupted = _safe_attr(done_resolved_handle, "interrupted", "unknown")
+                hume_coverage_for_audio = _hume_speech_audio_coverages.get(done_id)
+                produced_audio = _speech_produced_audio(done_id, started_at, hume_coverage_for_audio)
                 # The TTS handle can report interrupted=False even when the FSM
                 # observed the user barging in. The FSM observation is
-                # authoritative for ledger ownership, so combine them.
+                # authoritative for ledger ownership, so combine them, but stale
+                # zero-audio cleanup is reconciliation rather than interruption.
                 fsm_observed_interrupted = _interaction_state.was_speech_interrupted(done_id)
-                effective_interrupted = _effective_interruption(interrupted, fsm_observed_interrupted)
+                effective_interrupted = _effective_interruption_for_speech(
+                    interrupted,
+                    fsm_observed_interrupted,
+                    was_stale=was_stale,
+                    produced_audio=produced_audio,
+                )
+                if effective_interrupted:
+                    evidence = "fsm_observed_interrupted" if fsm_observed_interrupted else "handle_interrupted"
+                    logger.warning("real_user_interruption=true speech_id=%s evidence=%s", done_id, evidence)
+                elif was_stale and not produced_audio:
+                    logger.info("stale_speech_finished_without_interruption=true speech_id=%s", done_id)
+                logger.info(
+                    "speech_handle_cleanup reason=%s speech_id=%s was_stale=%s was_active=%s produced_audio=%s marked_interrupted=%s",
+                    "done_callback",
+                    done_id,
+                    was_stale,
+                    was_active,
+                    produced_audio,
+                    effective_interrupted,
+                )
                 speaking_at = agent_speaking_at.get(done_id)
                 listening_at = agent_listening_at.get(done_id)
                 speech_duration_seconds = (finished_at - started_at) if started_at is not None else -1.0
@@ -2471,6 +2553,19 @@ def _effective_interruption(handle_interrupted: object, fsm_observed_interrupted
     from EITHER source counts.
     """
     return str(handle_interrupted).strip().lower() in {"true", "1", "yes"} or bool(fsm_observed_interrupted)
+
+
+def _effective_interruption_for_speech(
+    handle_interrupted: object,
+    fsm_observed_interrupted: bool,
+    *,
+    was_stale: bool,
+    produced_audio: bool,
+) -> bool:
+    """Return true only for real interruptions, not stale zero-audio reconciliation."""
+    if was_stale and not produced_audio:
+        return False
+    return _effective_interruption(handle_interrupted, fsm_observed_interrupted)
 
 
 def _ledger_downgrade_reason_for_outcome(

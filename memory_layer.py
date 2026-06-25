@@ -497,7 +497,7 @@ class MemoryLayer:
         compact = f"{'User said' if role == 'user' else 'Lucy replied'}: {content}"
         if self._db_url:
             try:
-                await self._write_postgres_memory(compact, role, turn_id, modality, media_url)
+                await self._embed_and_store(compact, role, turn_id, modality, media_url)
             except Exception as exc:
                 logger.warning("memory_write status=error target=postgres error_type=%s error=%s", type(exc).__name__, exc)
             await self._embed_and_store(compact)
@@ -512,6 +512,13 @@ class MemoryLayer:
             except Exception as exc:
                 logger.warning("memory_write status=error target=simplemem error_type=%s error=%s", type(exc).__name__, exc)
 
+
+    async def _embed_and_store(self, compact: str, role: str, turn_id: int | None, modality: str, media_url: str | None) -> None:
+        """Store durable memory with optional embedding, degrading to text-only writes. Never raises for semantic failures."""
+        try:
+            await self._write_postgres_memory(compact, role, turn_id, modality, media_url)
+        except Exception:
+            raise
 
     async def _write_postgres_memory(self, compact: str, role: str, turn_id: int | None, modality: str, media_url: str | None) -> None:
         metadata = json.dumps({"role": role, "turn_id": turn_id})

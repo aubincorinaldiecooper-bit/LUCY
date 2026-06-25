@@ -261,6 +261,39 @@ class MemoryLayerWriteTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(*list(layer._background_tasks))
         self.assertEqual(written, [])
 
+    async def test_remember_calls_embed_and_store_without_unhandled_exception(self):
+        layer, _ = make_layer()
+        calls = []
+
+        async def fake_embed_and_store(compact, role, turn_id, modality, media_url):
+            calls.append((compact, role, turn_id, modality, media_url))
+
+        layer._embed_and_store = fake_embed_and_store
+        await layer._remember("user", "hello", 8, "text", None)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("User said: hello", calls[0][0])
+
+    async def test_embed_and_store_semantic_failure_falls_back_to_text_write(self):
+        written = []
+
+        def reader(sql, params):
+            if "pg_extension" in sql:
+                return [(True,)]
+            return []
+
+        layer = MemoryLayer(
+            MemoryIdentity(guest_id="g"),
+            db_url="postgresql://fake",
+            simplemem_factory=lambda index_dir: FakeSimpleMem(),
+            db_reader=reader,
+            db_writer=lambda sql, params: written.append((sql, params)),
+            embedder=lambda text: (_ for _ in ()).throw(RuntimeError("embedding down")),
+            vector_enabled=True,
+        )
+        await layer._embed_and_store("User said: fallback", "user", 9, "text", None)
+        self.assertEqual(len(written), 1)
+        self.assertNotIn("embedding", written[0][0])
+
     async def test_remember_writes_pgvector_embedding_when_available(self):
         written = []
 
