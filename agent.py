@@ -99,7 +99,12 @@ from transcript_context import (
     transcript_context_llm_model,
     transcript_context_llm_timeout_ms,
 )
-from voice_interruption import classify_tail_outcome, is_audible_cutoff
+from voice_interruption import (
+    classify_tail_outcome,
+    is_audible_cutoff,
+    peak_dbfs,
+    tail_ends_in_silence,
+)
 from omnivoice_tts import OmniVoiceConfig, OmniVoiceTTS, find_omnivoice_tts
 from omnivoice_voice_pool import get_session_selector
 from omnivoice_language import detect_language_request, language_name
@@ -833,6 +838,10 @@ def _record_hume_speech_audio_frame(coverage: HumeSpeechAudioCoverage | None, va
     if coverage.first_frame_at is None:
         coverage.first_frame_at = now
     coverage.last_frame_at = now
+    # Keep a rolling tail buffer (~last 1s mono int16) for end-of-speech silence
+    # analysis. Cheap and independent of WAV capture.
+    tail_cap = 96_000
+    coverage.tail_pcm = (coverage.tail_pcm + pcm)[-tail_cap:]
     if coverage.capture_chunks is not None and not coverage.capture_truncated:
         max_bytes = _hume_wav_artifact_max_bytes()
         captured_so_far = sum(len(chunk) for chunk in coverage.capture_chunks)
@@ -846,6 +855,39 @@ def _hume_generated_audio_duration_seconds(coverage: HumeSpeechAudioCoverage | N
     if coverage is None or coverage.sample_rate <= 0:
         return None
     return coverage.sample_count / coverage.sample_rate
+
+
+def _hume_tail_audio_analysis(coverage: HumeSpeechAudioCoverage | None, *, window_ms: int = 200) -> dict | None:
+    """Measure the trailing window of the synthesized PCM to tell whether the
+    audio ends in silence (clean decay -> any perceived cut is downstream of
+    synthesis) or on a loud sample (the TTS itself returned a clipped tail).
+    Best-effort; returns None if there is no usable PCM."""
+    if coverage is None or not coverage.tail_pcm:
+        return None
+    sample_rate = coverage.sample_rate or 48000
+    num_channels = coverage.num_channels or 1
+    try:
+        import array
+
+        samples = array.array("h")
+        # int16 frames; ensure even byte length before parsing.
+        raw = coverage.tail_pcm
+        if len(raw) % 2:
+            raw = raw[:-1]
+        samples.frombytes(raw)
+        if not samples:
+            return None
+        window_samples = max(1, int(sample_rate * num_channels * window_ms / 1000))
+        window = samples[-window_samples:]
+        peak = max((abs(s) for s in window), default=0)
+    except Exception:
+        return None
+    return {
+        "window_ms": window_ms,
+        "tail_peak_amplitude": peak,
+        "tail_peak_dbfs": peak_dbfs(peak),
+        "tail_ends_in_silence": tail_ends_in_silence(peak),
+    }
 
 
 def _write_hume_wav_artifact(coverage: HumeSpeechAudioCoverage) -> str | None:
@@ -902,6 +944,26 @@ def _finalize_hume_speech_audio_coverage(coverage: HumeSpeechAudioCoverage | Non
         coverage.capture_truncated,
         error_type,
     )
+    tail_analysis = _hume_tail_audio_analysis(coverage)
+    if tail_analysis is not None:
+        # ends_in_silence=true  -> synthesis tail is intact; a perceived clip is
+        #                          downstream (client playout / device).
+        # ends_in_silence=false -> the TTS returned audio that ends mid-word
+        #                          (the clip is in synthesis itself).
+        logger.info(
+            "assistant_tail_audio_check speech_id=%s turn_id=%s tail_window_ms=%s "
+            "tail_peak_amplitude=%s tail_peak_dbfs=%.1f tail_ends_in_silence=%s "
+            "synthesis_tail_intact=%s likely_clip_source=%s wav_artifact_path=%s",
+            coverage.speech_id,
+            coverage.turn_id,
+            tail_analysis["window_ms"],
+            tail_analysis["tail_peak_amplitude"],
+            tail_analysis["tail_peak_dbfs"],
+            tail_analysis["tail_ends_in_silence"],
+            tail_analysis["tail_ends_in_silence"],
+            "downstream_playout" if tail_analysis["tail_ends_in_silence"] else "tts_synthesis",
+            artifact_path or "none",
+        )
     return coverage
 
 
@@ -4244,6 +4306,11 @@ class HumeSpeechAudioCoverage:
     capture_chunks: list[bytes] | None = None
     capture_truncated: bool = False
     artifact_path: str | None = None
+    # Rolling buffer of the most recent PCM (int16) so we can analyze whether the
+    # synthesized audio ends in silence (tail intact) or is clipped mid-word.
+    # Kept independent of WAV capture so the tail check works even when capture
+    # is disabled. Capped so long speeches don't grow memory.
+    tail_pcm: bytes = b""
 
 
 def _normalized_words(text: str) -> list[str]:

@@ -194,3 +194,31 @@ def classify_tail_outcome(
 def is_audible_cutoff(outcome: str) -> bool:
     """Only a likely tail cut is a real user-facing audible cutoff."""
     return outcome == LIKELY_TAIL_CUT
+
+
+# --- synthesized-audio tail analysis ---
+# When the server hands the full audio to playout (playout >= generated, handle
+# not interrupted) yet the user still hears a clipped tail, the cut is either in
+# synthesis (the TTS returned audio that ends mid-word) or downstream (client
+# playout). These two are distinguishable by looking at the END of the
+# synthesized PCM: speech that finishes cleanly trails into n= silence; speech
+# the TTS clipped ends on a loud (non-silent) sample.
+
+INT16_FULL_SCALE = 32768
+
+
+def peak_dbfs(peak_amplitude: int, *, full_scale: int = INT16_FULL_SCALE) -> float:
+    """dBFS of a peak sample amplitude. Returns -inf for pure silence."""
+    import math
+
+    if peak_amplitude <= 0:
+        return float("-inf")
+    return 20.0 * math.log10(min(peak_amplitude, full_scale) / float(full_scale))
+
+
+def tail_ends_in_silence(peak_amplitude: int, *, silence_dbfs: float = -40.0,
+                         full_scale: int = INT16_FULL_SCALE) -> bool:
+    """True if the trailing audio window is quiet enough to be a natural decay
+    into silence (tail intact). A loud final window means the synthesized audio
+    was clipped mid-word."""
+    return peak_dbfs(peak_amplitude, full_scale=full_scale) < silence_dbfs

@@ -118,6 +118,27 @@ class TailOutcomeTests(unittest.TestCase):
         self.assertFalse(vi.is_audible_cutoff(out))
 
 
+class TailAudioSilenceTests(unittest.TestCase):
+    def test_silent_tail_is_silence(self):
+        # near-zero trailing amplitude -> clean decay, synthesis tail intact
+        self.assertTrue(vi.tail_ends_in_silence(50))
+        self.assertLess(vi.peak_dbfs(50), -40.0)
+
+    def test_loud_tail_is_not_silence(self):
+        # loud final sample -> TTS clipped mid-word
+        self.assertFalse(vi.tail_ends_in_silence(20000))
+        self.assertGreater(vi.peak_dbfs(20000), -40.0)
+
+    def test_pure_silence_is_negative_infinity(self):
+        self.assertEqual(vi.peak_dbfs(0), float("-inf"))
+        self.assertTrue(vi.tail_ends_in_silence(0))
+
+    def test_threshold_is_configurable(self):
+        # 327 ~= -40 dBFS at int16 full scale; raising the bar flips the verdict
+        self.assertTrue(vi.tail_ends_in_silence(300))
+        self.assertFalse(vi.tail_ends_in_silence(300, silence_dbfs=-50.0))
+
+
 class TurnDetectionResolveTests(unittest.TestCase):
     def test_audio_is_invalid_resolves_to_vad(self):
         resolved, ok = vi.resolve_turn_detection_mode("audio")
