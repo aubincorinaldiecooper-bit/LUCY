@@ -99,6 +99,7 @@ from transcript_context import (
     transcript_context_llm_model,
     transcript_context_llm_timeout_ms,
 )
+from voice_interruption import classify_tail_outcome, is_audible_cutoff
 from omnivoice_tts import OmniVoiceConfig, OmniVoiceTTS, find_omnivoice_tts
 from omnivoice_voice_pool import get_session_selector
 from omnivoice_language import detect_language_request, language_name
@@ -1978,6 +1979,47 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                         was_suppressed,
                         hume_coverage.artifact_path or "none",
                     )
+                # Tail outcome: classify what actually happened from playout timing +
+                # audio lifecycle, instead of treating every interrupted=True as a
+                # cutoff. Audio fully played (playout >= generated) means an
+                # interruption landed after the tail, not a real cut.
+                _audio_fully_played = (
+                    generated_duration is not None
+                    and speech_duration_seconds is not None
+                    and speech_duration_seconds >= 0
+                    and (speech_duration_seconds + 0.1) >= generated_duration
+                )
+                _tail_outcome = classify_tail_outcome(
+                    generated_audio_duration_s=generated_duration,
+                    playout_started_at=speaking_at,
+                    playout_completed_at=(
+                        listening_at if (not effective_interrupted or _audio_fully_played) else None
+                    ),
+                    interrupted_at=(listening_at if effective_interrupted else None),
+                    interrupted=bool(effective_interrupted),
+                    was_stale=bool(was_stale),
+                    was_active=bool(was_active),
+                    hume_requests_during_speech=during_count if during_count and during_count > 0 else 0,
+                )
+                logger.info(
+                    "assistant_speech_tail_outcome speech_id=%s generated_audio_duration_seconds=%s "
+                    "playout_started_at=%s playout_completed_at=%s interrupted_at=%s interrupted=%s "
+                    "fsm_observed_interrupted=%s handle_interrupted=%s was_stale=%s was_active=%s "
+                    "hume_requests_during_speech=%s tail_outcome=%s audible_cutoff=%s",
+                    done_id,
+                    _fmt_seconds(generated_duration),
+                    _fmt_seconds(speaking_at) if speaking_at is not None else "none",
+                    _fmt_seconds(listening_at) if listening_at is not None else "none",
+                    _fmt_seconds(listening_at) if effective_interrupted and listening_at is not None else "none",
+                    effective_interrupted,
+                    fsm_observed_interrupted,
+                    interrupted,
+                    was_stale,
+                    was_active,
+                    during_count,
+                    _tail_outcome,
+                    is_audible_cutoff(_tail_outcome),
+                )
                 logger.info(
                     "Assistant handoff timing: speech_id=%s speech_duration_seconds=%.3f agent_speaking_to_finished_seconds=%.3f finish_to_agent_listening_seconds=%.3f interrupted=%s was_suppressed=%s active_count=%s",
                     done_id,
@@ -3202,6 +3244,42 @@ def _log_memory_identity_readiness() -> None:
         "set MEMORY_ENABLED=true and a shared SESSION_IDENTITY_SHARED_SECRET on both "
         "frontend+backend for per-user cross-session memory; simplemem optional "
         "(falls back to Postgres recency)",
+    )
+    # Semantic-memory / embedding readiness + the active fallback mode.
+    try:
+        from memory_layer import (
+            memory_embedding_dimensions,
+            memory_embedding_model,
+            memory_vector_enabled,
+        )
+        semantic_on = memory_vector_enabled()
+        embed_model = memory_embedding_model()
+        embed_dim = memory_embedding_dimensions()
+    except Exception:  # noqa: BLE001 - readiness check must never raise
+        semantic_on, embed_model, embed_dim = False, "unknown", 0
+    provider = (os.getenv("MEMORY_EMBEDDING_PROVIDER") or "openai").strip().lower()
+    key_present = bool(
+        (os.getenv("COHERE_API_KEY") if provider == "cohere" else os.getenv("OPENAI_API_KEY"))
+    )
+    if not memory_enabled():
+        fallback_mode = "disabled"
+    elif semantic_on and key_present:
+        fallback_mode = "semantic_pgvector"
+    elif simplemem_installed:
+        fallback_mode = "simplemem"
+    else:
+        fallback_mode = "recency_text"
+    logger.info(
+        "memory_semantic_readiness: semantic_memory_enabled=%s embedding_provider=%s "
+        "embedding_model=%s embedding_dim=%s embedding_key_present=%s "
+        "simplemem_active=%s memory_fallback_mode=%s",
+        semantic_on,
+        provider,
+        embed_model,
+        embed_dim,
+        key_present,
+        simplemem_installed,
+        fallback_mode,
     )
 
 
@@ -4525,6 +4603,36 @@ def _persist_calibration_moment(moment: dict[str, Any]) -> None:
         )
 
 
+def _remember_calibration_pattern(moment: dict[str, Any]) -> None:
+    """Store a confirmed calibration moment in durable per-user memory so a
+    returning signed-in user's confirmed emotional patterns inform future sessions
+    via the normal memory preload. Best-effort; never raises. Guests are scoped to
+    the room (per-session) so this only persists across sessions for accounts."""
+    if not moment.get("user_confirmed_or_corrected") or _active_memory_layer is None:
+        return
+    transcript = (moment.get("transcript") or "").strip()
+    question = (moment.get("arche_question") or "").strip()
+    answer = (moment.get("user_answer") or "").strip()
+    content = (
+        f"{EMOTIONAL_PATTERN_PREFIX}when processing \"{transcript[:160]}\", "
+        f"you asked \"{question}\" and they said: \"{answer[:200]}\"."
+    )
+    try:
+        turn_raw = str(moment.get("turn_id") or "")
+        _active_memory_layer.schedule_remember(
+            role="emotional_calibration",
+            content=content,
+            turn_id=int(turn_raw) if turn_raw.isdigit() else None,
+        )
+        logger.info("emotional_calibration_pattern_remembered=true turn_id=%s", moment.get("turn_id"))
+    except Exception as exc:
+        logger.warning(
+            "emotional_calibration_pattern_remember_failed=true error_type=%s error=%s",
+            type(exc).__name__,
+            _redact_sensitive_text(exc),
+        )
+
+
 def _complete_pending_calibration_moment(user_answer: str) -> None:
     global _pending_calibration_moment
     if _pending_calibration_moment is None:
@@ -4534,6 +4642,7 @@ def _complete_pending_calibration_moment(user_answer: str) -> None:
     moment["user_confirmed_or_corrected"] = bool(user_answer.strip())
     _calibration_moments.append(moment)
     _persist_calibration_moment(moment)
+    _remember_calibration_pattern(moment)
     logger.info(
         "emotional_calibration_moment_stored=true turn_id=%s session_id=%s user_answer_present=%s total_moments=%s",
         moment.get("turn_id"),
@@ -7712,9 +7821,13 @@ async def entrypoint(ctx: JobContext):
         "min_words": int(os.getenv("LIVEKIT_INTERRUPTION_MIN_WORDS", "2")),
         "min_duration": float(os.getenv("LIVEKIT_INTERRUPTION_MIN_DURATION", "0.65")),
         "resume_false_interruption": env_bool("LIVEKIT_RESUME_FALSE_INTERRUPTION", True),
-        "false_interruption_timeout": float(os.getenv("LIVEKIT_FALSE_INTERRUPTION_TIMEOUT", "1.8")),
+        "false_interruption_timeout": float(os.getenv("LIVEKIT_FALSE_INTERRUPTION_TIMEOUT", "1.0")),
     }
-    logger.info("Resolved interruption config: %s", interruption_options)
+    logger.info(
+        "Resolved interruption config: %s resume_false_interruption_active=%s",
+        interruption_options,
+        interruption_options.get("resume_false_interruption") and interruption_options.get("enabled"),
+    )
     endpointing_mode = os.getenv("LIVEKIT_ENDPOINTING_MODE", "dynamic")
     endpointing_min_delay = float(os.getenv("ENDPOINTING_MIN_DELAY_SECONDS", os.getenv("LIVEKIT_ENDPOINTING_MIN_DELAY", "1.1")))
     endpointing_max_delay = float(os.getenv("ENDPOINTING_MAX_DELAY_SECONDS", os.getenv("LIVEKIT_ENDPOINTING_MAX_DELAY", "2.4")))
