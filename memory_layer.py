@@ -241,13 +241,6 @@ class MemoryLayer:
         self._simplemem: Any = None
         self._simplemem_status = "not_initialized"
         self._background_tasks: set[asyncio.Task] = set()
-        # pgvector semantic recall: embed memories on write and find the most
-        # relevant (not just most recent) on retrieve. Off unless enabled + a key.
-        self._semantic_enabled = (
-            semantic_retrieval_enabled() if semantic_enabled is None else semantic_enabled
-        )
-        self._embed_fn = embed_fn or embed_text
-        self._semantic_timeout_ms = semantic_timeout_ms()
 
     # ---------- backends ----------
 
@@ -491,16 +484,35 @@ class MemoryLayer:
             return
         task = loop.create_task(self._remember(role=role, content=content, turn_id=turn_id, modality=modality, media_url=media_url))
         self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
+
+        def _on_done(t: "asyncio.Task") -> None:
+            self._background_tasks.discard(t)
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                # Last line of defense: retrieve+log so a background memory write can
+                # never surface as an unhandled task exception or touch the voice loop.
+                logger.warning(
+                    "memory_background_task_failed=true role=%s turn_id=%s modality=%s fallback=recency error_type=%s error=%s",
+                    role, turn_id, modality, type(exc).__name__, exc,
+                )
+
+        task.add_done_callback(_on_done)
 
     async def _remember(self, role: str, content: str, turn_id: int | None, modality: str, media_url: str | None) -> None:
         compact = f"{'User said' if role == 'user' else 'Lucy replied'}: {content}"
         if self._db_url:
+            # Single durable write (pgvector if available, else text). Never re-run:
+            # a duplicate call here previously threw an uncaught TypeError (missing
+            # args) and crashed the background task. Failures degrade to recency.
             try:
                 await self._embed_and_store(compact, role, turn_id, modality, media_url)
             except Exception as exc:
-                logger.warning("memory_write status=error target=postgres error_type=%s error=%s", type(exc).__name__, exc)
-            await self._embed_and_store(compact)
+                logger.warning(
+                    "memory_write status=error target=postgres role=%s turn_id=%s modality=%s fallback=recency error_type=%s error=%s",
+                    role, turn_id, modality, type(exc).__name__, exc,
+                )
         backend = self._get_simplemem()
         if backend is not None:
             try:
@@ -510,15 +522,26 @@ class MemoryLayer:
                 else:
                     await asyncio.to_thread(backend.add_text, compact, tags)
             except Exception as exc:
-                logger.warning("memory_write status=error target=simplemem error_type=%s error=%s", type(exc).__name__, exc)
+                logger.warning(
+                    "memory_write status=error target=simplemem role=%s turn_id=%s error_type=%s error=%s",
+                    role, turn_id, type(exc).__name__, exc,
+                )
 
 
     async def _embed_and_store(self, compact: str, role: str, turn_id: int | None, modality: str, media_url: str | None) -> None:
-        """Store durable memory with optional embedding, degrading to text-only writes. Never raises for semantic failures."""
+        """Store durable memory with optional embedding, degrading to text-only writes.
+
+        Never raises: semantic/embedding/pgvector failures fall back to a durable
+        text insert inside _write_postgres_memory, and a total write failure is
+        logged (recency recall remains the safe fallback). Kept on MemoryLayer with
+        this exact signature because _remember() calls it positionally."""
         try:
             await self._write_postgres_memory(compact, role, turn_id, modality, media_url)
-        except Exception:
-            raise
+        except Exception as exc:
+            logger.warning(
+                "memory_embed_and_store status=error role=%s turn_id=%s modality=%s fallback=recency error_type=%s error=%s",
+                role, turn_id, modality, type(exc).__name__, exc,
+            )
 
     async def _write_postgres_memory(self, compact: str, role: str, turn_id: int | None, modality: str, media_url: str | None) -> None:
         metadata = json.dumps({"role": role, "turn_id": turn_id})
