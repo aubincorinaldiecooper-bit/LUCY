@@ -16,6 +16,10 @@ dependencies = [
   # shadow (and the Hume TTS path). Declared explicitly so a clean install/CI has
   # it rather than relying on it arriving transitively.
   "aiohttp>=3.9",
+  # Default embeddings provider for semantic memory recall (pgvector). Lightweight
+  # SDK (httpx/pydantic, no ML libs). OpenAI embeddings use the already-present
+  # openai SDK, so no extra dep there.
+  "cohere>=5",
 ]
 
 [project.optional-dependencies]

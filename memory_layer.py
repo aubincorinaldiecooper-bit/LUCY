@@ -322,7 +322,7 @@ class MemoryLayer:
         started_at = time.monotonic()
 
         async def _run() -> list[str]:
-            vector = await self._embed_fn(query)
+            vector = await self._embed_fn(query, input_type="search_query")
             if not vector:
                 raise _SemanticUnavailable("no_embedding")
             rows = await asyncio.to_thread(
@@ -434,7 +434,7 @@ class MemoryLayer:
         if not self._semantic_enabled or not self._db_url:
             return
         try:
-            vector = await self._embed_fn(compact)
+            vector = await self._embed_fn(compact, input_type="search_document")
             if not vector:
                 return
             await asyncio.to_thread(

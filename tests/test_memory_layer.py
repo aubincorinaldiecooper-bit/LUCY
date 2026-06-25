@@ -258,7 +258,7 @@ class SemanticMemoryTests(unittest.IsolatedAsyncioTestCase):
     def _layer(self, *, embed_vec, reader_rows=None, writer_calls=None, enabled=True):
         import memory_layer as ml
 
-        async def _embed(text):
+        async def _embed(text, **_):
             return embed_vec
 
         def _reader(sql, params):
@@ -294,7 +294,7 @@ class SemanticMemoryTests(unittest.IsolatedAsyncioTestCase):
     async def test_db_error_falls_back(self):
         import memory_layer as ml
 
-        async def _embed(_):
+        async def _embed(_, **__):
             return [0.5]
 
         def _reader(sql, params):
