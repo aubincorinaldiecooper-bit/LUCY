@@ -1245,6 +1245,8 @@ def attach_session_diagnostics(session: AgentSession) -> None:
     speech_latency_audits: dict[str, dict[str, float | int | str | None]] = {}
     assistant_speech_turn_ids: dict[str, int] = {}
     assistant_speech_llm_turn_ids: dict[str, int] = {}
+    active_speech_interrupted_at: dict[str, float] = {}
+    last_assistant_speech_outcome: dict[str, object] | None = None
 
     def _resolve_speech_handle(event_or_handle: object) -> object:
         for attr in ("speech_handle", "handle", "speech"):
@@ -1855,7 +1857,7 @@ def attach_session_diagnostics(session: AgentSession) -> None:
         add_done_callback = getattr(resolved_handle, "add_done_callback", None)
         if callable(add_done_callback):
             def _on_done(done_event_or_handle: object) -> None:
-                nonlocal pending_user_handoff_speech_id
+                nonlocal pending_user_handoff_speech_id, last_assistant_speech_outcome
                 global _latest_active_assistant_count_for_hume
                 done_resolved_handle = _resolve_speech_handle(done_event_or_handle)
                 done_id = _speech_id(done_resolved_handle)
@@ -1957,6 +1959,8 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                     latest_user_state,
                 )
                 hume_coverage = _hume_speech_audio_coverages.pop(done_id, None)
+                generated_duration = None
+                generated_bytes = getattr(hume_coverage, "byte_count", None) if hume_coverage is not None else None
                 if hume_coverage is not None:
                     generated_duration = _hume_generated_audio_duration_seconds(hume_coverage)
                     playout_duration = speech_duration_seconds if speech_duration_seconds >= 0 else None
@@ -2010,6 +2014,36 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                 start_count = hume_request_count_at_speech_start.get(done_id, -1)
                 finish_count = hume_request_count_at_speech_finish.get(done_id, _hume_tts_request_counter)
                 hume_requests_during = finish_count - start_count if start_count >= 0 and finish_count >= 0 else -1
+                interruption_at = active_speech_interrupted_at.pop(done_id, None)
+                tail_outcome = _classify_assistant_tail_outcome(
+                    interrupted=bool(effective_interrupted),
+                    interruption_at=interruption_at,
+                    playout_started_at=speaking_at,
+                    playout_completed_at=finished_at if produced_audio else None,
+                    generated_audio_duration_seconds=generated_duration,
+                    hume_requests_during_speech=hume_requests_during,
+                )
+                playout_duration_for_report = speech_duration_seconds if speech_duration_seconds >= 0 else None
+                last_assistant_speech_outcome = {
+                    "previous_speech_id": done_id,
+                    "generated_audio_duration_seconds": generated_duration,
+                    "playout_duration_seconds": playout_duration_for_report,
+                    "interrupted": bool(effective_interrupted),
+                    **tail_outcome,
+                }
+                logger.info(
+                    "assistant_tail_diagnostic speech_id=%s generated_audio_duration_seconds=%s playout_duration_seconds=%s interrupted=%s interruption_before_playout_complete=%s interruption_after_playout_complete=%s assistant_playout_completed_normally=%s assistant_tail_cut_likely=%s interruption_timing=%s suppressed_or_ghost_handle=%s",
+                    done_id,
+                    _fmt_seconds(generated_duration),
+                    _fmt_seconds(playout_duration_for_report),
+                    bool(effective_interrupted),
+                    tail_outcome["interruption_before_playout_complete"],
+                    tail_outcome["interruption_after_playout_complete"],
+                    tail_outcome["assistant_playout_completed_normally"],
+                    tail_outcome["assistant_tail_cut_likely"],
+                    tail_outcome["interruption_timing"],
+                    tail_outcome["suppressed_or_ghost_handle"],
+                )
                 base_audit = speech_latency_audit or {}
                 latency_audit = _build_voice_latency_audit(
                     turn_id=int(base_audit.get("turn_id", _current_turn_id) or _current_turn_id),
@@ -2146,6 +2180,15 @@ def attach_session_diagnostics(session: AgentSession) -> None:
             last_user_listening_at = latest_user_state_timestamp
         if latest_user_state == "speaking":
             pre_state = _interaction_state.state
+            interrupted_ids = set(active_speech_handles.keys())
+            active_fsm_speech_id = getattr(_interaction_state, "active_speech_id", None)
+            if active_fsm_speech_id:
+                interrupted_ids.add(active_fsm_speech_id)
+            current_speech = getattr(session, "current_speech", None)
+            if current_speech is not None:
+                interrupted_ids.add(_speech_id(current_speech))
+            for interrupted_id in interrupted_ids:
+                active_speech_interrupted_at.setdefault(interrupted_id, latest_user_state_timestamp)
             _record_audio_env_event("speech_start", latest_user_state_timestamp)
             _interaction_state.on_user_speech_started()
             # Latch a barge-in that begins while the assistant is still thinking
@@ -2295,6 +2338,18 @@ def attach_session_diagnostics(session: AgentSession) -> None:
             return
         logger.info("Conversation item added: role=%s interrupted=%s", role, interrupted)
         if str(role).strip().lower() == "user":
+            feedback = _user_feedback_marker(_extract_text_for_debug(target))
+            if feedback and last_assistant_speech_outcome is not None:
+                logger.info(
+                    "assistant_tail_user_feedback_report user_feedback=%s previous_speech_id=%s generated_audio_duration_seconds=%s playout_duration_seconds=%s interrupted=%s interruption_timing=%s assistant_tail_cut_likely=%s",
+                    feedback,
+                    last_assistant_speech_outcome.get("previous_speech_id", "n/a"),
+                    _fmt_seconds(last_assistant_speech_outcome.get("generated_audio_duration_seconds")),
+                    _fmt_seconds(last_assistant_speech_outcome.get("playout_duration_seconds")),
+                    last_assistant_speech_outcome.get("interrupted"),
+                    last_assistant_speech_outcome.get("interruption_timing"),
+                    last_assistant_speech_outcome.get("assistant_tail_cut_likely"),
+                )
             _reset_search_state_for_turn()
             logger.info("Search state reset for new user turn: search_in_progress=%s search_tool_called=%s", _search_in_progress, _search_tool_called)
 
@@ -2566,6 +2621,81 @@ def _effective_interruption_for_speech(
     if was_stale and not produced_audio:
         return False
     return _effective_interruption(handle_interrupted, fsm_observed_interrupted)
+
+
+def _classify_assistant_tail_outcome(
+    *,
+    interrupted: bool,
+    interruption_at: float | None,
+    playout_started_at: float | None,
+    playout_completed_at: float | None,
+    generated_audio_duration_seconds: float | None,
+    hume_requests_during_speech: int | None,
+) -> dict[str, object]:
+    hume_request_count_allows_audio = hume_requests_during_speech is None or hume_requests_during_speech != 0
+    produced_hume_audio = hume_request_count_allows_audio and bool(
+        generated_audio_duration_seconds and generated_audio_duration_seconds > 0
+    )
+    if not produced_hume_audio:
+        return {
+            "interruption_before_playout_complete": False,
+            "interruption_after_playout_complete": False,
+            "assistant_playout_completed_normally": False,
+            "assistant_tail_cut_likely": False,
+            "interruption_timing": "none",
+            "suppressed_or_ghost_handle": True,
+        }
+    estimated_generated_end = None
+    if playout_started_at is not None and generated_audio_duration_seconds is not None:
+        estimated_generated_end = playout_started_at + generated_audio_duration_seconds
+    completion_boundary = playout_completed_at if playout_completed_at is not None else estimated_generated_end
+    interruption_before = False
+    interruption_after = False
+    timing = "none"
+    if interrupted and interruption_at is not None and completion_boundary is not None:
+        # Small tolerance prevents a final VAD edge at the exact end from being
+        # misread as a user-facing tail cut.
+        if interruption_at < (completion_boundary - 0.05):
+            interruption_before = True
+            timing = "before_playout_complete"
+        else:
+            interruption_after = True
+            timing = "after_playout_complete"
+    elif interrupted:
+        timing = "before_playout_complete" if playout_completed_at is None else "after_playout_complete"
+        interruption_before = timing == "before_playout_complete"
+        interruption_after = timing == "after_playout_complete"
+    completed_normally = produced_hume_audio and not interruption_before
+    return {
+        "interruption_before_playout_complete": interruption_before,
+        "interruption_after_playout_complete": interruption_after,
+        "assistant_playout_completed_normally": completed_normally,
+        "assistant_tail_cut_likely": interruption_before,
+        "interruption_timing": timing,
+        "suppressed_or_ghost_handle": False,
+    }
+
+
+def _user_feedback_marker(text: str) -> str | None:
+    lowered = (text or "").strip().lower()
+    if not lowered:
+        return None
+    clean_patterns = (
+        "no cutoff",
+        "no cut off",
+        "ended clean",
+        "ended cleanly",
+        "didn't sound like a tail",
+        "did not sound like a tail",
+        "wasn't cut off",
+        "was not cut off",
+    )
+    if any(pattern in lowered for pattern in clean_patterns):
+        return "clean"
+    cutoff_patterns = ("hard clip", "cutoff", "cut off", "tail response", "tail end")
+    if any(pattern in lowered for pattern in cutoff_patterns):
+        return "cutoff"
+    return None
 
 
 def _ledger_downgrade_reason_for_outcome(
@@ -7579,9 +7709,9 @@ async def entrypoint(ctx: JobContext):
 
     interruption_options: InterruptionOptions = {
         "enabled": env_bool("LIVEKIT_INTERRUPTION_ENABLED", True),
-        "min_words": int(os.getenv("LIVEKIT_INTERRUPTION_MIN_WORDS", "1")),
-        "min_duration": float(os.getenv("LIVEKIT_INTERRUPTION_MIN_DURATION", "0.6")),
-        "resume_false_interruption": env_bool("LIVEKIT_RESUME_FALSE_INTERRUPTION", False),
+        "min_words": int(os.getenv("LIVEKIT_INTERRUPTION_MIN_WORDS", "2")),
+        "min_duration": float(os.getenv("LIVEKIT_INTERRUPTION_MIN_DURATION", "0.65")),
+        "resume_false_interruption": env_bool("LIVEKIT_RESUME_FALSE_INTERRUPTION", True),
         "false_interruption_timeout": float(os.getenv("LIVEKIT_FALSE_INTERRUPTION_TIMEOUT", "1.8")),
     }
     logger.info("Resolved interruption config: %s", interruption_options)

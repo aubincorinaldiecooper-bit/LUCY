@@ -858,6 +858,48 @@ class InterruptionLedgerTests(unittest.TestCase):
         self.assertTrue(entry["suppressed"])
         self.assertEqual(agent._ledger_recent_canonical(5), [])
 
+    def test_tail_outcome_before_playout_complete_is_likely_cut(self):
+        outcome = agent._classify_assistant_tail_outcome(
+            interrupted=True,
+            interruption_at=10.5,
+            playout_started_at=10.0,
+            playout_completed_at=None,
+            generated_audio_duration_seconds=2.0,
+            hume_requests_during_speech=1,
+        )
+        self.assertTrue(outcome["interruption_before_playout_complete"])
+        self.assertTrue(outcome["assistant_tail_cut_likely"])
+        self.assertEqual(outcome["interruption_timing"], "before_playout_complete")
+
+    def test_tail_outcome_after_playout_complete_is_clean(self):
+        outcome = agent._classify_assistant_tail_outcome(
+            interrupted=True,
+            interruption_at=12.2,
+            playout_started_at=10.0,
+            playout_completed_at=12.0,
+            generated_audio_duration_seconds=2.0,
+            hume_requests_during_speech=1,
+        )
+        self.assertTrue(outcome["interruption_after_playout_complete"])
+        self.assertTrue(outcome["assistant_playout_completed_normally"])
+        self.assertFalse(outcome["assistant_tail_cut_likely"])
+
+    def test_tail_outcome_ghost_handle_is_not_cutoff(self):
+        outcome = agent._classify_assistant_tail_outcome(
+            interrupted=True,
+            interruption_at=12.0,
+            playout_started_at=None,
+            playout_completed_at=None,
+            generated_audio_duration_seconds=None,
+            hume_requests_during_speech=0,
+        )
+        self.assertTrue(outcome["suppressed_or_ghost_handle"])
+        self.assertFalse(outcome["assistant_tail_cut_likely"])
+
+    def test_user_feedback_marker_prefers_clean_no_cutoff(self):
+        self.assertEqual(agent._user_feedback_marker("There was no cutoff."), "clean")
+        self.assertEqual(agent._user_feedback_marker("It was another hard clip of your tail response."), "cutoff")
+
     def test_stale_zero_audio_speech_is_not_effective_interruption(self):
         self.assertFalse(
             agent._effective_interruption_for_speech(
