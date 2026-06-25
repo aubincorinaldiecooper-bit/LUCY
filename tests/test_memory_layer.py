@@ -327,3 +327,31 @@ class MemoryConfigTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EmotionalPatternPreloadTests(unittest.TestCase):
+    def test_partition_splits_by_prefix(self):
+        import memory_layer as ml
+        mems = [
+            "They are training for a marathon.",
+            ml.EMOTIONAL_PATTERN_PREFIX + "you asked X and they said pressure not fear.",
+            "  ",
+            "They prefer mornings.",
+        ]
+        general, emotional = ml.partition_emotional_patterns(mems)
+        self.assertEqual(general, ["They are training for a marathon.", "They prefer mornings."])
+        self.assertEqual(emotional, ["you asked X and they said pressure not fear."])
+
+    def test_emotional_note_is_private_and_safe(self):
+        import memory_layer as ml
+        note = ml.emotional_pattern_preload_note(["they framed it as disappointment, not anger"])
+        self.assertIsNotNone(note)
+        low = note.lower()
+        self.assertIn("never reveal", low)
+        self.assertIn("never tell them how they sound", low)
+        self.assertIn("disappointment", note)
+
+    def test_emotional_note_empty(self):
+        import memory_layer as ml
+        self.assertIsNone(ml.emotional_pattern_preload_note([]))
+        self.assertIsNone(ml.emotional_pattern_preload_note(["   "]))
