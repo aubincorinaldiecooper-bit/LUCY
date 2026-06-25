@@ -51,7 +51,7 @@ export function useVoiceClient(options?: { onServerDisconnect?: () => void }) {
   const remoteAudioElsRef = useRef<Set<HTMLMediaElement>>(new Set());
   const audioContextRef = useRef<AudioContext | null>(null);
   const gainNodeRef = useRef<GainNode | null>(null);
-  const mediaSourceNodesRef = useRef<Map<HTMLMediaElement, MediaElementAudioSourceNode>>(new Map());
+  const mediaSourceNodesRef = useRef<Map<HTMLMediaElement, AudioNode>>(new Map());
 
   const getRemoteAudioGain = useCallback(() => {
     const raw = Number.parseFloat(process.env.NEXT_PUBLIC_REMOTE_AUDIO_GAIN ?? "1.35");
@@ -59,10 +59,13 @@ export function useVoiceClient(options?: { onServerDisconnect?: () => void }) {
     return Math.max(1.0, Math.min(2.0, raw));
   }, []);
 
-  const setupAudioGainForElement = useCallback((audioElement: HTMLMediaElement) => {
+  const setupAudioGainForTrack = useCallback((track: RemoteTrack, audioElement: HTMLMediaElement) => {
     if (typeof window === "undefined") return;
     const AudioContextCtor = window.AudioContext || (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
     if (!AudioContextCtor) return;
+
+    const mediaStreamTrack = track.mediaStreamTrack;
+    if (!mediaStreamTrack) return;
 
     try {
       const audioContext = audioContextRef.current ?? new AudioContextCtor();
@@ -76,9 +79,17 @@ export function useVoiceClient(options?: { onServerDisconnect?: () => void }) {
       }
       gainNode.gain.value = getRemoteAudioGain();
       if (!mediaSourceNodesRef.current.has(audioElement)) {
-        const sourceNode = audioContext.createMediaElementSource(audioElement);
+        // Tap the track's MediaStream directly instead of the <audio> element.
+        // createMediaElementSource inserts a media-element buffer whose
+        // end-of-stream handling clips the tail of each response (confirmed:
+        // server delivers full audio + trailing silence, cut is downstream).
+        // A MediaStreamAudioSourceNode plays the raw track and avoids that,
+        // while still allowing >1x gain. The element stays attached but muted
+        // only to keep the WebRTC audio pipeline pulling frames.
+        const sourceNode = audioContext.createMediaStreamSource(new MediaStream([mediaStreamTrack]));
         sourceNode.connect(gainNode);
         mediaSourceNodesRef.current.set(audioElement, sourceNode);
+        audioElement.muted = true;
       }
 
       if (audioContext.state === "suspended") {
@@ -187,7 +198,7 @@ export function useVoiceClient(options?: { onServerDisconnect?: () => void }) {
         audioElement.style.display = "none";
         document.body.appendChild(audioElement);
         remoteAudioElsRef.current.add(audioElement);
-        setupAudioGainForElement(audioElement);
+        setupAudioGainForTrack(track as RemoteTrack, audioElement);
         audioElement.play().catch((err) => {
           console.warn("Remote audio autoplay was blocked by the browser", err);
         });
@@ -218,7 +229,7 @@ export function useVoiceClient(options?: { onServerDisconnect?: () => void }) {
       setState("idle");
       roomRef.current = null;
     }
-  }, [clearRemoteAudioElements, cleanupAudioNodeForElement, isMuted, setupAudioGainForElement]);
+  }, [clearRemoteAudioElements, cleanupAudioNodeForElement, isMuted, setupAudioGainForTrack]);
 
   const toggleMute = useCallback(async () => {
     const next = !isMuted;
