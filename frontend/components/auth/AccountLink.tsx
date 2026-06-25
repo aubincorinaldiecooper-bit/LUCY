@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { authClient, useSession } from "@/lib/auth-client";
+import { signOutEverywhere, useSession } from "@/lib/auth-client";
 
 type Variant = "light" | "dark";
 
@@ -32,7 +32,7 @@ export default function AccountLink({ variant = "light" }: { variant?: Variant }
         <span className={`hidden sm:inline ${styles.email}`}>{session.user.email}</span>
         <button
           type="button"
-          onClick={() => authClient.signOut()}
+          onClick={() => signOutEverywhere()}
           className={`rounded-full px-4 py-1.5 transition-colors ${styles.pill}`}
         >
           Sign out
