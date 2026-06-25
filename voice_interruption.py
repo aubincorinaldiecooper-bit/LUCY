@@ -166,10 +166,15 @@ def classify_tail_outcome(
     if was_stale and not was_active:
         return STALE_CLEANUP_ONLY
 
-    produced_audio = (
+    # Generated audio duration (from Hume coverage) is the reliable signal that
+    # audio was synthesized and fed to playout. The Hume *request counter* is NOT
+    # reliable: it only increments when HUME HTTP debug is enabled, so in
+    # production it stays 0 even for multi-second speeches. Gating on it
+    # mislabels every real speech as a ghost handle and masks actual tail cuts.
+    # Treat it as a soft/supporting hint only.
+    produced_audio = playout_started_at is not None and (
         (generated_audio_duration_s or 0) > 0
-        and (hume_requests_during_speech or 0) > 0
-        and playout_started_at is not None
+        or (hume_requests_during_speech or 0) > 0
     )
     if not produced_audio:
         # No audio reached the user -> ghost handle, not an audible cutoff.
@@ -189,3 +194,31 @@ def classify_tail_outcome(
 def is_audible_cutoff(outcome: str) -> bool:
     """Only a likely tail cut is a real user-facing audible cutoff."""
     return outcome == LIKELY_TAIL_CUT
+
+
+# --- synthesized-audio tail analysis ---
+# When the server hands the full audio to playout (playout >= generated, handle
+# not interrupted) yet the user still hears a clipped tail, the cut is either in
+# synthesis (the TTS returned audio that ends mid-word) or downstream (client
+# playout). These two are distinguishable by looking at the END of the
+# synthesized PCM: speech that finishes cleanly trails into n= silence; speech
+# the TTS clipped ends on a loud (non-silent) sample.
+
+INT16_FULL_SCALE = 32768
+
+
+def peak_dbfs(peak_amplitude: int, *, full_scale: int = INT16_FULL_SCALE) -> float:
+    """dBFS of a peak sample amplitude. Returns -inf for pure silence."""
+    import math
+
+    if peak_amplitude <= 0:
+        return float("-inf")
+    return 20.0 * math.log10(min(peak_amplitude, full_scale) / float(full_scale))
+
+
+def tail_ends_in_silence(peak_amplitude: int, *, silence_dbfs: float = -40.0,
+                         full_scale: int = INT16_FULL_SCALE) -> bool:
+    """True if the trailing audio window is quiet enough to be a natural decay
+    into silence (tail intact). A loud final window means the synthesized audio
+    was clipped mid-word."""
+    return peak_dbfs(peak_amplitude, full_scale=full_scale) < silence_dbfs

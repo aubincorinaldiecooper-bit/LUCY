@@ -96,6 +96,48 @@ class TailOutcomeTests(unittest.TestCase):
         self.assertEqual(out, vi.STALE_CLEANUP_ONLY)
         self.assertFalse(vi.is_audible_cutoff(out))
 
+    def test_audio_produced_when_hume_counter_is_zero(self):
+        # Production reality: Hume request counter stays 0 without HTTP debug,
+        # but generated audio duration proves audio was synthesized + played.
+        # Must NOT be misclassified as a ghost handle.
+        out = vi.classify_tail_outcome(
+            generated_audio_duration_s=10.1, playout_started_at=100.0,
+            playout_completed_at=113.7, interrupted_at=None, interrupted=False,
+            hume_requests_during_speech=0)
+        self.assertEqual(out, vi.CLEAN_PLAYOUT)
+        self.assertFalse(vi.is_audible_cutoff(out))
+
+    def test_interrupted_after_full_playout_with_zero_hume_counter(self):
+        # Barge-in lands after the full audio already played (playout >> generated)
+        # -> interruption after playout, not an audible tail cut.
+        out = vi.classify_tail_outcome(
+            generated_audio_duration_s=2.9, playout_started_at=100.0,
+            playout_completed_at=104.8, interrupted_at=104.8, interrupted=True,
+            hume_requests_during_speech=0)
+        self.assertEqual(out, vi.INTERRUPTION_AFTER_PLAYOUT)
+        self.assertFalse(vi.is_audible_cutoff(out))
+
+
+class TailAudioSilenceTests(unittest.TestCase):
+    def test_silent_tail_is_silence(self):
+        # near-zero trailing amplitude -> clean decay, synthesis tail intact
+        self.assertTrue(vi.tail_ends_in_silence(50))
+        self.assertLess(vi.peak_dbfs(50), -40.0)
+
+    def test_loud_tail_is_not_silence(self):
+        # loud final sample -> TTS clipped mid-word
+        self.assertFalse(vi.tail_ends_in_silence(20000))
+        self.assertGreater(vi.peak_dbfs(20000), -40.0)
+
+    def test_pure_silence_is_negative_infinity(self):
+        self.assertEqual(vi.peak_dbfs(0), float("-inf"))
+        self.assertTrue(vi.tail_ends_in_silence(0))
+
+    def test_threshold_is_configurable(self):
+        # 327 ~= -40 dBFS at int16 full scale; raising the bar flips the verdict
+        self.assertTrue(vi.tail_ends_in_silence(300))
+        self.assertFalse(vi.tail_ends_in_silence(300, silence_dbfs=-50.0))
+
 
 class TurnDetectionResolveTests(unittest.TestCase):
     def test_audio_is_invalid_resolves_to_vad(self):
