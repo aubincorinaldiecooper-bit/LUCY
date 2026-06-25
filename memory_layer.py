@@ -61,6 +61,14 @@ def memory_vector_enabled() -> bool:
     return os.getenv("MEMORY_VECTOR_ENABLED", "false").strip().lower() in {"true", "1", "yes"}
 
 
+def semantic_retrieval_enabled() -> bool:
+    return memory_vector_enabled()
+
+
+def semantic_timeout_ms() -> int:
+    return memory_retrieval_timeout_ms()
+
+
 def memory_embedding_model() -> str:
     return (os.getenv("MEMORY_EMBEDDING_MODEL") or DEFAULT_MEMORY_EMBEDDING_MODEL).strip() or DEFAULT_MEMORY_EMBEDDING_MODEL
 
@@ -132,6 +140,21 @@ def _content_hash(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
 
 
+def embed_text(text: str) -> list[float]:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY missing for semantic memory embeddings")
+    from openai import OpenAI
+
+    client = OpenAI(api_key=api_key)
+    response = client.embeddings.create(
+        model=memory_embedding_model(),
+        input=text,
+        dimensions=memory_embedding_dimensions(),
+    )
+    return [float(v) for v in response.data[0].embedding]
+
+
 def _normalize_retrieved_items(raw: Any) -> list[str]:
     items: list[str] = []
     if raw is None:
@@ -172,6 +195,9 @@ class MemoryLayer:
         db_writer: Callable[[str, tuple], None] | None = None,
         embedder: Callable[[str], list[float]] | None = None,
         vector_enabled: bool | None = None,
+        semantic_enabled: bool | None = None,
+        embed_fn: Callable[[str], list[float]] | None = None,
+        semantic_timeout_ms_override: int | None = None,
     ) -> None:
         self.identity = identity
         self.session_id = session_id
@@ -183,10 +209,34 @@ class MemoryLayer:
         self._simplemem_factory = simplemem_factory or _default_simplemem_factory
         self._db_reader = db_reader or self._psycopg_reader
         self._db_writer = db_writer or self._psycopg_writer
-        self._embedder = embedder or self._openai_embed_text
-        self._vector_enabled = memory_vector_enabled() if vector_enabled is None else bool(vector_enabled)
-        self._embedding_model = memory_embedding_model()
-        self._embedding_dimensions = memory_embedding_dimensions()
+        try:
+            if semantic_enabled is None:
+                if vector_enabled is None:
+                    semantic_on = semantic_retrieval_enabled()
+                else:
+                    semantic_on = bool(vector_enabled)
+            else:
+                semantic_on = bool(semantic_enabled)
+            self._semantic_enabled = semantic_on
+            self._vector_enabled = semantic_on
+            self._embed_fn = embed_fn or embedder or embed_text
+            self._embedder = self._embed_fn
+            self._semantic_timeout_ms = semantic_timeout_ms_override or semantic_timeout_ms()
+            self._embedding_model = memory_embedding_model()
+            self._embedding_dimensions = memory_embedding_dimensions()
+        except Exception as exc:
+            logger.warning(
+                "memory_semantic_config_invalid=true degraded_to_non_semantic=true error_type=%s error=%s",
+                type(exc).__name__,
+                exc,
+            )
+            self._semantic_enabled = False
+            self._vector_enabled = False
+            self._embed_fn = embed_fn or embedder or embed_text
+            self._embedder = self._embed_fn
+            self._semantic_timeout_ms = self._retrieval_timeout_ms
+            self._embedding_model = DEFAULT_MEMORY_EMBEDDING_MODEL
+            self._embedding_dimensions = DEFAULT_MEMORY_EMBEDDING_DIMENSIONS
         self._vector_status = "not_checked" if self._vector_enabled else "disabled"
         self._simplemem: Any = None
         self._simplemem_status = "not_initialized"
@@ -356,21 +406,21 @@ class MemoryLayer:
         try:
             items = await asyncio.wait_for(
                 self._retrieve_pgvector_if_available(query, top_k),
-                timeout=self._retrieval_timeout_ms / 1000,
+                timeout=self._semantic_timeout_ms / 1000,
             )
             if items is not None:
                 logger.info(
                     "memory_retrieval status=ok backend=pgvector memory_count=%s duration_seconds=%.3f timeout_ms=%s",
                     len(items),
                     time.monotonic() - started_at,
-                    self._retrieval_timeout_ms,
+                    self._semantic_timeout_ms,
                 )
                 if items:
                     return items
         except asyncio.TimeoutError:
             logger.warning(
                 "memory_retrieval status=timeout backend=pgvector timeout_ms=%s duration_seconds=%.3f",
-                self._retrieval_timeout_ms,
+                self._semantic_timeout_ms,
                 time.monotonic() - started_at,
             )
             return []
