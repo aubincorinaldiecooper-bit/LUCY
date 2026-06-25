@@ -1,6 +1,6 @@
 "use client";
 
-import { authClient, useSession } from "@/lib/auth-client";
+import { signOutEverywhere, useSession } from "@/lib/auth-client";
 import MagicLinkSignIn from "@/components/auth/MagicLinkSignIn";
 
 /**
@@ -23,7 +23,7 @@ export default function AuthPanel({ callbackURL = "/" }: { callbackURL?: string 
         </p>
         <button
           type="button"
-          onClick={() => authClient.signOut()}
+          onClick={() => signOutEverywhere()}
           className="rounded-md border border-neutral-700 px-3 py-2 text-sm text-white hover:border-neutral-400"
         >
           Sign out
