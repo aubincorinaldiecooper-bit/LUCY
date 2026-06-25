@@ -96,6 +96,27 @@ class TailOutcomeTests(unittest.TestCase):
         self.assertEqual(out, vi.STALE_CLEANUP_ONLY)
         self.assertFalse(vi.is_audible_cutoff(out))
 
+    def test_audio_produced_when_hume_counter_is_zero(self):
+        # Production reality: Hume request counter stays 0 without HTTP debug,
+        # but generated audio duration proves audio was synthesized + played.
+        # Must NOT be misclassified as a ghost handle.
+        out = vi.classify_tail_outcome(
+            generated_audio_duration_s=10.1, playout_started_at=100.0,
+            playout_completed_at=113.7, interrupted_at=None, interrupted=False,
+            hume_requests_during_speech=0)
+        self.assertEqual(out, vi.CLEAN_PLAYOUT)
+        self.assertFalse(vi.is_audible_cutoff(out))
+
+    def test_interrupted_after_full_playout_with_zero_hume_counter(self):
+        # Barge-in lands after the full audio already played (playout >> generated)
+        # -> interruption after playout, not an audible tail cut.
+        out = vi.classify_tail_outcome(
+            generated_audio_duration_s=2.9, playout_started_at=100.0,
+            playout_completed_at=104.8, interrupted_at=104.8, interrupted=True,
+            hume_requests_during_speech=0)
+        self.assertEqual(out, vi.INTERRUPTION_AFTER_PLAYOUT)
+        self.assertFalse(vi.is_audible_cutoff(out))
+
 
 class TurnDetectionResolveTests(unittest.TestCase):
     def test_audio_is_invalid_resolves_to_vad(self):

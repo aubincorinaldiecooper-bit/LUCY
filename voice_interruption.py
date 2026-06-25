@@ -166,10 +166,15 @@ def classify_tail_outcome(
     if was_stale and not was_active:
         return STALE_CLEANUP_ONLY
 
-    produced_audio = (
+    # Generated audio duration (from Hume coverage) is the reliable signal that
+    # audio was synthesized and fed to playout. The Hume *request counter* is NOT
+    # reliable: it only increments when HUME HTTP debug is enabled, so in
+    # production it stays 0 even for multi-second speeches. Gating on it
+    # mislabels every real speech as a ghost handle and masks actual tail cuts.
+    # Treat it as a soft/supporting hint only.
+    produced_audio = playout_started_at is not None and (
         (generated_audio_duration_s or 0) > 0
-        and (hume_requests_during_speech or 0) > 0
-        and playout_started_at is not None
+        or (hume_requests_during_speech or 0) > 0
     )
     if not produced_audio:
         # No audio reached the user -> ghost handle, not an audible cutoff.
