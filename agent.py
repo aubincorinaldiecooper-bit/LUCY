@@ -317,6 +317,19 @@ _current_turn_audio_unclear = False
 _barge_in_during_thinking_turn_id = 0
 _barge_in_started_at = 0.0
 _barge_in_confirmed_real = False
+# Handoff-guard suppression recovery: when the guard drops a thinking-phase reply,
+# the barge-in is *expected* to commit a replacement turn. When it does not (a
+# brief continuation, a backchannel, or speech the STT never finalizes), the
+# conversation would dead-end in silence. These track the most recently suppressed
+# reply so a watchdog can re-speak it if no replacement ever takes the floor.
+_suppressed_reply_pending = False
+_suppressed_reply_turn_id = 0
+_suppressed_reply_text = ""
+_suppressed_reply_armed_at = 0.0
+_suppressed_reply_recovery_task: "asyncio.Task | None" = None
+# Module-level handle to the live AgentSession, set at session start, so the
+# suppression-recovery watchdog can speak from a background task.
+_active_agent_session: "AgentSession | None" = None
 # Context-policy state: a thin in-memory conversation ledger (not a memory system)
 # used only to inject recent VISIBLE turns and to carry a contextual intent
 # forward 1-2 turns. Suppressed/zero-audio/interrupted assistant turns are kept
@@ -3110,6 +3123,15 @@ LLM_TO_TTS_HANDOFF_GUARD_ENABLED = env_bool("LLM_TO_TTS_HANDOFF_GUARD_ENABLED", 
 # handoff guard treats it as a real new utterance and suppresses the stale reply.
 # Filters coughs/VAD blips. Only consulted when the guard is enabled.
 HANDOFF_GUARD_MIN_SPEECH_MS = env_int_clamped("HANDOFF_GUARD_MIN_SPEECH_MS", 350, 0, 5000)
+# Suppression recovery: after the handoff guard drops a reply, wait this grace and
+# then re-speak it IF no replacement turn took the floor (a guarantee that a
+# suppression can never leave unbounded dead air). Enabled by default because it
+# is a no-op unless a suppression actually fires (i.e. unless the guard is on).
+HANDOFF_GUARD_RECOVERY_ENABLED = env_bool("HANDOFF_GUARD_RECOVERY_ENABLED", True)
+# Grace before recovery speaks. Must exceed the endpointing window (~900ms) plus
+# turn-commit latency so a genuine replacement turn is given every chance to take
+# over first; only a barge-in that never commits a turn trips the recovery.
+HANDOFF_GUARD_RECOVERY_GRACE_MS = env_int_clamped("HANDOFF_GUARD_RECOVERY_GRACE_MS", 1500, 0, 10000)
 
 
 def _handoff_guard_should_suppress(turn_id: int) -> tuple[bool, str]:
@@ -3129,6 +3151,159 @@ def _handoff_guard_should_suppress(turn_id: int) -> tuple[bool, str]:
     if _barge_in_confirmed_real or elapsed_ms >= HANDOFF_GUARD_MIN_SPEECH_MS:
         return True, f"real_barge_in_during_thinking:elapsed_ms={elapsed_ms:.0f}:min_ms={HANDOFF_GUARD_MIN_SPEECH_MS}"
     return False, f"barge_in_below_min_speech:elapsed_ms={elapsed_ms:.0f}:min_ms={HANDOFF_GUARD_MIN_SPEECH_MS}"
+
+
+# Interaction-state names that mean "the floor is busy" — a replacement reply is
+# already in flight or the user is mid-utterance — so the suppressed reply must
+# NOT be re-spoken (doing so would talk over a real turn / the user).
+_RECOVERY_FLOOR_BUSY_STATES = frozenset(
+    {
+        "USER_SPEAKING",
+        "USER_INTERRUPTING",
+        "COMMITTED_TURN",
+        "ASSISTANT_THINKING",
+        "ASSISTANT_SPEAKING",
+        "HOLDING_FRAGMENT",
+    }
+)
+
+
+def _should_recover_suppressed_reply(
+    *,
+    armed_turn_id: int,
+    current_turn_id: int,
+    interaction_state: str,
+    has_text: bool,
+) -> tuple[bool, str]:
+    """Decide whether a handoff-guard-suppressed reply should be re-spoken once the
+    recovery grace elapses.
+
+    Recover only when the suppression would otherwise leave dead air:
+      * there is text to speak,
+      * the same turn is still current (no replacement turn committed since — a new
+        turn would generate its own reply, so re-speaking would double up), and
+      * the floor is open (the user is not mid-utterance and nothing is being
+        produced). A stale USER_TURN_CANDIDATE that never committed a turn (the
+        exact dead-air case) counts as open.
+
+    Pure/deterministic so it can be unit-tested without the session or asyncio.
+    """
+    if not has_text:
+        return False, "no_text"
+    if current_turn_id != armed_turn_id:
+        return False, "superseded_by_new_turn"
+    state = (interaction_state or "").strip().upper()
+    if state in _RECOVERY_FLOOR_BUSY_STATES:
+        return False, f"floor_busy:{state.lower()}"
+    return True, f"open_floor:{state.lower() or 'unknown'}"
+
+
+def _arm_suppressed_reply_recovery(turn_id: int, text: str) -> None:
+    """Record a handoff-guard-suppressed reply and schedule a watchdog that
+    re-speaks it if no replacement turn takes the floor within the grace window.
+
+    A no-op when recovery is disabled, the text is empty, or no event loop is
+    running (e.g. unit tests that exercise suppression synchronously)."""
+    global _suppressed_reply_pending, _suppressed_reply_turn_id, _suppressed_reply_text
+    global _suppressed_reply_armed_at, _suppressed_reply_recovery_task
+    if not HANDOFF_GUARD_RECOVERY_ENABLED:
+        return
+    clean = (text or "").strip()
+    if not clean:
+        return
+    _suppressed_reply_pending = True
+    _suppressed_reply_turn_id = turn_id
+    _suppressed_reply_text = clean
+    _suppressed_reply_armed_at = time.monotonic()
+    # A newer suppression supersedes any pending watchdog.
+    if _suppressed_reply_recovery_task is not None and not _suppressed_reply_recovery_task.done():
+        _suppressed_reply_recovery_task.cancel()
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        _suppressed_reply_recovery_task = None
+        return
+    _suppressed_reply_recovery_task = loop.create_task(_suppressed_reply_recovery_watchdog(turn_id))
+    logger.info(
+        "handoff_guard_recovery_armed=true turn_id=%s grace_ms=%s text_length=%s",
+        turn_id,
+        HANDOFF_GUARD_RECOVERY_GRACE_MS,
+        len(clean),
+    )
+
+
+def _clear_suppressed_reply_recovery(reason: str) -> None:
+    """Cancel any pending suppression-recovery watchdog (a real replacement turn or
+    session teardown supersedes it)."""
+    global _suppressed_reply_pending, _suppressed_reply_recovery_task
+    if not _suppressed_reply_pending and _suppressed_reply_recovery_task is None:
+        return
+    if _suppressed_reply_pending:
+        logger.info(
+            "handoff_guard_recovery_cleared=true reason=%s suppressed_turn_id=%s",
+            reason,
+            _suppressed_reply_turn_id,
+        )
+    _suppressed_reply_pending = False
+    if _suppressed_reply_recovery_task is not None and not _suppressed_reply_recovery_task.done():
+        _suppressed_reply_recovery_task.cancel()
+    _suppressed_reply_recovery_task = None
+
+
+async def _suppressed_reply_recovery_watchdog(turn_id: int) -> None:
+    """After the recovery grace, re-speak a suppressed reply if it would otherwise
+    leave dead air. See `_should_recover_suppressed_reply` for the decision."""
+    global _suppressed_reply_pending
+    global _barge_in_during_thinking_turn_id, _barge_in_started_at, _barge_in_confirmed_real
+    try:
+        await asyncio.sleep(HANDOFF_GUARD_RECOVERY_GRACE_MS / 1000.0)
+    except asyncio.CancelledError:
+        return
+    # Only act on the latest arming for this turn (a newer suppression/clear wins).
+    if not _suppressed_reply_pending or _suppressed_reply_turn_id != turn_id:
+        return
+    state = str(getattr(_interaction_state, "state", "") or "")
+    text = _suppressed_reply_text
+    should, reason = _should_recover_suppressed_reply(
+        armed_turn_id=turn_id,
+        current_turn_id=_current_turn_id,
+        interaction_state=state,
+        has_text=bool(text.strip()),
+    )
+    _suppressed_reply_pending = False  # consume this arming either way
+    if not should:
+        logger.info(
+            "handoff_guard_recovery_skipped=true turn_id=%s reason=%s interaction_state=%s",
+            turn_id,
+            reason,
+            state or "unknown",
+        )
+        return
+    session = _active_agent_session
+    if session is None:
+        logger.warning("handoff_guard_recovery_unavailable=true turn_id=%s reason=no_session", turn_id)
+        return
+    # Clear the stale barge-in latch first: we have decided the barge-in produced no
+    # replacement turn, so it must not suppress this recovery utterance in tts_node.
+    _barge_in_during_thinking_turn_id = 0
+    _barge_in_started_at = 0.0
+    _barge_in_confirmed_real = False
+    try:
+        logger.warning(
+            "handoff_guard_recovery_spoken=true turn_id=%s reason=%s text_length=%s",
+            turn_id,
+            reason,
+            len(text),
+        )
+        # The suppressed reply was already added to the chat context, so re-speaking
+        # it must not duplicate that entry — only (re)produce the audio.
+        await session.say(text, allow_interruptions=True, add_to_chat_ctx=False)
+    except Exception as exc:
+        logger.warning(
+            "handoff_guard_recovery_say_failed=true turn_id=%s error=%s",
+            turn_id,
+            _redact_sensitive_text(exc),
+        )
 
 
 CONTEXT_WINDOW_TURNS = env_int_clamped("CONTEXT_WINDOW_TURNS", 10, 4, 100)
@@ -5889,6 +6064,7 @@ class LucyAgent(Agent):
             async def _logging_passthrough_stream() -> AsyncIterable[str]:
                 global _last_tts_received_text_hash, _last_tts_text_length, _last_tts_sentence_end_count, _last_tts_raw_chunk_count, _last_tts_normalized_yield_count, _last_tts_first_input_at
                 chunks: list[str] = []
+                suppressed_parts: list[str] = []
                 count = 0
                 yielded_any = False
                 suppressed = False
@@ -5910,12 +6086,19 @@ class LucyAgent(Agent):
                                     sup_reason,
                                 )
                         if suppressed:
-                            continue  # drain the source so upstream closes, yield nothing
+                            # Drain the source so upstream closes (yield nothing), but
+                            # keep the full text so recovery can re-speak it if the
+                            # barge-in never commits a replacement turn.
+                            if isinstance(chunk, str):
+                                suppressed_parts.append(chunk)
+                            continue
                         if isinstance(chunk, str):
                             chunks.append(chunk)
                         yielded_any = True
                         yield chunk
                 finally:
+                    if suppressed:
+                        _arm_suppressed_reply_recovery(_current_turn_id, "".join(suppressed_parts))
                     raw_text = "".join(chunks)
                     _last_tts_received_text_hash = _text_hash(raw_text)
                     _last_tts_text_length = len(raw_text)
@@ -6055,6 +6238,10 @@ class LucyAgent(Agent):
                     len(raw_text),
                     handoff_reason,
                 )
+                # Arm recovery so this drop can never become unbounded dead air: if
+                # the barge-in never commits a replacement turn, the watchdog
+                # re-speaks this reply once the floor reopens.
+                _arm_suppressed_reply_recovery(_current_turn_id, sanitized)
                 sanitized = ""
             normalized_text = self._normalize_spoken_text(sanitized)
             normalized_hash = _text_hash(normalized_text)
@@ -6921,6 +7108,9 @@ class LucyAgent(Agent):
         _barge_in_during_thinking_turn_id = 0
         _barge_in_started_at = 0.0
         _barge_in_confirmed_real = False
+        # A genuine replacement turn supersedes any reply suppressed on the prior
+        # turn — cancel its pending recovery so the watchdog can't double-speak.
+        _clear_suppressed_reply_recovery("new_turn_committed")
         # Attribute this commit against real user-speech signals (not only FSM
         # events, which can be missed): a recent user-speaking edge or a recent
         # STT final means the user genuinely spoke for this turn even if the FSM
@@ -7965,7 +8155,7 @@ async def entrypoint(ctx: JobContext):
         True,
     )
 
-    global _active_memory_layer, _audiointeraction_shadow, _inworld_voice_profile_shadow, _calibration_session_id
+    global _active_memory_layer, _audiointeraction_shadow, _inworld_voice_profile_shadow, _calibration_session_id, _active_agent_session
     _calibration_session_id = str(_safe_attr(_safe_attr(ctx, "room"), "name") or "unknown")
     logger.info(
         "tts_runtime_selection hume_active=%s tts_provider=%s tts_fallback_provider=%s omnivoice_inactive=%s omnivoice_enabled=%s omnivoice_expressive_planner_enabled=%s",
@@ -8159,6 +8349,10 @@ async def entrypoint(ctx: JobContext):
         True,
     )
     session = AgentSession(**session_kwargs)
+    # Expose the live session so the suppression-recovery watchdog (armed from
+    # tts_node, fired from a background task) can re-speak a dropped reply.
+    _active_agent_session = session
+    _clear_suppressed_reply_recovery("session_start")
     resolved_stt = session_kwargs.get("stt")
     logger.info("Resolved STT type: %s", type(resolved_stt).__name__)
     resolved_vad = session_kwargs.get("vad")
