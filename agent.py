@@ -43,7 +43,7 @@ from internet_search import (
     search_timeout_seconds,
 )
 from audiointeraction_shadow import AudioInteractionShadow, audiointeraction_mode, build_shadow_from_env
-from inworld_voice_profile import InworldVoiceProfileShadow, build_inworld_shadow_from_env
+from inworld_voice_profile import InworldVoiceProfileShadow, build_inworld_shadow_from_env, emotion_analyzer_status
 from hume_evi_bridge import run_hume_evi_bridge, voice_engine
 from interaction_state import (
     ASSISTANT_SPEAKING,
@@ -8181,6 +8181,21 @@ async def entrypoint(ctx: JobContext):
     else:
         logger.info("AudioInteraction shadow startup: audiointeraction_mode=%s shadow_active=false", audiointeraction_mode())
 
+    # Single, unambiguous startup verdict for the voice emotion analyzer so
+    # "is the emotion analyzer working?" is answerable from one log line rather
+    # than inferred from per-turn fallback_skip_reason=disabled noise.
+    _emotion_status = emotion_analyzer_status()
+    logger.info(
+        "emotion_analyzer_status active=%s reason=%s component=inworld_voice_profile "
+        "inworld_enabled=%s voice_profile_enabled=%s api_key_present=%s auth_scheme=%s model_id=%s",
+        _emotion_status["active"],
+        _emotion_status["reason"],
+        _emotion_status["inworld_enabled"],
+        _emotion_status["voice_profile_enabled"],
+        _emotion_status["api_key_present"],
+        _emotion_status["auth_scheme"],
+        _emotion_status["model_id"],
+    )
     _inworld_voice_profile_shadow = build_inworld_shadow_from_env()
     if _inworld_voice_profile_shadow is not None:
         _inworld_voice_profile_shadow.start()
