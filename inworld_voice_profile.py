@@ -99,6 +99,18 @@ class InworldConfig:
             return False, "inworld_ws_url_missing"
         return True, "ok"
 
+    def authorization_header(self) -> str:
+        """Authorization header value for the STT websocket.
+
+        Inworld's base64 ``clientId:clientSecret`` key is a *Basic* credential (the
+        default); set ``INWORLD_AUTH_SCHEME=Bearer`` only for a bearer token. The
+        scheme was previously hardcoded to Bearer, which 401'd Basic keys (the
+        common case) and silently dropped the analyzer into reconnect/fallback.
+        """
+        scheme = (self.auth_scheme or "Basic").strip() or "Basic"
+        canonical = {"basic": "Basic", "bearer": "Bearer"}.get(scheme.lower(), scheme)
+        return f"{canonical} {self.api_key}"
+
 
 @dataclass
 class NormalizedVoiceProfile:
@@ -287,7 +299,7 @@ class InworldVoiceProfileShadow:
         try:
             ws = await session.ws_connect(
                 self.config.ws_url,
-                headers={"Authorization": f"Bearer {self.config.api_key}"},
+                headers={"Authorization": self.config.authorization_header()},
                 heartbeat=20,
             )
         except Exception:
@@ -423,6 +435,26 @@ class InworldVoiceProfileShadow:
             except (asyncio.CancelledError, Exception):
                 pass
         logger.info("inworld_voice_profile_summary frames_sent=%s frames_dropped=%s responses_received=%s connect_errors=%s send_errors=%s parse_errors=%s fallback_skip_reason=%s", self.counters["frames_sent"], self.counters["frames_dropped"], self.counters["responses_received"], self.counters["connect_errors"], self.counters["send_errors"], self.counters["parse_errors"], self.last_skip_reason)
+
+
+def emotion_analyzer_status() -> dict[str, Any]:
+    """One-glance status of the Inworld voice-profile emotion analyzer.
+
+    Reports whether it is active and, when not, exactly why — so a single startup
+    log line answers "is the emotion analyzer working?" without having to infer it
+    from scattered per-turn ``fallback_skip_reason=disabled`` lines.
+    """
+    config = InworldConfig.from_env()
+    usable, reason = config.is_usable()
+    return {
+        "active": usable,
+        "reason": "active" if usable else reason,
+        "inworld_enabled": _env_bool("INWORLD_ENABLED", False),
+        "voice_profile_enabled": _env_bool("INWORLD_VOICE_PROFILE_ENABLED", False),
+        "api_key_present": bool(config.api_key),
+        "auth_scheme": config.auth_scheme,
+        "model_id": config.model_id,
+    }
 
 
 def build_inworld_shadow_from_env(ws_factory: Callable[..., Any] | None = None) -> InworldVoiceProfileShadow | None:
