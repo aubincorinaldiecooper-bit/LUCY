@@ -48,151 +48,28 @@ export function useVoiceClient(options?: { onServerDisconnect?: () => void }) {
   const userInitiatedDisconnectRef = useRef(false);
   const onServerDisconnectRef = useRef<(() => void) | undefined>(options?.onServerDisconnect);
   onServerDisconnectRef.current = options?.onServerDisconnect;
+  // Single audible path for the agent's voice: each remote audio track is
+  // attached to ONE <audio> element and played natively. We deliberately do not
+  // also route the track through a parallel Web Audio graph. Running both a media
+  // element and a MediaStream source for the same WebRTC track played two
+  // overlapping, slightly-offset copies (the "duplicated voice" bug) whose tails
+  // desynced and sounded clipped (the "tail cutoff" bug). One element == one copy
+  // == a clean tail. Loudness is left at the source level; if a boost is needed it
+  // must be added without introducing a second audible stream.
   const remoteAudioElsRef = useRef<Set<HTMLMediaElement>>(new Set());
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const gainNodeRef = useRef<GainNode | null>(null);
-  const compressorNodeRef = useRef<DynamicsCompressorNode | null>(null);
-  const mediaSourceNodesRef = useRef<Map<HTMLMediaElement, AudioNode>>(new Map());
-
-  const getRemoteAudioGain = useCallback(() => {
-    // Makeup gain applied AFTER the compressor. Because the compressor tames
-    // peaks, this can safely sit above 1.0 without clipping; default 2.0
-    // (~+6 dB) and a 4.0 ceiling give real perceived loudness headroom.
-    const raw = Number.parseFloat(process.env.NEXT_PUBLIC_REMOTE_AUDIO_GAIN ?? "2.0");
-    if (!Number.isFinite(raw)) return 2.0;
-    return Math.max(1.0, Math.min(4.0, raw));
-  }, []);
-
-  // Returns true when the WebAudio graph became the audible path for this
-  // track, false when it could not be built (caller then leaves the <audio>
-  // element audible as the single fallback path).
-  const setupAudioGainForTrack = useCallback((track: RemoteTrack, audioElement: HTMLMediaElement): boolean => {
-    if (typeof window === "undefined") return false;
-    const AudioContextCtor = window.AudioContext || (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-    if (!AudioContextCtor) return false;
-
-    const mediaStreamTrack = track.mediaStreamTrack;
-    if (!mediaStreamTrack) return false;
-
-    try {
-      const audioContext = audioContextRef.current ?? new AudioContextCtor();
-      audioContextRef.current = audioContext;
-
-      // Signal chain: MediaStream source -> compressor -> makeup gain -> output.
-      // The compressor raises perceived loudness (evens out the moderate Hume
-      // output level) and protects against clipping when the makeup gain is
-      // pushed above 1.0.
-      let compressorNode = compressorNodeRef.current;
-      if (!compressorNode) {
-        compressorNode = audioContext.createDynamicsCompressor();
-        compressorNode.threshold.value = -24; // dB: start compressing here
-        compressorNode.knee.value = 30;        // soft knee for natural feel
-        compressorNode.ratio.value = 4;         // gentle 4:1 compression
-        compressorNode.attack.value = 0.003;
-        compressorNode.release.value = 0.25;
-        compressorNodeRef.current = compressorNode;
-      }
-
-      let gainNode = gainNodeRef.current;
-      if (!gainNode) {
-        gainNode = audioContext.createGain();
-        compressorNode.connect(gainNode);
-        gainNode.connect(audioContext.destination);
-        gainNodeRef.current = gainNode;
-      }
-      gainNode.gain.value = getRemoteAudioGain();
-
-      // Enforce a single audible remote source. Before wiring this track, tear
-      // down every existing MediaStream source node so a re-subscribe or a
-      // stop/start within the same page can never stack a second, slightly
-      // offset copy of the agent's voice (the duplicate-audio bug). This app
-      // only ever has one remote audio track (the agent), so one source ==
-      // correct.
-      mediaSourceNodesRef.current.forEach((node) => {
-        try {
-          node.disconnect();
-        } catch {
-          // best-effort disconnect
-        }
-      });
-      mediaSourceNodesRef.current.clear();
-
-      // Tap the track's MediaStream directly rather than via
-      // createMediaElementSource, whose end-of-stream buffer clips each
-      // response's tail (server delivers full audio + trailing silence; the
-      // cut is downstream). The <audio> element stays attached but muted, only
-      // to keep the WebRTC pipeline pulling frames for this MediaStream.
-      const sourceNode = audioContext.createMediaStreamSource(new MediaStream([mediaStreamTrack]));
-      sourceNode.connect(compressorNode);
-      mediaSourceNodesRef.current.set(audioElement, sourceNode);
-
-      if (audioContext.state === "suspended") {
-        void audioContext.resume().catch(() => {
-          // Browser autoplay policies may delay resume until user gesture.
-        });
-      }
-      return true;
-    } catch (err) {
-      console.warn("Failed to setup remote audio gain", err);
-      return false;
-    }
-  }, [getRemoteAudioGain]);
-
-  const cleanupAudioNodeForElement = useCallback((audioElement: HTMLMediaElement) => {
-    const sourceNode = mediaSourceNodesRef.current.get(audioElement);
-    if (!sourceNode) return;
-    try {
-      sourceNode.disconnect();
-    } catch {
-      // best-effort disconnect
-    }
-    mediaSourceNodesRef.current.delete(audioElement);
-  }, []);
-
-  const teardownAudioGainResources = useCallback(() => {
-    mediaSourceNodesRef.current.forEach((sourceNode) => {
-      try {
-        sourceNode.disconnect();
-      } catch {
-        // best-effort disconnect
-      }
-    });
-    mediaSourceNodesRef.current.clear();
-
-    if (gainNodeRef.current) {
-      try {
-        gainNodeRef.current.disconnect();
-      } catch {
-        // best-effort disconnect
-      }
-      gainNodeRef.current = null;
-    }
-
-    if (compressorNodeRef.current) {
-      try {
-        compressorNodeRef.current.disconnect();
-      } catch {
-        // best-effort disconnect
-      }
-      compressorNodeRef.current = null;
-    }
-
-    if (audioContextRef.current) {
-      void audioContextRef.current.close().catch(() => {
-        // best-effort close
-      });
-      audioContextRef.current = null;
-    }
-  }, []);
 
   const clearRemoteAudioElements = useCallback(() => {
     for (const el of remoteAudioElsRef.current) {
-      cleanupAudioNodeForElement(el);
+      try {
+        el.pause();
+      } catch {
+        // best-effort pause before teardown
+      }
+      el.srcObject = null;
       el.remove();
     }
     remoteAudioElsRef.current.clear();
-    teardownAudioGainResources();
-  }, [cleanupAudioNodeForElement, teardownAudioGainResources]);
+  }, []);
 
   const disconnect = useCallback(async () => {
     connectAttemptRef.current += 1;
@@ -236,21 +113,17 @@ export function useVoiceClient(options?: { onServerDisconnect?: () => void }) {
       });
       room.on(RoomEvent.TrackSubscribed, (track) => {
         if (track.kind !== Track.Kind.Audio) return;
+        // Tear down any previously attached remote audio element first so a
+        // re-subscribe (reconnect, track republish) can never stack a second
+        // audible copy. This app only ever has one remote audio track (the agent).
+        clearRemoteAudioElements();
         const audioElement = (track as RemoteTrack).attach();
-        // Mute BEFORE the element can autoplay. The audible path is the
-        // WebAudio graph below; if the element also played, the user would
-        // hear two overlapping copies (the duplicate-audio bug).
-        audioElement.muted = true;
         audioElement.autoplay = true;
         audioElement.volume = 1.0;
         audioElement.setAttribute("playsinline", "true");
         audioElement.style.display = "none";
         document.body.appendChild(audioElement);
         remoteAudioElsRef.current.add(audioElement);
-        const webAudioActive = setupAudioGainForTrack(track as RemoteTrack, audioElement);
-        // Exactly one audible path: keep the element muted when the WebAudio
-        // graph is live, otherwise unmute it as the sole fallback.
-        audioElement.muted = webAudioActive;
         audioElement.play().catch((err) => {
           console.warn("Remote audio autoplay was blocked by the browser", err);
         });
@@ -259,7 +132,6 @@ export function useVoiceClient(options?: { onServerDisconnect?: () => void }) {
         if (track.kind !== Track.Kind.Audio) return;
         const detachedEls = (track as RemoteTrack).detach();
         detachedEls.forEach((el) => {
-          cleanupAudioNodeForElement(el);
           remoteAudioElsRef.current.delete(el);
           el.remove();
         });
@@ -281,7 +153,7 @@ export function useVoiceClient(options?: { onServerDisconnect?: () => void }) {
       setState("idle");
       roomRef.current = null;
     }
-  }, [clearRemoteAudioElements, cleanupAudioNodeForElement, isMuted, setupAudioGainForTrack]);
+  }, [clearRemoteAudioElements, isMuted]);
 
   const toggleMute = useCallback(async () => {
     const next = !isMuted;
