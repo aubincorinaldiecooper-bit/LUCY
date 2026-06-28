@@ -502,31 +502,13 @@ class MemoryLayer:
 
     async def _remember(self, role: str, content: str, turn_id: int | None, modality: str, media_url: str | None) -> None:
         compact = f"{'User said' if role == 'user' else 'Lucy replied'}: {content}"
-        if self._db_url:
-            # Single durable write (pgvector if available, else text). Never re-run:
-            # a duplicate call here previously threw an uncaught TypeError (missing
-            # args) and crashed the background task. Failures degrade to recency.
-            try:
-                await self._embed_and_store(compact, role, turn_id, modality, media_url)
-            except Exception as exc:
-                logger.warning(
-                    "memory_write status=error target=postgres role=%s turn_id=%s modality=%s fallback=recency error_type=%s error=%s",
-                    role, turn_id, modality, type(exc).__name__, exc,
-                )
-        backend = self._get_simplemem()
-        if backend is not None:
-            try:
-                tags = [f"user:{self.identity.key}", f"role:{role}"]
-                if modality == "audio" and media_url:
-                    await asyncio.to_thread(backend.add_audio, media_url, tags)
-                else:
-                    await asyncio.to_thread(backend.add_text, compact, tags)
-            except Exception as exc:
-                logger.warning(
-                    "memory_write status=error target=simplemem role=%s turn_id=%s error_type=%s error=%s",
-                    role, turn_id, type(exc).__name__, exc,
-                )
-
+        try:
+            await self._embed_and_store(compact, role, turn_id, modality, media_url)
+        except Exception as exc:
+            logger.warning(
+                "memory_write status=error target=postgres role=%s turn_id=%s modality=%s fallback=recency error_type=%s error=%s",
+                role, turn_id, modality, type(exc).__name__, exc,
+            )
 
     async def _embed_and_store(self, compact: str, role: str, turn_id: int | None, modality: str, media_url: str | None) -> None:
         """Store durable memory with optional embedding, degrading to text-only writes.
@@ -542,6 +524,20 @@ class MemoryLayer:
                 "memory_embed_and_store status=error role=%s turn_id=%s modality=%s fallback=recency error_type=%s error=%s",
                 role, turn_id, modality, type(exc).__name__, exc,
             )
+            # Fallback to simplemem if Postgres fails
+            backend = self._get_simplemem()
+            if backend is not None:
+                try:
+                    tags = [f"user:{self.identity.key}", f"role:{role}"]
+                    if modality == "audio" and media_url:
+                        await asyncio.to_thread(backend.add_audio, media_url, tags)
+                    else:
+                        await asyncio.to_thread(backend.add_text, compact, tags)
+                except Exception as exc2:
+                    logger.warning(
+                        "memory_write status=error target=simplemem role=%s turn_id=%s error_type=%s error=%s",
+                        role, turn_id, type(exc2).__name__, exc2,
+                    )
 
     async def _write_postgres_memory(self, compact: str, role: str, turn_id: int | None, modality: str, media_url: str | None) -> None:
         metadata = json.dumps({"role": role, "turn_id": turn_id})
@@ -559,6 +555,8 @@ class MemoryLayer:
             media_url,
             metadata,
         )
+        if not self._db_url:
+            return
         if self._pgvector_available():
             try:
                 embedding = await self._embed_text(compact)

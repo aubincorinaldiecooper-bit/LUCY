@@ -4917,36 +4917,6 @@ def _persist_calibration_moment(moment: dict[str, Any]) -> None:
         )
 
 
-def _remember_calibration_pattern(moment: dict[str, Any]) -> None:
-    """Store a confirmed calibration moment in durable per-user memory so a
-    returning signed-in user's confirmed emotional patterns inform future sessions
-    via the normal memory preload. Best-effort; never raises. Guests are scoped to
-    the room (per-session) so this only persists across sessions for accounts."""
-    if not moment.get("user_confirmed_or_corrected") or _active_memory_layer is None:
-        return
-    transcript = (moment.get("transcript") or "").strip()
-    question = (moment.get("arche_question") or "").strip()
-    answer = (moment.get("user_answer") or "").strip()
-    content = (
-        f"{EMOTIONAL_PATTERN_PREFIX}when processing \"{transcript[:160]}\", "
-        f"you asked \"{question}\" and they said: \"{answer[:200]}\"."
-    )
-    try:
-        turn_raw = str(moment.get("turn_id") or "")
-        _active_memory_layer.schedule_remember(
-            role="emotional_calibration",
-            content=content,
-            turn_id=int(turn_raw) if turn_raw.isdigit() else None,
-        )
-        logger.info("emotional_calibration_pattern_remembered=true turn_id=%s", moment.get("turn_id"))
-    except Exception as exc:
-        logger.warning(
-            "emotional_calibration_pattern_remember_failed=true error_type=%s error=%s",
-            type(exc).__name__,
-            _redact_sensitive_text(exc),
-        )
-
-
 def _complete_pending_calibration_moment(user_answer: str) -> None:
     global _pending_calibration_moment
     if _pending_calibration_moment is None:
@@ -8150,7 +8120,7 @@ async def entrypoint(ctx: JobContext):
         "min_words": int(os.getenv("LIVEKIT_INTERRUPTION_MIN_WORDS", "2")),
         "min_duration": float(os.getenv("LIVEKIT_INTERRUPTION_MIN_DURATION", "0.65")),
         "resume_false_interruption": env_bool("LIVEKIT_RESUME_FALSE_INTERRUPTION", True),
-        "false_interruption_timeout": float(os.getenv("LIVEKIT_FALSE_INTERRUPTION_TIMEOUT", "1.0")),
+        "false_interruption_timeout": float(os.getenv("LIVEKIT_FALSE_INTERRUPTION_TIMEOUT", "1.8")),
     }
     logger.info(
         "Resolved interruption config: %s resume_false_interruption_active=%s",
@@ -8227,6 +8197,7 @@ async def entrypoint(ctx: JobContext):
         True,
     )
 
+    global _active_memory_layer, _audiointeraction_shadow, _inworld_voice_profile_shadow, _calibration_session_id
     global _active_memory_layer, _audiointeraction_shadow, _inworld_voice_profile_shadow, _calibration_session_id, _active_agent_session
     _calibration_session_id = str(_safe_attr(_safe_attr(ctx, "room"), "name") or "unknown")
     logger.info(
@@ -8253,21 +8224,6 @@ async def entrypoint(ctx: JobContext):
     else:
         logger.info("AudioInteraction shadow startup: audiointeraction_mode=%s shadow_active=false", audiointeraction_mode())
 
-    # Single, unambiguous startup verdict for the voice emotion analyzer so
-    # "is the emotion analyzer working?" is answerable from one log line rather
-    # than inferred from per-turn fallback_skip_reason=disabled noise.
-    _emotion_status = emotion_analyzer_status()
-    logger.info(
-        "emotion_analyzer_status active=%s reason=%s component=inworld_voice_profile "
-        "inworld_enabled=%s voice_profile_enabled=%s api_key_present=%s auth_scheme=%s model_id=%s",
-        _emotion_status["active"],
-        _emotion_status["reason"],
-        _emotion_status["inworld_enabled"],
-        _emotion_status["voice_profile_enabled"],
-        _emotion_status["api_key_present"],
-        _emotion_status["auth_scheme"],
-        _emotion_status["model_id"],
-    )
     _inworld_voice_profile_shadow = build_inworld_shadow_from_env()
     if _inworld_voice_profile_shadow is not None:
         _inworld_voice_profile_shadow.start()

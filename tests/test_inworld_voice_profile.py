@@ -351,5 +351,28 @@ class EmotionAnalyzerStatusTests(unittest.TestCase):
         self.assertFalse(status["api_key_present"])
 
 
+class ShadowTests(unittest.TestCase):
+    def test_disabled_without_global_inworld_flag(self):
+        with mock.patch.dict(
+            os.environ,
+            {"INWORLD_ENABLED": "false", "INWORLD_VOICE_PROFILE_ENABLED": "true", "INWORLD_API_KEY": "abc"},
+            clear=False,
+        ):
+            self.assertIsNone(ivp.build_inworld_shadow_from_env())
+
+    def test_context_for_turn_returns_latest_profile_and_latency(self):
+        cfg = ivp.InworldConfig(
+            enabled=True, ws_url="wss://x", api_key="k", model_id="inworld/inworld-stt-1",
+            voice_profile_threshold=0.4, sample_rate=16000, emotion_confidence_floor=0.5,
+        )
+        shadow = ivp.InworldVoiceProfileShadow(cfg)
+        shadow.latest_profile = ivp.NormalizedVoiceProfile(energy="low", confidence=0.7)
+        shadow.latest_received_at = 12.0
+        profile, reason, latency = shadow.context_for_turn(10.0)
+        self.assertEqual(profile.energy, "low")
+        self.assertEqual(reason, "none")
+        self.assertEqual(latency, 2.0)
+
+
 if __name__ == "__main__":
     unittest.main()
