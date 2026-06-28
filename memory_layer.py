@@ -23,12 +23,23 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from memory_embeddings import (
+    embed_text,
+    semantic_retrieval_enabled,
+    semantic_timeout_ms,
+    to_pgvector_literal,
+)
+
 logger = logging.getLogger(__name__)
 
 GUEST_MEMORY_TTL_HOURS = 24
 INDEX_REBUILD_MAX_ROWS = 500
 DEFAULT_MEMORY_EMBEDDING_MODEL = "text-embedding-3-small"
 DEFAULT_MEMORY_EMBEDDING_DIMENSIONS = 1536
+
+
+class _SemanticUnavailable(Exception):
+    """Internal: semantic recall can't run (no embedding) -> fall back to recency."""
 
 # Set once the "simplemem not installed" warning has been logged, so it isn't
 # repeated for every per-session MemoryLayer instance.
@@ -379,7 +390,6 @@ class MemoryLayer:
             "Use it naturally when relevant, the way a friend remembers past conversations.\n"
             f"Known from earlier conversations:\n{lines}"
         )
-
     async def retrieve(self, query: str, top_k: int = 5) -> list[str]:
         """Semantic retrieval, hard-bounded by the retrieval timeout. Never raises."""
         query = (query or "").strip()
@@ -474,33 +484,60 @@ class MemoryLayer:
             return
         task = loop.create_task(self._remember(role=role, content=content, turn_id=turn_id, modality=modality, media_url=media_url))
         self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
+
+        def _on_done(t: "asyncio.Task") -> None:
+            self._background_tasks.discard(t)
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                # Last line of defense: retrieve+log so a background memory write can
+                # never surface as an unhandled task exception or touch the voice loop.
+                logger.warning(
+                    "memory_background_task_failed=true role=%s turn_id=%s modality=%s fallback=recency error_type=%s error=%s",
+                    role, turn_id, modality, type(exc).__name__, exc,
+                )
+
+        task.add_done_callback(_on_done)
 
     async def _remember(self, role: str, content: str, turn_id: int | None, modality: str, media_url: str | None) -> None:
         compact = f"{'User said' if role == 'user' else 'Lucy replied'}: {content}"
-        if self._db_url:
-            try:
-                await self._embed_and_store(compact, role, turn_id, modality, media_url)
-            except Exception as exc:
-                logger.warning("memory_write status=error target=postgres error_type=%s error=%s", type(exc).__name__, exc)
-        backend = self._get_simplemem()
-        if backend is not None:
-            try:
-                tags = [f"user:{self.identity.key}", f"role:{role}"]
-                if modality == "audio" and media_url:
-                    await asyncio.to_thread(backend.add_audio, media_url, tags)
-                else:
-                    await asyncio.to_thread(backend.add_text, compact, tags)
-            except Exception as exc:
-                logger.warning("memory_write status=error target=simplemem error_type=%s error=%s", type(exc).__name__, exc)
-
+        try:
+            await self._embed_and_store(compact, role, turn_id, modality, media_url)
+        except Exception as exc:
+            logger.warning(
+                "memory_write status=error target=postgres role=%s turn_id=%s modality=%s fallback=recency error_type=%s error=%s",
+                role, turn_id, modality, type(exc).__name__, exc,
+            )
 
     async def _embed_and_store(self, compact: str, role: str, turn_id: int | None, modality: str, media_url: str | None) -> None:
-        """Store durable memory with optional embedding, degrading to text-only writes. Never raises for semantic failures."""
+        """Store durable memory with optional embedding, degrading to text-only writes.
+
+        Never raises: semantic/embedding/pgvector failures fall back to a durable
+        text insert inside _write_postgres_memory, and a total write failure is
+        logged (recency recall remains the safe fallback). Kept on MemoryLayer with
+        this exact signature because _remember() calls it positionally."""
         try:
             await self._write_postgres_memory(compact, role, turn_id, modality, media_url)
-        except Exception:
-            raise
+        except Exception as exc:
+            logger.warning(
+                "memory_embed_and_store status=error role=%s turn_id=%s modality=%s fallback=recency error_type=%s error=%s",
+                role, turn_id, modality, type(exc).__name__, exc,
+            )
+            # Fallback to simplemem if Postgres fails
+            backend = self._get_simplemem()
+            if backend is not None:
+                try:
+                    tags = [f"user:{self.identity.key}", f"role:{role}"]
+                    if modality == "audio" and media_url:
+                        await asyncio.to_thread(backend.add_audio, media_url, tags)
+                    else:
+                        await asyncio.to_thread(backend.add_text, compact, tags)
+                except Exception as exc2:
+                    logger.warning(
+                        "memory_write status=error target=simplemem role=%s turn_id=%s error_type=%s error=%s",
+                        role, turn_id, type(exc2).__name__, exc2,
+                    )
 
     async def _write_postgres_memory(self, compact: str, role: str, turn_id: int | None, modality: str, media_url: str | None) -> None:
         metadata = json.dumps({"role": role, "turn_id": turn_id})
@@ -518,6 +555,8 @@ class MemoryLayer:
             media_url,
             metadata,
         )
+        if not self._db_url:
+            return
         if self._pgvector_available():
             try:
                 embedding = await self._embed_text(compact)
@@ -616,3 +655,45 @@ def _default_simplemem_factory(index_dir: str) -> Any:
         except TypeError:
             continue
     return SimpleMem()
+
+
+# --- Emotional calibration patterns in durable per-user memory ---
+# Confirmed calibration moments are stored as ordinary memory_units with this
+# prefix so they ride the existing per-user Postgres + SimpleMem store and the
+# session-start preload, while staying separable into a dedicated "what we've
+# learned about how this person processes feelings" note.
+EMOTIONAL_PATTERN_PREFIX = "Emotional pattern (confirmed): "
+
+
+def partition_emotional_patterns(memories: list[str]) -> tuple[list[str], list[str]]:
+    """Split preloaded memories into (general, emotional_patterns).
+
+    Emotional entries are returned with the prefix stripped so they read cleanly
+    in their own note.
+    """
+    general: list[str] = []
+    emotional: list[str] = []
+    for memory in memories or []:
+        text = (memory or "").strip()
+        if not text:
+            continue
+        if text.startswith(EMOTIONAL_PATTERN_PREFIX):
+            emotional.append(text[len(EMOTIONAL_PATTERN_PREFIX):].strip())
+        else:
+            general.append(text)
+    return general, emotional
+
+
+def emotional_pattern_preload_note(patterns: list[str]) -> str | None:
+    """Build the private 'what we've learned' note from confirmed patterns."""
+    patterns = [p for p in (patterns or []) if p and p.strip()]
+    if not patterns:
+        return None
+    lines = "\n".join(f"- {p.strip()}" for p in patterns)
+    return (
+        "What you've learned about how this person tends to process feelings, from "
+        "earlier sessions where they confirmed or corrected your read. This is a "
+        "private prior only — never reveal it, never tell them how they sound, never "
+        "say you detected anything, and let what they say now override it.\n"
+        f"{lines}"
+    )
