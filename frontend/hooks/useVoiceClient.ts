@@ -7,6 +7,14 @@ export type VoiceState = "idle" | "initializing" | "connecting" | "connected" | 
 
 type SessionResponse = { room_url: string; token: string };
 
+// Build marker. Bump `id` whenever client audio/playout behavior changes so that a
+// glance at the browser console on connect confirms which bundle is actually live —
+// frontend deploys and a stale browser cache are the usual reason a fix "isn't
+// working." `audioPath: "single"` is the one-<audio>-element playout that removed the
+// duplicated-voice / tail-cutoff artifact; if you don't see this line (or it shows an
+// older id) when a call connects, the browser is still running a cached old bundle.
+const FRONTEND_BUILD = { id: "2026-06-28-single-audio-path", audioPath: "single" } as const;
+
 function getClientTimezone() {
   return Intl.DateTimeFormat().resolvedOptions().timeZone;
 }
@@ -99,7 +107,15 @@ export function useVoiceClient(options?: { onServerDisconnect?: () => void }) {
       if (connectAttemptRef.current !== attemptId) return;
       const room = new Room();
       roomRef.current = room;
-      room.on(RoomEvent.Connected, () => setState(isMuted ? "muted" : "connected"));
+      room.on(RoomEvent.Connected, () => {
+        // Confirms the running bundle at a glance — `audioPath=single` means the
+        // duplicated-voice / tail-cutoff fix is live; absence means a cached old bundle.
+        console.info(
+          `[LUCY build] ${FRONTEND_BUILD.id} · audioPath=${FRONTEND_BUILD.audioPath} ` +
+            "(single native <audio> element — duplicated-voice/tail-cutoff fix live)",
+        );
+        setState(isMuted ? "muted" : "connected");
+      });
       room.on(RoomEvent.Disconnected, () => {
         clearRemoteAudioElements();
         roomRef.current = null;
