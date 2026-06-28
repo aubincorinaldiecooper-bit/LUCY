@@ -3035,6 +3035,15 @@ def _inject_coherence_note(turn_ctx: object, reason: str) -> bool:
 # speaking->listening transition trims silence instead of the final word/breath.
 # 0 disables the hold (pure passthrough). Clamped to a sane ceiling.
 TTS_POST_SPEECH_HOLD_MS = env_int_clamped("TTS_POST_SPEECH_HOLD_MS", 0, 0, 5000)
+# Output makeup gain applied to TTS PCM frames at the source (server side), so
+# loudness can be raised WITHOUT a second browser audio stream — the old client
+# Web Audio boost was exactly the parallel stream that doubled/clipped the voice.
+# 1.0 = unchanged (zero-overhead passthrough). Hume output has headroom; keep
+# <= 2.0 to avoid clipping. Clamped 1.0..4.0.
+try:
+    TTS_OUTPUT_GAIN = max(1.0, min(4.0, float(os.getenv("TTS_OUTPUT_GAIN", "1.0") or "1.0")))
+except ValueError:
+    TTS_OUTPUT_GAIN = 1.0
 RUN_DB_MIGRATIONS_ON_STARTUP = env_bool("RUN_DB_MIGRATIONS_ON_STARTUP", False)
 
 # --- Session time limit -------------------------------------------------------
@@ -3381,6 +3390,69 @@ async def _with_post_speech_hold(source):
             "Post-speech playout hold applied: tts_post_speech_hold_applied=true hold_ms=%s silent_frames_appended=%s tts_path=%s",
             TTS_POST_SPEECH_HOLD_MS,
             appended,
+            _last_tts_path or "n/a",
+        )
+
+
+try:
+    import numpy as _np
+except Exception:  # numpy is a transitive dep; degrade to passthrough if absent
+    _np = None
+
+
+def _apply_output_gain_to_frame(frame: "rtc.AudioFrame", gain: float) -> "tuple[rtc.AudioFrame, int]":
+    """Scale a 16-bit PCM frame by ``gain`` with hard-clip protection.
+
+    Returns ``(frame, clipped_sample_count)``. A no-op (frame unchanged, 0
+    clipped) when gain is 1.0, numpy is unavailable, or the frame has no data.
+    """
+    if gain == 1.0 or _np is None:
+        return frame, 0
+    data = getattr(frame, "data", None)
+    if data is None:
+        return frame, 0
+    samples = _np.frombuffer(bytes(data), dtype=_np.int16).astype(_np.float32)
+    samples *= gain
+    clipped = int(_np.count_nonzero((samples > 32767.0) | (samples < -32768.0)))
+    _np.clip(samples, -32768.0, 32767.0, out=samples)
+    return (
+        rtc.AudioFrame(
+            data=samples.astype(_np.int16).tobytes(),
+            sample_rate=int(getattr(frame, "sample_rate", 48000) or 48000),
+            num_channels=int(getattr(frame, "num_channels", 1) or 1),
+            samples_per_channel=int(getattr(frame, "samples_per_channel", 0) or len(samples)),
+        ),
+        clipped,
+    )
+
+
+async def _with_output_gain(source):
+    """Apply ``TTS_OUTPUT_GAIN`` to each PCM frame (config-gated; 1.0 = passthrough).
+
+    Raises perceived loudness at the source so the client never needs a second,
+    parallel audio stream to boost volume (that parallel stream was the cause of
+    the doubled/clipped voice). Non-audio items pass through untouched.
+    """
+    if TTS_OUTPUT_GAIN == 1.0 or _np is None:
+        async for frame in source:
+            yield frame
+        return
+    frame_count = 0
+    clipped_total = 0
+    async for frame in source:
+        if isinstance(frame, rtc.AudioFrame):
+            new_frame, clipped = _apply_output_gain_to_frame(frame, TTS_OUTPUT_GAIN)
+            frame_count += 1
+            clipped_total += clipped
+            yield new_frame
+        else:
+            yield frame
+    if frame_count:
+        logger.info(
+            "tts_output_gain_applied=true gain=%s frames=%s clipped_samples=%s tts_path=%s",
+            TTS_OUTPUT_GAIN,
+            frame_count,
+            clipped_total,
             _last_tts_path or "n/a",
         )
 
@@ -6474,8 +6546,8 @@ class LucyAgent(Agent):
                         request_index,
                     )
 
-            return _with_post_speech_hold(_direct_hume_or_fallback_stream())
-        return _with_post_speech_hold(_direct_or_plugin_or_default())
+            return _with_post_speech_hold(_with_output_gain(_direct_hume_or_fallback_stream()))
+        return _with_post_speech_hold(_with_output_gain(_direct_or_plugin_or_default()))
 
     def llm_node(self, chat_ctx, tools, model_settings):
         datetime_user_text = _extract_latest_user_text_from_chat_ctx(chat_ctx)
