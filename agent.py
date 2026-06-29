@@ -8013,6 +8013,10 @@ async def _run_session_time_limit(session: AgentSession, ctx: JobContext) -> Non
         raise
 
 
+def _is_inworld_realtime_voice_engine_from_env() -> bool:
+    return os.getenv("VOICE_ENGINE", "").strip().lower() == "inworld_realtime"
+
+
 async def entrypoint(ctx: JobContext):
     job_started_at = time.monotonic()
     logger.info(
@@ -8023,7 +8027,15 @@ async def entrypoint(ctx: JobContext):
         os.getenv("RAILWAY_ENVIRONMENT_NAME", "n/a"),
     )
     _run_db_migrations_on_startup()
-    _log_memory_identity_readiness()
+
+    is_inworld_realtime = _is_inworld_realtime_voice_engine_from_env()
+    if is_inworld_realtime:
+        logger.info(
+            "inworld_realtime_exclusive_mode=true legacy_speech_pipeline_skipped=true skip_openrouter_llm=true skip_llm_warmup=true skip_transcript_context=true skip_greeting_prerender=true skip_stt_provider_setup=true skip_tts_provider_setup=true skip_vad_provider_setup=true skip_livekit_agent_session=true"
+        )
+        await _run_inworld_realtime_voice_engine(ctx)
+        return
+
     _log_livekit_tts_source_inspection()
     openrouter_model = os.getenv("OPENROUTER_MODEL", OPENROUTER_DEFAULT_MODEL)
     openrouter_api_key_present = bool(os.getenv("OPENROUTER_API_KEY", "").strip())
@@ -8302,10 +8314,6 @@ async def entrypoint(ctx: JobContext):
     if selected_voice_engine == "hume_evi":
         await _run_hume_evi_voice_engine(ctx)
         return
-    if selected_voice_engine == "inworld_realtime":
-        await _run_inworld_realtime_voice_engine(ctx)
-        return
-
     lucy_agent = LucyAgent(
         runtime_context=runtime_context,
         memory_layer=memory_layer_instance,

@@ -653,6 +653,66 @@ class MemoryLayer:
             base_params,
         )
 
+
+    async def _embed_and_store(self, compact: str, role: str, turn_id: int | None, modality: str, media_url: str | None) -> None:
+        """Store durable memory with optional embedding, degrading to text-only writes. Never raises for semantic failures."""
+        try:
+            await self._write_postgres_memory(compact, role, turn_id, modality, media_url)
+        except Exception:
+            raise
+
+    async def _write_postgres_memory(self, compact: str, role: str, turn_id: int | None, modality: str, media_url: str | None) -> None:
+        metadata = json.dumps({"role": role, "turn_id": turn_id})
+        base_params = (
+            self.identity.scope,
+            self.identity.clerk_user_id,
+            self.identity.guest_id,
+            self.companion_id,
+            compact,
+            _content_hash(compact),
+            self.identity.scope == "account",
+            self.identity.scope,
+            GUEST_MEMORY_TTL_HOURS,
+            modality,
+            media_url,
+            metadata,
+        )
+        if self._pgvector_available():
+            try:
+                embedding = await self._embed_text(compact)
+                await asyncio.to_thread(
+                    self._db_writer,
+                    """
+                    INSERT INTO memory_units
+                      (memory_scope, clerk_user_id, guest_id, companion_id, content, content_hash,
+                       is_persistent, ttl_expires_at, modality, media_url, metadata,
+                       embedding, embedding_model, embedding_created_at)
+                    VALUES
+                      (%s, %s, %s, %s, %s, %s, %s,
+                       CASE WHEN %s = 'guest' THEN now() + make_interval(hours => %s) ELSE NULL END,
+                       %s, %s, %s::jsonb, %s::vector, %s, now())
+                    """,
+                    (*base_params, self._vector_literal(embedding), self._embedding_model),
+                )
+                logger.info("memory_write status=ok target=postgres backend=pgvector")
+                return
+            except Exception as exc:
+                self._vector_status = "error"
+                logger.warning("memory_write_pgvector_failed=true fallback=postgres_text error_type=%s error=%s", type(exc).__name__, exc)
+        await asyncio.to_thread(
+            self._db_writer,
+            """
+            INSERT INTO memory_units
+              (memory_scope, clerk_user_id, guest_id, companion_id, content, content_hash,
+               is_persistent, ttl_expires_at, modality, media_url, metadata)
+            VALUES
+              (%s, %s, %s, %s, %s, %s, %s,
+               CASE WHEN %s = 'guest' THEN now() + make_interval(hours => %s) ELSE NULL END,
+               %s, %s, %s::jsonb)
+            """,
+            base_params,
+        )
+
     async def rebuild_index_if_empty(self) -> None:
         """Re-ingest recent Postgres memories when the container has a fresh/empty index."""
         backend = self._get_simplemem()
