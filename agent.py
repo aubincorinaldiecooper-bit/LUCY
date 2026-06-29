@@ -61,7 +61,14 @@ from interaction_state import (
     build_audio_environment_decision,
     classify_turn_kind,
 )
-from memory_layer import MemoryLayer, identity_from_metadata, memory_enabled
+from memory_layer import (
+    EMOTIONAL_PATTERN_PREFIX,
+    MemoryLayer,
+    emotional_pattern_preload_note,
+    identity_from_metadata,
+    memory_enabled,
+    partition_emotional_patterns,
+)
 from runtime_context import (
     RuntimeContext,
     answer_datetime_intent,
@@ -92,6 +99,12 @@ from transcript_context import (
     transcript_context_llm_enabled,
     transcript_context_llm_model,
     transcript_context_llm_timeout_ms,
+)
+from voice_interruption import (
+    classify_tail_outcome,
+    is_audible_cutoff,
+    peak_dbfs,
+    tail_ends_in_silence,
 )
 from omnivoice_tts import OmniVoiceConfig, OmniVoiceTTS, find_omnivoice_tts
 from omnivoice_voice_pool import get_session_selector
@@ -305,6 +318,19 @@ _current_turn_audio_unclear = False
 _barge_in_during_thinking_turn_id = 0
 _barge_in_started_at = 0.0
 _barge_in_confirmed_real = False
+# Handoff-guard suppression recovery: when the guard drops a thinking-phase reply,
+# the barge-in is *expected* to commit a replacement turn. When it does not (a
+# brief continuation, a backchannel, or speech the STT never finalizes), the
+# conversation would dead-end in silence. These track the most recently suppressed
+# reply so a watchdog can re-speak it if no replacement ever takes the floor.
+_suppressed_reply_pending = False
+_suppressed_reply_turn_id = 0
+_suppressed_reply_text = ""
+_suppressed_reply_armed_at = 0.0
+_suppressed_reply_recovery_task: "asyncio.Task | None" = None
+# Module-level handle to the live AgentSession, set at session start, so the
+# suppression-recovery watchdog can speak from a background task.
+_active_agent_session: "AgentSession | None" = None
 # Context-policy state: a thin in-memory conversation ledger (not a memory system)
 # used only to inject recent VISIBLE turns and to carry a contextual intent
 # forward 1-2 turns. Suppressed/zero-audio/interrupted assistant turns are kept
@@ -826,6 +852,10 @@ def _record_hume_speech_audio_frame(coverage: HumeSpeechAudioCoverage | None, va
     if coverage.first_frame_at is None:
         coverage.first_frame_at = now
     coverage.last_frame_at = now
+    # Keep a rolling tail buffer (~last 1s mono int16) for end-of-speech silence
+    # analysis. Cheap and independent of WAV capture.
+    tail_cap = 96_000
+    coverage.tail_pcm = (coverage.tail_pcm + pcm)[-tail_cap:]
     if coverage.capture_chunks is not None and not coverage.capture_truncated:
         max_bytes = _hume_wav_artifact_max_bytes()
         captured_so_far = sum(len(chunk) for chunk in coverage.capture_chunks)
@@ -839,6 +869,39 @@ def _hume_generated_audio_duration_seconds(coverage: HumeSpeechAudioCoverage | N
     if coverage is None or coverage.sample_rate <= 0:
         return None
     return coverage.sample_count / coverage.sample_rate
+
+
+def _hume_tail_audio_analysis(coverage: HumeSpeechAudioCoverage | None, *, window_ms: int = 200) -> dict | None:
+    """Measure the trailing window of the synthesized PCM to tell whether the
+    audio ends in silence (clean decay -> any perceived cut is downstream of
+    synthesis) or on a loud sample (the TTS itself returned a clipped tail).
+    Best-effort; returns None if there is no usable PCM."""
+    if coverage is None or not coverage.tail_pcm:
+        return None
+    sample_rate = coverage.sample_rate or 48000
+    num_channels = coverage.num_channels or 1
+    try:
+        import array
+
+        samples = array.array("h")
+        # int16 frames; ensure even byte length before parsing.
+        raw = coverage.tail_pcm
+        if len(raw) % 2:
+            raw = raw[:-1]
+        samples.frombytes(raw)
+        if not samples:
+            return None
+        window_samples = max(1, int(sample_rate * num_channels * window_ms / 1000))
+        window = samples[-window_samples:]
+        peak = max((abs(s) for s in window), default=0)
+    except Exception:
+        return None
+    return {
+        "window_ms": window_ms,
+        "tail_peak_amplitude": peak,
+        "tail_peak_dbfs": peak_dbfs(peak),
+        "tail_ends_in_silence": tail_ends_in_silence(peak),
+    }
 
 
 def _write_hume_wav_artifact(coverage: HumeSpeechAudioCoverage) -> str | None:
@@ -895,6 +958,26 @@ def _finalize_hume_speech_audio_coverage(coverage: HumeSpeechAudioCoverage | Non
         coverage.capture_truncated,
         error_type,
     )
+    tail_analysis = _hume_tail_audio_analysis(coverage)
+    if tail_analysis is not None:
+        # ends_in_silence=true  -> synthesis tail is intact; a perceived clip is
+        #                          downstream (client playout / device).
+        # ends_in_silence=false -> the TTS returned audio that ends mid-word
+        #                          (the clip is in synthesis itself).
+        logger.info(
+            "assistant_tail_audio_check speech_id=%s turn_id=%s tail_window_ms=%s "
+            "tail_peak_amplitude=%s tail_peak_dbfs=%.1f tail_ends_in_silence=%s "
+            "synthesis_tail_intact=%s likely_clip_source=%s wav_artifact_path=%s",
+            coverage.speech_id,
+            coverage.turn_id,
+            tail_analysis["window_ms"],
+            tail_analysis["tail_peak_amplitude"],
+            tail_analysis["tail_peak_dbfs"],
+            tail_analysis["tail_ends_in_silence"],
+            tail_analysis["tail_ends_in_silence"],
+            "downstream_playout" if tail_analysis["tail_ends_in_silence"] else "tts_synthesis",
+            artifact_path or "none",
+        )
     return coverage
 
 
@@ -1972,6 +2055,47 @@ def attach_session_diagnostics(session: AgentSession) -> None:
                         was_suppressed,
                         hume_coverage.artifact_path or "none",
                     )
+                # Tail outcome: classify what actually happened from playout timing +
+                # audio lifecycle, instead of treating every interrupted=True as a
+                # cutoff. Audio fully played (playout >= generated) means an
+                # interruption landed after the tail, not a real cut.
+                _audio_fully_played = (
+                    generated_duration is not None
+                    and speech_duration_seconds is not None
+                    and speech_duration_seconds >= 0
+                    and (speech_duration_seconds + 0.1) >= generated_duration
+                )
+                _tail_outcome = classify_tail_outcome(
+                    generated_audio_duration_s=generated_duration,
+                    playout_started_at=speaking_at,
+                    playout_completed_at=(
+                        listening_at if (not effective_interrupted or _audio_fully_played) else None
+                    ),
+                    interrupted_at=(listening_at if effective_interrupted else None),
+                    interrupted=bool(effective_interrupted),
+                    was_stale=bool(was_stale),
+                    was_active=bool(was_active),
+                    hume_requests_during_speech=during_count if during_count and during_count > 0 else 0,
+                )
+                logger.info(
+                    "assistant_speech_tail_outcome speech_id=%s generated_audio_duration_seconds=%s "
+                    "playout_started_at=%s playout_completed_at=%s interrupted_at=%s interrupted=%s "
+                    "fsm_observed_interrupted=%s handle_interrupted=%s was_stale=%s was_active=%s "
+                    "hume_requests_during_speech=%s tail_outcome=%s audible_cutoff=%s",
+                    done_id,
+                    _fmt_seconds(generated_duration),
+                    _fmt_seconds(speaking_at) if speaking_at is not None else "none",
+                    _fmt_seconds(listening_at) if listening_at is not None else "none",
+                    _fmt_seconds(listening_at) if effective_interrupted and listening_at is not None else "none",
+                    effective_interrupted,
+                    fsm_observed_interrupted,
+                    interrupted,
+                    was_stale,
+                    was_active,
+                    during_count,
+                    _tail_outcome,
+                    is_audible_cutoff(_tail_outcome),
+                )
                 logger.info(
                     "Assistant handoff timing: speech_id=%s speech_duration_seconds=%.3f agent_speaking_to_finished_seconds=%.3f finish_to_agent_listening_seconds=%.3f interrupted=%s was_suppressed=%s active_count=%s",
                     done_id,
@@ -2626,9 +2750,15 @@ def _classify_assistant_tail_outcome(
     generated_audio_duration_seconds: float | None,
     hume_requests_during_speech: int | None,
 ) -> dict[str, object]:
-    hume_request_count_allows_audio = hume_requests_during_speech is None or hume_requests_during_speech != 0
-    produced_hume_audio = hume_request_count_allows_audio and bool(
-        generated_audio_duration_seconds and generated_audio_duration_seconds > 0
+    # Audio is considered produced if EITHER Hume coverage reports a positive
+    # duration OR hume_requests_during_speech is positive. The Hume counter
+    # only increments when HUME_HTTP_DEBUG is enabled, so in production it
+    # stays 0 even for multi-second speeches — gating on it mislabels every
+    # real speech as a ghost handle. Mirrors the logic in
+    # voice_interruption.classify_tail_outcome.
+    produced_hume_audio = (
+        bool(generated_audio_duration_seconds and generated_audio_duration_seconds > 0)
+        or (hume_requests_during_speech or 0) > 0
     )
     if not produced_hume_audio:
         return {
@@ -2912,6 +3042,15 @@ def _inject_coherence_note(turn_ctx: object, reason: str) -> bool:
 # speaking->listening transition trims silence instead of the final word/breath.
 # 0 disables the hold (pure passthrough). Clamped to a sane ceiling.
 TTS_POST_SPEECH_HOLD_MS = env_int_clamped("TTS_POST_SPEECH_HOLD_MS", 0, 0, 5000)
+# Output makeup gain applied to TTS PCM frames at the source (server side), so
+# loudness can be raised WITHOUT a second browser audio stream — the old client
+# Web Audio boost was exactly the parallel stream that doubled/clipped the voice.
+# 1.0 = unchanged (zero-overhead passthrough). Hume output has headroom; keep
+# <= 2.0 to avoid clipping. Clamped 1.0..4.0.
+try:
+    TTS_OUTPUT_GAIN = max(1.0, min(4.0, float(os.getenv("TTS_OUTPUT_GAIN", "1.0") or "1.0")))
+except ValueError:
+    TTS_OUTPUT_GAIN = 1.0
 RUN_DB_MIGRATIONS_ON_STARTUP = env_bool("RUN_DB_MIGRATIONS_ON_STARTUP", False)
 
 # --- Session time limit -------------------------------------------------------
@@ -3000,6 +3139,15 @@ LLM_TO_TTS_HANDOFF_GUARD_ENABLED = env_bool("LLM_TO_TTS_HANDOFF_GUARD_ENABLED", 
 # handoff guard treats it as a real new utterance and suppresses the stale reply.
 # Filters coughs/VAD blips. Only consulted when the guard is enabled.
 HANDOFF_GUARD_MIN_SPEECH_MS = env_int_clamped("HANDOFF_GUARD_MIN_SPEECH_MS", 350, 0, 5000)
+# Suppression recovery: after the handoff guard drops a reply, wait this grace and
+# then re-speak it IF no replacement turn took the floor (a guarantee that a
+# suppression can never leave unbounded dead air). Enabled by default because it
+# is a no-op unless a suppression actually fires (i.e. unless the guard is on).
+HANDOFF_GUARD_RECOVERY_ENABLED = env_bool("HANDOFF_GUARD_RECOVERY_ENABLED", True)
+# Grace before recovery speaks. Must exceed the endpointing window (~900ms) plus
+# turn-commit latency so a genuine replacement turn is given every chance to take
+# over first; only a barge-in that never commits a turn trips the recovery.
+HANDOFF_GUARD_RECOVERY_GRACE_MS = env_int_clamped("HANDOFF_GUARD_RECOVERY_GRACE_MS", 1500, 0, 10000)
 
 
 def _handoff_guard_should_suppress(turn_id: int) -> tuple[bool, str]:
@@ -3019,6 +3167,159 @@ def _handoff_guard_should_suppress(turn_id: int) -> tuple[bool, str]:
     if _barge_in_confirmed_real or elapsed_ms >= HANDOFF_GUARD_MIN_SPEECH_MS:
         return True, f"real_barge_in_during_thinking:elapsed_ms={elapsed_ms:.0f}:min_ms={HANDOFF_GUARD_MIN_SPEECH_MS}"
     return False, f"barge_in_below_min_speech:elapsed_ms={elapsed_ms:.0f}:min_ms={HANDOFF_GUARD_MIN_SPEECH_MS}"
+
+
+# Interaction-state names that mean "the floor is busy" — a replacement reply is
+# already in flight or the user is mid-utterance — so the suppressed reply must
+# NOT be re-spoken (doing so would talk over a real turn / the user).
+_RECOVERY_FLOOR_BUSY_STATES = frozenset(
+    {
+        "USER_SPEAKING",
+        "USER_INTERRUPTING",
+        "COMMITTED_TURN",
+        "ASSISTANT_THINKING",
+        "ASSISTANT_SPEAKING",
+        "HOLDING_FRAGMENT",
+    }
+)
+
+
+def _should_recover_suppressed_reply(
+    *,
+    armed_turn_id: int,
+    current_turn_id: int,
+    interaction_state: str,
+    has_text: bool,
+) -> tuple[bool, str]:
+    """Decide whether a handoff-guard-suppressed reply should be re-spoken once the
+    recovery grace elapses.
+
+    Recover only when the suppression would otherwise leave dead air:
+      * there is text to speak,
+      * the same turn is still current (no replacement turn committed since — a new
+        turn would generate its own reply, so re-speaking would double up), and
+      * the floor is open (the user is not mid-utterance and nothing is being
+        produced). A stale USER_TURN_CANDIDATE that never committed a turn (the
+        exact dead-air case) counts as open.
+
+    Pure/deterministic so it can be unit-tested without the session or asyncio.
+    """
+    if not has_text:
+        return False, "no_text"
+    if current_turn_id != armed_turn_id:
+        return False, "superseded_by_new_turn"
+    state = (interaction_state or "").strip().upper()
+    if state in _RECOVERY_FLOOR_BUSY_STATES:
+        return False, f"floor_busy:{state.lower()}"
+    return True, f"open_floor:{state.lower() or 'unknown'}"
+
+
+def _arm_suppressed_reply_recovery(turn_id: int, text: str) -> None:
+    """Record a handoff-guard-suppressed reply and schedule a watchdog that
+    re-speaks it if no replacement turn takes the floor within the grace window.
+
+    A no-op when recovery is disabled, the text is empty, or no event loop is
+    running (e.g. unit tests that exercise suppression synchronously)."""
+    global _suppressed_reply_pending, _suppressed_reply_turn_id, _suppressed_reply_text
+    global _suppressed_reply_armed_at, _suppressed_reply_recovery_task
+    if not HANDOFF_GUARD_RECOVERY_ENABLED:
+        return
+    clean = (text or "").strip()
+    if not clean:
+        return
+    _suppressed_reply_pending = True
+    _suppressed_reply_turn_id = turn_id
+    _suppressed_reply_text = clean
+    _suppressed_reply_armed_at = time.monotonic()
+    # A newer suppression supersedes any pending watchdog.
+    if _suppressed_reply_recovery_task is not None and not _suppressed_reply_recovery_task.done():
+        _suppressed_reply_recovery_task.cancel()
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        _suppressed_reply_recovery_task = None
+        return
+    _suppressed_reply_recovery_task = loop.create_task(_suppressed_reply_recovery_watchdog(turn_id))
+    logger.info(
+        "handoff_guard_recovery_armed=true turn_id=%s grace_ms=%s text_length=%s",
+        turn_id,
+        HANDOFF_GUARD_RECOVERY_GRACE_MS,
+        len(clean),
+    )
+
+
+def _clear_suppressed_reply_recovery(reason: str) -> None:
+    """Cancel any pending suppression-recovery watchdog (a real replacement turn or
+    session teardown supersedes it)."""
+    global _suppressed_reply_pending, _suppressed_reply_recovery_task
+    if not _suppressed_reply_pending and _suppressed_reply_recovery_task is None:
+        return
+    if _suppressed_reply_pending:
+        logger.info(
+            "handoff_guard_recovery_cleared=true reason=%s suppressed_turn_id=%s",
+            reason,
+            _suppressed_reply_turn_id,
+        )
+    _suppressed_reply_pending = False
+    if _suppressed_reply_recovery_task is not None and not _suppressed_reply_recovery_task.done():
+        _suppressed_reply_recovery_task.cancel()
+    _suppressed_reply_recovery_task = None
+
+
+async def _suppressed_reply_recovery_watchdog(turn_id: int) -> None:
+    """After the recovery grace, re-speak a suppressed reply if it would otherwise
+    leave dead air. See `_should_recover_suppressed_reply` for the decision."""
+    global _suppressed_reply_pending
+    global _barge_in_during_thinking_turn_id, _barge_in_started_at, _barge_in_confirmed_real
+    try:
+        await asyncio.sleep(HANDOFF_GUARD_RECOVERY_GRACE_MS / 1000.0)
+    except asyncio.CancelledError:
+        return
+    # Only act on the latest arming for this turn (a newer suppression/clear wins).
+    if not _suppressed_reply_pending or _suppressed_reply_turn_id != turn_id:
+        return
+    state = str(getattr(_interaction_state, "state", "") or "")
+    text = _suppressed_reply_text
+    should, reason = _should_recover_suppressed_reply(
+        armed_turn_id=turn_id,
+        current_turn_id=_current_turn_id,
+        interaction_state=state,
+        has_text=bool(text.strip()),
+    )
+    _suppressed_reply_pending = False  # consume this arming either way
+    if not should:
+        logger.info(
+            "handoff_guard_recovery_skipped=true turn_id=%s reason=%s interaction_state=%s",
+            turn_id,
+            reason,
+            state or "unknown",
+        )
+        return
+    session = _active_agent_session
+    if session is None:
+        logger.warning("handoff_guard_recovery_unavailable=true turn_id=%s reason=no_session", turn_id)
+        return
+    # Clear the stale barge-in latch first: we have decided the barge-in produced no
+    # replacement turn, so it must not suppress this recovery utterance in tts_node.
+    _barge_in_during_thinking_turn_id = 0
+    _barge_in_started_at = 0.0
+    _barge_in_confirmed_real = False
+    try:
+        logger.warning(
+            "handoff_guard_recovery_spoken=true turn_id=%s reason=%s text_length=%s",
+            turn_id,
+            reason,
+            len(text),
+        )
+        # The suppressed reply was already added to the chat context, so re-speaking
+        # it must not duplicate that entry — only (re)produce the audio.
+        await session.say(text, allow_interruptions=True, add_to_chat_ctx=False)
+    except Exception as exc:
+        logger.warning(
+            "handoff_guard_recovery_say_failed=true turn_id=%s error=%s",
+            turn_id,
+            _redact_sensitive_text(exc),
+        )
 
 
 CONTEXT_WINDOW_TURNS = env_int_clamped("CONTEXT_WINDOW_TURNS", 10, 4, 100)
@@ -3100,6 +3401,69 @@ async def _with_post_speech_hold(source):
         )
 
 
+try:
+    import numpy as _np
+except Exception:  # numpy is a transitive dep; degrade to passthrough if absent
+    _np = None
+
+
+def _apply_output_gain_to_frame(frame: "rtc.AudioFrame", gain: float) -> "tuple[rtc.AudioFrame, int]":
+    """Scale a 16-bit PCM frame by ``gain`` with hard-clip protection.
+
+    Returns ``(frame, clipped_sample_count)``. A no-op (frame unchanged, 0
+    clipped) when gain is 1.0, numpy is unavailable, or the frame has no data.
+    """
+    if gain == 1.0 or _np is None:
+        return frame, 0
+    data = getattr(frame, "data", None)
+    if data is None:
+        return frame, 0
+    samples = _np.frombuffer(bytes(data), dtype=_np.int16).astype(_np.float32)
+    samples *= gain
+    clipped = int(_np.count_nonzero((samples > 32767.0) | (samples < -32768.0)))
+    _np.clip(samples, -32768.0, 32767.0, out=samples)
+    return (
+        rtc.AudioFrame(
+            data=samples.astype(_np.int16).tobytes(),
+            sample_rate=int(getattr(frame, "sample_rate", 48000) or 48000),
+            num_channels=int(getattr(frame, "num_channels", 1) or 1),
+            samples_per_channel=int(getattr(frame, "samples_per_channel", 0) or len(samples)),
+        ),
+        clipped,
+    )
+
+
+async def _with_output_gain(source):
+    """Apply ``TTS_OUTPUT_GAIN`` to each PCM frame (config-gated; 1.0 = passthrough).
+
+    Raises perceived loudness at the source so the client never needs a second,
+    parallel audio stream to boost volume (that parallel stream was the cause of
+    the doubled/clipped voice). Non-audio items pass through untouched.
+    """
+    if TTS_OUTPUT_GAIN == 1.0 or _np is None:
+        async for frame in source:
+            yield frame
+        return
+    frame_count = 0
+    clipped_total = 0
+    async for frame in source:
+        if isinstance(frame, rtc.AudioFrame):
+            new_frame, clipped = _apply_output_gain_to_frame(frame, TTS_OUTPUT_GAIN)
+            frame_count += 1
+            clipped_total += clipped
+            yield new_frame
+        else:
+            yield frame
+    if frame_count:
+        logger.info(
+            "tts_output_gain_applied=true gain=%s frames=%s clipped_samples=%s tts_path=%s",
+            TTS_OUTPUT_GAIN,
+            frame_count,
+            clipped_total,
+            _last_tts_path or "n/a",
+        )
+
+
 def _safe_source_excerpt(obj: object, max_chars: int) -> str:
     try:
         src = inspect.getsource(obj)
@@ -3171,6 +3535,68 @@ def _log_livekit_tts_source_inspection() -> None:
     logger.info("LiveKit Hume TTS class source excerpt (max_8000): %s", hume_src)
     logger.info("LiveKit Hume TTS.synthesize signature=%s source_excerpt(max_4000): %s", hume_synthesize_sig, hume_synthesize_src)
     logger.info("LiveKit Hume TTS.stream signature=%s source_excerpt(max_4000): %s", hume_stream_sig, hume_stream_src)
+
+
+def _log_memory_identity_readiness() -> None:
+    """One-line startup readiness check so the Railway config is verifiable at a
+    glance: whether long-term memory, per-user identity, and the SimpleMem index
+    are actually active. Logs presence only (never secret values)."""
+    try:
+        import importlib.util
+        simplemem_installed = importlib.util.find_spec("simplemem") is not None
+    except Exception:  # noqa: BLE001 - readiness check must never raise
+        simplemem_installed = False
+    logger.info(
+        "memory_identity_readiness: memory_enabled=%s database_url_present=%s "
+        "session_identity_shared_secret_present=%s simplemem_installed=%s "
+        "simplemem_index_dir=%s memory_preload_limit=%s "
+        "note=%s",
+        memory_enabled(),
+        bool(os.getenv("DATABASE_URL")),
+        bool(os.getenv("SESSION_IDENTITY_SHARED_SECRET")),
+        simplemem_installed,
+        os.getenv("SIMPLEMEM_INDEX_DIR", "/data/simplemem"),
+        os.getenv("MEMORY_PRELOAD_LIMIT", "10"),
+        "set MEMORY_ENABLED=true and a shared SESSION_IDENTITY_SHARED_SECRET on both "
+        "frontend+backend for per-user cross-session memory; simplemem optional "
+        "(falls back to Postgres recency)",
+    )
+    # Semantic-memory / embedding readiness + the active fallback mode.
+    try:
+        from memory_layer import (
+            memory_embedding_dimensions,
+            memory_embedding_model,
+            memory_vector_enabled,
+        )
+        semantic_on = memory_vector_enabled()
+        embed_model = memory_embedding_model()
+        embed_dim = memory_embedding_dimensions()
+    except Exception:  # noqa: BLE001 - readiness check must never raise
+        semantic_on, embed_model, embed_dim = False, "unknown", 0
+    provider = (os.getenv("MEMORY_EMBEDDING_PROVIDER") or "openai").strip().lower()
+    key_present = bool(
+        (os.getenv("COHERE_API_KEY") if provider == "cohere" else os.getenv("OPENAI_API_KEY"))
+    )
+    if not memory_enabled():
+        fallback_mode = "disabled"
+    elif semantic_on and key_present:
+        fallback_mode = "semantic_pgvector"
+    elif simplemem_installed:
+        fallback_mode = "simplemem"
+    else:
+        fallback_mode = "recency_text"
+    logger.info(
+        "memory_semantic_readiness: semantic_memory_enabled=%s embedding_provider=%s "
+        "embedding_model=%s embedding_dim=%s embedding_key_present=%s "
+        "simplemem_active=%s memory_fallback_mode=%s",
+        semantic_on,
+        provider,
+        embed_model,
+        embed_dim,
+        key_present,
+        simplemem_installed,
+        fallback_mode,
+    )
 
 
 def _run_db_migrations_on_startup() -> None:
@@ -4134,6 +4560,11 @@ class HumeSpeechAudioCoverage:
     capture_chunks: list[bytes] | None = None
     capture_truncated: bool = False
     artifact_path: str | None = None
+    # Rolling buffer of the most recent PCM (int16) so we can analyze whether the
+    # synthesized audio ends in silence (tail intact) or is clipped mid-word.
+    # Kept independent of WAV capture so the tail check works even when capture
+    # is disabled. Capped so long speeches don't grow memory.
+    tail_pcm: bytes = b""
 
 
 def _normalized_words(text: str) -> list[str]:
@@ -4502,6 +4933,7 @@ def _complete_pending_calibration_moment(user_answer: str) -> None:
     moment["user_confirmed_or_corrected"] = bool(user_answer.strip())
     _calibration_moments.append(moment)
     _persist_calibration_moment(moment)
+    _remember_calibration_pattern(moment)
     logger.info(
         "emotional_calibration_moment_stored=true turn_id=%s session_id=%s user_answer_present=%s total_moments=%s",
         moment.get("turn_id"),
@@ -5681,6 +6113,7 @@ class LucyAgent(Agent):
             async def _logging_passthrough_stream() -> AsyncIterable[str]:
                 global _last_tts_received_text_hash, _last_tts_text_length, _last_tts_sentence_end_count, _last_tts_raw_chunk_count, _last_tts_normalized_yield_count, _last_tts_first_input_at
                 chunks: list[str] = []
+                suppressed_parts: list[str] = []
                 count = 0
                 yielded_any = False
                 suppressed = False
@@ -5702,12 +6135,19 @@ class LucyAgent(Agent):
                                     sup_reason,
                                 )
                         if suppressed:
-                            continue  # drain the source so upstream closes, yield nothing
+                            # Drain the source so upstream closes (yield nothing), but
+                            # keep the full text so recovery can re-speak it if the
+                            # barge-in never commits a replacement turn.
+                            if isinstance(chunk, str):
+                                suppressed_parts.append(chunk)
+                            continue
                         if isinstance(chunk, str):
                             chunks.append(chunk)
                         yielded_any = True
                         yield chunk
                 finally:
+                    if suppressed:
+                        _arm_suppressed_reply_recovery(_current_turn_id, "".join(suppressed_parts))
                     raw_text = "".join(chunks)
                     _last_tts_received_text_hash = _text_hash(raw_text)
                     _last_tts_text_length = len(raw_text)
@@ -5847,6 +6287,10 @@ class LucyAgent(Agent):
                     len(raw_text),
                     handoff_reason,
                 )
+                # Arm recovery so this drop can never become unbounded dead air: if
+                # the barge-in never commits a replacement turn, the watchdog
+                # re-speaks this reply once the floor reopens.
+                _arm_suppressed_reply_recovery(_current_turn_id, sanitized)
                 sanitized = ""
             normalized_text = self._normalize_spoken_text(sanitized)
             normalized_hash = _text_hash(normalized_text)
@@ -6079,8 +6523,8 @@ class LucyAgent(Agent):
                         request_index,
                     )
 
-            return _with_post_speech_hold(_direct_hume_or_fallback_stream())
-        return _with_post_speech_hold(_direct_or_plugin_or_default())
+            return _with_post_speech_hold(_with_output_gain(_direct_hume_or_fallback_stream()))
+        return _with_post_speech_hold(_with_output_gain(_direct_or_plugin_or_default()))
 
     def llm_node(self, chat_ctx, tools, model_settings):
         datetime_user_text = _extract_latest_user_text_from_chat_ctx(chat_ctx)
@@ -6713,6 +7157,9 @@ class LucyAgent(Agent):
         _barge_in_during_thinking_turn_id = 0
         _barge_in_started_at = 0.0
         _barge_in_confirmed_real = False
+        # A genuine replacement turn supersedes any reply suppressed on the prior
+        # turn — cancel its pending recovery so the watchdog can't double-speak.
+        _clear_suppressed_reply_recovery("new_turn_committed")
         # Attribute this commit against real user-speech signals (not only FSM
         # events, which can be missed): a recent user-speaking edge or a recent
         # STT final means the user genuinely spoke for this turn even if the FSM
@@ -7576,6 +8023,7 @@ async def entrypoint(ctx: JobContext):
         os.getenv("RAILWAY_ENVIRONMENT_NAME", "n/a"),
     )
     _run_db_migrations_on_startup()
+    _log_memory_identity_readiness()
     _log_livekit_tts_source_inspection()
     openrouter_model = os.getenv("OPENROUTER_MODEL", OPENROUTER_DEFAULT_MODEL)
     openrouter_api_key_present = bool(os.getenv("OPENROUTER_API_KEY", "").strip())
@@ -7704,7 +8152,11 @@ async def entrypoint(ctx: JobContext):
         "resume_false_interruption": env_bool("LIVEKIT_RESUME_FALSE_INTERRUPTION", True),
         "false_interruption_timeout": float(os.getenv("LIVEKIT_FALSE_INTERRUPTION_TIMEOUT", "1.8")),
     }
-    logger.info("Resolved interruption config: %s", interruption_options)
+    logger.info(
+        "Resolved interruption config: %s resume_false_interruption_active=%s",
+        interruption_options,
+        interruption_options.get("resume_false_interruption") and interruption_options.get("enabled"),
+    )
     endpointing_mode = os.getenv("LIVEKIT_ENDPOINTING_MODE", "dynamic")
     endpointing_min_delay = float(os.getenv("ENDPOINTING_MIN_DELAY_SECONDS", os.getenv("LIVEKIT_ENDPOINTING_MIN_DELAY", "1.1")))
     endpointing_max_delay = float(os.getenv("ENDPOINTING_MAX_DELAY_SECONDS", os.getenv("LIVEKIT_ENDPOINTING_MAX_DELAY", "2.4")))
@@ -7776,6 +8228,7 @@ async def entrypoint(ctx: JobContext):
     )
 
     global _active_memory_layer, _audiointeraction_shadow, _inworld_voice_profile_shadow, _calibration_session_id
+    global _active_memory_layer, _audiointeraction_shadow, _inworld_voice_profile_shadow, _calibration_session_id, _active_agent_session
     _calibration_session_id = str(_safe_attr(_safe_attr(ctx, "room"), "name") or "unknown")
     logger.info(
         "tts_runtime_selection hume_active=%s tts_provider=%s tts_fallback_provider=%s omnivoice_inactive=%s omnivoice_enabled=%s omnivoice_expressive_planner_enabled=%s",
@@ -7822,12 +8275,18 @@ async def entrypoint(ctx: JobContext):
         except asyncio.TimeoutError:
             preloaded_memories = []
             logger.warning("memory_preload status=timeout timeout_seconds=2.0")
-        memory_preload_note = MemoryLayer.preload_note(preloaded_memories)
+        # Split confirmed emotional-calibration patterns out of the general
+        # memories into their own private "what we've learned" note, and combine.
+        general_memories, emotional_patterns = partition_emotional_patterns(preloaded_memories)
+        general_note = MemoryLayer.preload_note(general_memories)
+        emotional_note = emotional_pattern_preload_note(emotional_patterns)
+        memory_preload_note = "\n\n".join(n for n in (general_note, emotional_note) if n) or None
         logger.info(
-            "Memory layer startup: memory_enabled=true memory_scope=%s memory_identity_present=%s preloaded_memory_count=%s preload_note_present=%s",
+            "Memory layer startup: memory_enabled=true memory_scope=%s memory_identity_present=%s preloaded_memory_count=%s emotional_pattern_count=%s preload_note_present=%s",
             memory_identity.scope,
             memory_identity.present,
-            len(preloaded_memories),
+            len(general_memories),
+            len(emotional_patterns),
             bool(memory_preload_note),
         )
         try:
@@ -7966,6 +8425,10 @@ async def entrypoint(ctx: JobContext):
         True,
     )
     session = AgentSession(**session_kwargs)
+    # Expose the live session so the suppression-recovery watchdog (armed from
+    # tts_node, fired from a background task) can re-speak a dropped reply.
+    _active_agent_session = session
+    _clear_suppressed_reply_recovery("session_start")
     resolved_stt = session_kwargs.get("stt")
     logger.info("Resolved STT type: %s", type(resolved_stt).__name__)
     resolved_vad = session_kwargs.get("vad")
