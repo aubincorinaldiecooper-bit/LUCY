@@ -230,6 +230,34 @@ def _iter_pcm_frames(pcm: bytes, *, sample_rate: int = INWORLD_OUTPUT_SAMPLE_RAT
         )
 
 
+def _safe_payload_shape(payload: dict[str, Any]) -> str:
+    """Return a safe representation of payload structure without secrets or audio data."""
+    def shape_value(v: Any) -> str:
+        if isinstance(v, dict):
+            keys = sorted(v.keys())
+            return "{" + ",".join(keys) + "}"
+        elif isinstance(v, list):
+            return "[...]"
+        elif isinstance(v, str):
+            if len(v) > 100:
+                return f"str({len(v)})"
+            return f'"{v}"'
+        elif isinstance(v, (int, float, bool)):
+            return str(type(v).__name__)
+        else:
+            return type(v).__name__
+
+    try:
+        keys = sorted(payload.keys())
+        items = []
+        for k in keys:
+            v = payload[k]
+            items.append(f"{k}:{shape_value(v)}")
+        return "{" + ",".join(items) + "}"
+    except Exception:
+        return "<?>"
+
+
 class InworldRealtimeLiveKitBridge:
     def __init__(self, room: rtc.Room, settings: InworldRealtimeSettings) -> None:
         self.room = room
@@ -242,6 +270,8 @@ class InworldRealtimeLiveKitBridge:
         self._session_ready = asyncio.Event()
         self._audio_forwarded_count = 0
         self._last_outbound_event_type: str | None = None
+        self._last_outbound_event_safe_shape: str | None = None
+        self._events_sent_since_session_updated = 0
         self._last_inbound_event_time = time.monotonic()
 
     async def run(self) -> None:
@@ -344,10 +374,8 @@ class InworldRealtimeLiveKitBridge:
                 pcm = _frame_bytes(frame)
                 if not pcm:
                     continue
-                await ws.send_json(build_audio_append_message(pcm))
+                await self._send_inworld_message(build_audio_append_message(pcm), reason="audio_frame_from_livekit")
                 self._audio_forwarded_count += 1
-                self._last_outbound_event_type = "input_audio_buffer.append"
-                logger.info("inworld_realtime_audio_input_forwarded=true bytes=%s", len(pcm) if inworld_realtime_log_audio() else "redacted")
         finally:
             await stream.aclose()
 
@@ -383,6 +411,43 @@ class InworldRealtimeLiveKitBridge:
         finally:
             self._closed.set()
 
+    async def _send_inworld_message(self, payload: dict[str, Any], reason: str = "unknown") -> None:
+        """Send a message to Inworld with comprehensive logging."""
+        if self._ws is None:
+            return
+
+        event_type = str(payload.get("type") or "unknown")
+        top_level_keys = sorted(payload.keys())
+        safe_shape = _safe_payload_shape(payload)
+        has_audio = "audio" in payload and isinstance(payload.get("audio"), str)
+        audio_len = len(payload.get("audio", "")) if has_audio else 0
+
+        logger.info(
+            "inworld_outbound_message event_type=%s reason=%s top_level_keys=%s safe_shape=%s has_audio=%s audio_base64_len=%s",
+            event_type,
+            reason,
+            ",".join(top_level_keys),
+            safe_shape,
+            has_audio,
+            audio_len if has_audio else "n/a",
+        )
+
+        try:
+            await self._ws.send_json(payload)
+            self._last_outbound_event_type = event_type
+            self._last_outbound_event_safe_shape = safe_shape
+            self._events_sent_since_session_updated += 1
+            logger.info("inworld_message_sent=true event_type=%s", event_type)
+        except Exception as exc:
+            logger.error(
+                "inworld_message_send_error=true event_type=%s error_type=%s error=%s safe_shape=%s",
+                event_type,
+                type(exc).__name__,
+                exc,
+                safe_shape,
+            )
+            raise
+
     async def _handle_inworld_message(self, payload: dict[str, Any]) -> None:
         msg_type = str(payload.get("type") or "")
 
@@ -392,11 +457,12 @@ class InworldRealtimeLiveKitBridge:
         if msg_type == "session.created":
             logger.info("inworld_session_created=true")
             # Send session.update immediately after session.created
-            await self._send_session_update()
+            await self._send_inworld_message(build_session_update(self.settings), reason="session_created")
 
         elif msg_type == "session.updated":
             logger.info("inworld_session_updated=true")
             self._session_ready.set()
+            self._events_sent_since_session_updated = 0
             # Run forced text test to prove output path works
             await self._run_forced_text_test()
 
@@ -448,7 +514,15 @@ class InworldRealtimeLiveKitBridge:
 
         elif msg_type == "error":
             error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
-            logger.error("inworld_server_error=true code=%s message=%s", error.get("code"), error.get("message"))
+            logger.error(
+                "inworld_server_error=true code=%s message=%s param=%s last_outbound_event_type=%s last_outbound_event_safe_shape=%s events_sent_since_session_updated=%s",
+                error.get("code"),
+                error.get("message"),
+                error.get("param"),
+                self._last_outbound_event_type or "none",
+                self._last_outbound_event_safe_shape or "none",
+                self._events_sent_since_session_updated,
+            )
 
         else:
             logger.info("inworld_server_event_unhandled type=%s", msg_type)
@@ -459,8 +533,7 @@ class InworldRealtimeLiveKitBridge:
             return
 
         update = build_session_update(self.settings)
-        await self._ws.send_json(update)
-        self._last_outbound_event_type = "session.update"
+        await self._send_inworld_message(update, reason="session_created")
 
         logger.info(
             "inworld_session_update_sent=true inworld_session_model=%s inworld_stt_model=%s inworld_tts_model=%s inworld_tts_voice=%s inworld_turn_detection_type=%s inworld_turn_detection_create_response=%s inworld_turn_detection_interrupt_response=%s effective_voice_profile_enabled=%s",
@@ -481,14 +554,12 @@ class InworldRealtimeLiveKitBridge:
 
         # Send conversation.item.create with test text
         item_create = build_conversation_item_create("Say hello in one short sentence.")
-        await self._ws.send_json(item_create)
-        self._last_outbound_event_type = "conversation.item.create"
+        await self._send_inworld_message(item_create, reason="forced_text_test")
         logger.info("inworld_force_text_test_sent=true")
 
         # Send response.create
         response_create = build_response_create()
-        await self._ws.send_json(response_create)
-        self._last_outbound_event_type = "response.create"
+        await self._send_inworld_message(response_create, reason="forced_text_test")
         logger.info("inworld_response_create_sent=true")
 
 
