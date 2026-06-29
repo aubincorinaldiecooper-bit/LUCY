@@ -28,7 +28,6 @@ try:  # livekit-agents >= 1.6.1 exposes the audio end-of-turn detector here
 except Exception:  # pragma: no cover - older SDKs
     _lk_inference = None
 from livekit import api, rtc
-from livekit.plugins import ai_coustics, deepgram, hume, mistralai, openai, silero
 from internet_search import (
     SEARCH_DISABLED_MESSAGE,
     SEARCH_TOOL_DESCRIPTION,
@@ -8035,6 +8034,8 @@ async def entrypoint(ctx: JobContext):
         )
         await _run_inworld_realtime_voice_engine(ctx)
         return
+    # Import legacy plugins only when not using Inworld Realtime
+    from livekit.plugins import ai_coustics, deepgram, hume, mistralai, openai
 
     _log_livekit_tts_source_inspection()
     openrouter_model = os.getenv("OPENROUTER_MODEL", OPENROUTER_DEFAULT_MODEL)
