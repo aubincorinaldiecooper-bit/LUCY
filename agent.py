@@ -2747,11 +2747,15 @@ def _classify_assistant_tail_outcome(
     playout_started_at: float | None,
     playout_completed_at: float | None,
     generated_audio_duration_seconds: float | None,
-    hume_requests_during_speech: int | None,
-) -> dict[str, object]:
-    hume_request_count_allows_audio = hume_requests_during_speech is None or hume_requests_during_speech != 0
-    produced_hume_audio = hume_request_count_allows_audio and bool(
-        generated_audio_duration_seconds and generated_audio_duration_seconds > 0
+    # Audio is considered produced if EITHER Hume coverage reports a positive
+    # duration OR hume_requests_during_speech is positive. The Hume counter
+    # only increments when HUME_HTTP_DEBUG is enabled, so in production it
+    # stays 0 even for multi-second speeches — gating on it mislabels every
+    # real speech as a ghost handle. Mirrors the logic in
+    # voice_interruption.classify_tail_outcome.
+    produced_hume_audio = (
+        bool(generated_audio_duration_seconds and generated_audio_duration_seconds > 0)
+        or (hume_requests_during_speech or 0) > 0
     )
     if not produced_hume_audio:
         return {
