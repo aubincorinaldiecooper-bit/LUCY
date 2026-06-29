@@ -1,16 +1,499 @@
 """LiveKit ⇄ Inworld Realtime speech-to-speech bridge.
 
-This path is selected with ``VOICE_ENGINE=inworld_realtime`` and keeps LiveKit as
+This path is selected with VOICE_ENGINE=inworld_realtime and keeps LiveKit as
 Arche's browser media transport while Inworld owns STT, TTS, and semantic VAD / turn
 detection. The existing cascaded LiveKit AgentSession remains available by leaving
-VOICE_ENGINE unset or set to ``current``.
+VOICE_ENGINE unset or set to current.
 
 Architecture:
   LiveKit mic/audio input
-    → livekit_to_inworld_audio_loop
-    → Inworld WebSocket
+    -> livekit_to_inworld_audio_loop
+    -> Inworld WebSocket
   Inworld WebSocket
-    → inworld_to_livekit_receive_loop
-    → decode output audio
-    → write PCM frames to LiveKit AudioSource
-\"\"\"\n\nfrom __future__ import annotations\n\nimport asyncio\nimport base64\nimport json\nimport logging\nimport os\nimport time\nfrom dataclasses import dataclass\nfrom typing import Any\nfrom urllib.parse import urlencode\n\nimport aiohttp\nfrom livekit import rtc\n\nlogger = logging.getLogger(__name__)\n\nINWORLD_INPUT_SAMPLE_RATE = 24000\nINWORLD_OUTPUT_SAMPLE_RATE = 24000\nINWORLD_CHANNELS = 1\nINWORLD_FRAME_MS = 60\n\n\ndef _env_bool(name: str, default: bool) -> bool:\n    raw = os.getenv(name)\n    if raw is None or not raw.strip():\n        return default\n    return raw.strip().lower() in {\"1\", \"true\", \"yes\", \"on\"}\n\n\ndef inworld_realtime_debug() -> bool:\n    return _env_bool(\"INWORLD_REALTIME_DEBUG\", False)\n\n\ndef inworld_realtime_log_audio() -> bool:\n    return _env_bool(\"INWORLD_REALTIME_LOG_AUDIO\", False)\n\n\ndef inworld_realtime_session_timeout_seconds() -> float:\n    try:\n        return max(1.0, float(os.getenv(\"INWORLD_REALTIME_SESSION_TIMEOUT_SECONDS\", \"1800\")))\n    except Exception:\n        return 1800.0\n\n\n@dataclass(frozen=True)\nclass InworldRealtimeSettings:\n    api_key: str\n    session_id: str\n    websocket_url: str\n    model: str\n    stt_model: str\n    tts_model: str\n    voice: str\n    speed: float\n    turn_detection_type: str\n    turn_detection_eagerness: str\n    turn_detection_create_response: bool\n    turn_detection_interrupt_response: bool\n    instructions: str\n    timeout_seconds: float\n    voice_profile_enabled: bool\n    input_format: str\n    output_format: str\n    auth_scheme: str\n\n    @property\n    def connection_url(self) -> str:\n        query = {\"key\": self.session_id, \"protocol\": \"realtime\"}\n        separator = \"&\" if \"?\" in self.websocket_url else \"?\"\n        return f\"{self.websocket_url}{separator}{urlencode(query)}\"\n\n    @property\n    def auth_headers(self) -> dict[str, str]:\n        # Inworld server-side WebSocket auth uses the Portal API key directly as\n        # an already-base64-encoded Basic credential.\n        if self.auth_scheme.lower() == \"bearer\":\n            return {\"Authorization\": f\"Bearer {self.api_key}\"}\n        else:\n            return {\"Authorization\": f\"Basic {self.api_key}\"}\n\n\ndef load_inworld_realtime_settings(*, instructions: str | None = None) -> InworldRealtimeSettings:\n    api_key = (os.getenv(\"INWORLD_API_KEY\") or \"\").strip()\n    session_id = (os.getenv(\"INWORLD_REALTIME_SESSION_ID\") or os.getenv(\"LIVEKIT_ROOM_NAME\") or f\"lucy-{int(time.time() * 1000)}\").strip()\n    if not api_key:\n        raise RuntimeError(\"VOICE_ENGINE=inworld_realtime requires INWORLD_API_KEY\")\n    if not session_id:\n        raise RuntimeError(\"VOICE_ENGINE=inworld_realtime requires INWORLD_REALTIME_SESSION_ID or a room-derived fallback\")\n    \n    auth_scheme = (os.getenv(\"INWORLD_AUTH_SCHEME\") or \"basic\").strip().lower()\n    logger.info(\n        \"inworld_auth_config raw_INWORLD_AUTH_SCHEME=%s inworld_auth_mode=%s\",\n        auth_scheme,\n        \"bearer_jwt\" if auth_scheme == \"bearer\" else \"basic_base64_api_key\",\n    )\n    \n    return InworldRealtimeSettings(\n        api_key=api_key,\n        session_id=session_id,\n        websocket_url=(os.getenv(\"INWORLD_REALTIME_WS_URL\") or \"wss://api.inworld.ai/api/v1/realtime/session\").strip(),\n        model=(os.getenv(\"INWORLD_REALTIME_MODEL\") or os.getenv(\"OPENROUTER_MODEL\") or \"openai/gpt-4o-mini\").strip(),\n        stt_model=(os.getenv(\"INWORLD_MODEL_ID\") or os.getenv(\"INWORLD_STT_MODEL_ID\") or \"inworld/inworld-stt-1\").strip(),\n        tts_model=(os.getenv(\"INWORLD_TTS_MODEL\") or \"inworld-tts-2\").strip(),\n        voice=(os.getenv(\"INWORLD_TTS_VOICE\") or \"Luna\").strip(),\n        speed=float(os.getenv(\"INWORLD_TTS_SPEED\", \"1.0\") or \"1.0\"),\n        turn_detection_type=(os.getenv(\"INWORLD_TURN_DETECTION_TYPE\") or \"semantic_vad\").strip(),\n        turn_detection_eagerness=(os.getenv(\"INWORLD_TURN_DETECTION_EAGERNESS\") or \"medium\").strip(),\n        turn_detection_create_response=_env_bool(\"INWORLD_TURN_DETECTION_CREATE_RESPONSE\", True),\n        turn_detection_interrupt_response=_env_bool(\"INWORLD_TURN_DETECTION_INTERRUPT_RESPONSE\", True),\n        instructions=(instructions or os.getenv(\"INWORLD_REALTIME_INSTRUCTIONS\") or \"You are a concise, warm voice assistant.\").strip(),\n        timeout_seconds=inworld_realtime_session_timeout_seconds(),\n        voice_profile_enabled=_env_bool(\"INWORLD_VOICE_PROFILE_ENABLED\", False),\n        input_format=(os.getenv(\"INWORLD_REALTIME_INPUT_FORMAT\") or \"pcm16\").strip(),\n        output_format=(os.getenv(\"INWORLD_REALTIME_OUTPUT_FORMAT\") or \"pcm16\").strip(),\n        auth_scheme=auth_scheme,\n    )\n\n\ndef build_session_update(settings: InworldRealtimeSettings) -> dict[str, Any]:\n    return {\n        \"type\": \"session.update\",\n        \"session\": {\n            \"type\": \"realtime\",\n            \"model\": settings.model,\n            \"instructions\": settings.instructions,\n            \"output_modalities\": [\"audio\", \"text\"],\n            \"audio\": {\n                \"input\": {\n                    \"format\": {\"type\": settings.input_format, \"sample_rate\": INWORLD_INPUT_SAMPLE_RATE},\n                    \"transcription\": {\"model\": settings.stt_model},\n                    \"turn_detection\": {\n                        \"type\": settings.turn_detection_type,\n                        \"eagerness\": settings.turn_detection_eagerness,\n                        \"create_response\": settings.turn_detection_create_response,\n                        \"interrupt_response\": settings.turn_detection_interrupt_response,\n                    },\n                },\n                \"output\": {\n                    \"format\": {\"type\": settings.output_format, \"sample_rate\": INWORLD_OUTPUT_SAMPLE_RATE},\n                    \"model\": settings.tts_model,\n                    \"voice\": settings.voice,\n                    \"speed\": settings.speed,\n                },\n            },\n            \"providerData\": {\n                \"stt\": {\"voice_profile\": settings.voice_profile_enabled},\n            },\n        },\n    }\n\n\ndef build_conversation_item_create(text: str) -> dict[str, Any]:\n    \"\"\"Build a forced text test message.\"\"\"\n    return {\n        \"type\": \"conversation.item.create\",\n        \"item\": {\n            \"type\": \"message\",\n            \"role\": \"user\",\n            \"content\": {\n                \"content_type\": \"input_text\",\n                \"text\": text,\n            },\n        },\n    }\n\n\ndef build_response_create() -> dict[str, Any]:\n    \"\"\"Build a response.create message.\"\"\"\n    return {\n        \"type\": \"response.create\",\n        \"response\": {\n            \"output_modalities\": [\"audio\", \"text\"],\n        },\n    }\n\n\ndef build_audio_append_message(pcm: bytes) -> dict[str, str]:\n    return {\"type\": \"input_audio_buffer.append\", \"audio\": base64.b64encode(pcm).decode(\"ascii\")}\n\n\ndef _frame_bytes(frame: rtc.AudioFrame) -> bytes:\n    data = getattr(frame, \"data\", b\"\")\n    try:\n        return bytes(data)\n    except Exception:\n        return b\"\"\n\n\ndef _event_audio_bytes(payload: dict[str, Any]) -> bytes:\n    data = payload.get(\"delta\") or payload.get(\"audio\") or payload.get(\"data\")\n    if not isinstance(data, str) or not data:\n        return b\"\"\n    try:\n        return base64.b64decode(data)\n    except Exception:\n        return b\"\"\n\n\ndef _iter_pcm_frames(pcm: bytes, *, sample_rate: int = INWORLD_OUTPUT_SAMPLE_RATE, channels: int = INWORLD_CHANNELS):\n    bytes_per_sample = 2\n    samples_per_channel = max(1, int(sample_rate * INWORLD_FRAME_MS / 1000))\n    frame_size = samples_per_channel * channels * bytes_per_sample\n    for offset in range(0, len(pcm), frame_size):\n        chunk = pcm[offset : offset + frame_size]\n        if len(chunk) < frame_size:\n            chunk = chunk + (b\"\\x00\" * (frame_size - len(chunk)))\n        yield rtc.AudioFrame(\n            data=chunk,\n            sample_rate=sample_rate,\n            num_channels=channels,\n            samples_per_channel=samples_per_channel,\n        )\n\n\nclass InworldRealtimeLiveKitBridge:\n    def __init__(self, room: rtc.Room, settings: InworldRealtimeSettings) -> None:\n        self.room = room\n        self.settings = settings\n        self._tasks: set[asyncio.Task[Any]] = set()\n        self._closed = asyncio.Event()\n        self._ws: aiohttp.ClientWebSocketResponse | None = None\n        self._output_source = rtc.AudioSource(INWORLD_OUTPUT_SAMPLE_RATE, INWORLD_CHANNELS)\n        self._published = False\n        self._session_ready = asyncio.Event()\n        self._audio_forwarded_count = 0\n        self._last_outbound_event_type: str | None = None\n        self._last_inbound_event_time = time.monotonic()\n\n    async def run(self) -> None:\n        started_at = time.monotonic()\n        logger.info(\n            \"inworld_realtime_bridge_started=true voice_engine_selected=inworld_realtime stt_model=%s tts_model=%s tts_voice=%s turn_detection=%s voice_profile_enabled=%s\",\n            self.settings.stt_model,\n            self.settings.tts_model,\n            self.settings.voice,\n            self.settings.turn_detection_type,\n            self.settings.voice_profile_enabled,\n        )\n        await self._publish_output_track()\n        try:\n            timeout = aiohttp.ClientTimeout(total=None, sock_connect=20, sock_read=None)\n            async with aiohttp.ClientSession(timeout=timeout) as session:\n                async with session.ws_connect(self.settings.connection_url, headers=self.settings.auth_headers, heartbeat=20) as ws:\n                    self._ws = ws\n                    logger.info(\"inworld_realtime_connected=true session_id_present=%s\", bool(self.settings.session_id))\n                    \n                    # Start receive loop immediately after socket open\n                    receiver = asyncio.create_task(self._receive_inworld(ws))\n                    self._tasks.add(receiver)\n                    logger.info(\"inworld_receive_task_created=true\")\n                    \n                    # Subscribe to existing tracks and future tracks\n                    self._subscribe_existing_audio_tracks()\n                    self.room.on(\"track_subscribed\", self._on_track_subscribed)\n                    \n                    try:\n                        await asyncio.wait_for(self._closed.wait(), timeout=self.settings.timeout_seconds)\n                    except asyncio.TimeoutError:\n                        logger.info(\n                            \"inworld_realtime_bridge_closed=true close_reason=session_timeout timeout_seconds=%s audio_forwarded_count=%s last_outbound_event_type=%s receive_task_done=%s websocket_closed=%s\",\n                            self.settings.timeout_seconds,\n                            self._audio_forwarded_count,\n                            self._last_outbound_event_type or \"none\",\n                            receiver.done(),\n                            ws.closed,\n                        )\n                    finally:\n                        self.room.off(\"track_subscribed\", self._on_track_subscribed)\n                        await ws.close()\n                        await self.aclose()\n        except Exception as exc:\n            logger.error(\"inworld_realtime_bridge_error=true error_type=%s error=%s\", type(exc).__name__, exc)\n            await self.aclose()\n            raise\n        finally:\n            logger.info(\"inworld_realtime_bridge_closed=true duration_seconds=%.3f\", time.monotonic() - started_at)\n\n    async def aclose(self) -> None:\n        self._closed.set()\n        for task in list(self._tasks):\n            if not task.done():\n                task.cancel()\n        if self._tasks:\n            await asyncio.gather(*self._tasks, return_exceptions=True)\n            self._tasks.clear()\n        try:\n            await self._output_source.aclose()\n        except Exception:\n            pass\n\n    async def _publish_output_track(self) -> None:\n        if self._published:\n            return\n        track = rtc.LocalAudioTrack.create_audio_track(\"arche-inworld-realtime\", self._output_source)\n        options = rtc.TrackPublishOptions()\n        options.source = rtc.TrackSource.SOURCE_MICROPHONE\n        await self.room.local_participant.publish_track(track, options)\n        self._published = True\n        logger.info(\"inworld_realtime_audio_published_to_livekit=true track_name=arche-inworld-realtime\")\n\n    def _subscribe_existing_audio_tracks(self) -> None:\n        for participant in self.room.remote_participants.values():\n            for publication in getattr(participant, \"track_publications\", {}).values():\n                track = getattr(publication, \"track\", None)\n                if track is not None:\n                    self._maybe_start_audio_forwarder(track)\n\n    def _on_track_subscribed(self, track, publication=None, participant=None) -> None:\n        self._maybe_start_audio_forwarder(track)\n\n    def _maybe_start_audio_forwarder(self, track: Any) -> None:\n        if getattr(track, \"kind\", None) != rtc.TrackKind.KIND_AUDIO:\n            return\n        task = asyncio.create_task(self._forward_livekit_audio(track))\n        self._tasks.add(task)\n        task.add_done_callback(self._tasks.discard)\n\n    async def _forward_livekit_audio(self, track: Any) -> None:\n        ws = self._ws\n        if ws is None:\n            return\n        stream = rtc.AudioStream(track, sample_rate=INWORLD_INPUT_SAMPLE_RATE, num_channels=INWORLD_CHANNELS, frame_size_ms=INWORLD_FRAME_MS)\n        try:\n            async for event in stream:\n                frame = getattr(event, \"frame\", None)\n                pcm = _frame_bytes(frame)\n                if not pcm:\n                    continue\n                await ws.send_json(build_audio_append_message(pcm))\n                self._audio_forwarded_count += 1\n                self._last_outbound_event_type = \"input_audio_buffer.append\"\n                logger.info(\"inworld_realtime_audio_input_forwarded=true bytes=%s\", len(pcm) if inworld_realtime_log_audio() else \"redacted\")\n        finally:\n            await stream.aclose()\n\n    async def _receive_inworld(self, ws: aiohttp.ClientWebSocketResponse) -> None:\n        logger.info(\"inworld_receive_loop_started=true\")\n        try:\n            async for msg in ws:\n                if msg.type == aiohttp.WSMsgType.TEXT:\n                    try:\n                        payload = json.loads(msg.data)\n                    except Exception as exc:\n                        logger.error(\n                            \"inworld_raw_message_parse_error=true error=%s preview=%s\",\n                            exc,\n                            msg.data[:100] if len(msg.data) > 100 else msg.data,\n                        )\n                        continue\n                    \n                    # Log raw message receipt\n                    logger.info(\"inworld_raw_message_received=true bytes=%s\", len(msg.data))\n                    \n                    await self._handle_inworld_message(payload)\n                    self._last_inbound_event_time = time.monotonic()\n                elif msg.type in {aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR}:\n                    logger.info(\"inworld_websocket_closed=true msg_type=%s\", msg.type)\n                    break\n        except asyncio.CancelledError:\n            logger.info(\"inworld_receive_task_cancelled=true\")\n            raise\n        except Exception as exc:\n            logger.error(\"inworld_receive_task_exception=true error_type=%s error=%s\", type(exc).__name__, exc)\n            raise\n        finally:\n            self._closed.set()\n\n    async def _handle_inworld_message(self, payload: dict[str, Any]) -> None:\n        msg_type = str(payload.get(\"type\") or \"\")\n        \n        # Log server event type\n        logger.info(\"inworld_server_event_received type=%s\", msg_type)\n        \n        if msg_type == \"session.created\":\n            logger.info(\"inworld_session_created=true\")\n            # Send session.update immediately after session.created\n            await self._send_session_update()\n        \n        elif msg_type == \"session.updated\":\n            logger.info(\"inworld_session_updated=true\")\n            self._session_ready.set()\n            # Run forced text test to prove output path works\n            await self._run_forced_text_test()\n        \n        elif msg_type == \"response.output_audio.delta\":\n            pcm = _event_audio_bytes(payload)\n            if pcm:\n                logger.info(\"inworld_audio_delta_received=true encoded_bytes=%s\", len(payload.get(\"delta\", \"\")))\n                logger.info(\"inworld_audio_decoded=true pcm_bytes=%s\", len(pcm))\n                \n                frame_count = 0\n                for frame in _iter_pcm_frames(pcm):\n                    await self._output_source.capture_frame(frame)\n                    frame_count += 1\n                \n                logger.info(\n                    \"inworld_audio_written_to_livekit=true frames=%s samples_per_frame=%s sample_rate=%s channels=%s\",\n                    frame_count,\n                    INWORLD_OUTPUT_SAMPLE_RATE * INWORLD_FRAME_MS // 1000,\n                    INWORLD_OUTPUT_SAMPLE_RATE,\n                    INWORLD_CHANNELS,\n                )\n        \n        elif msg_type == \"conversation.item.input_audio_transcription.completed\":\n            transcript = str(payload.get(\"transcript\") or \"\")\n            logger.info(\"inworld_transcription_completed=true transcript_length=%s\", len(transcript))\n        \n        elif msg_type == \"conversation.item.input_audio_transcription.delta\":\n            delta = str(payload.get(\"delta\") or \"\")\n            logger.info(\"inworld_transcription_delta=true delta_length=%s\", len(delta))\n        \n        elif msg_type in {\"input_audio_buffer.speech_started\", \"input_audio_buffer.speech_stopped\", \"input_audio_buffer.turn_suggestion\"}:\n            logger.info(\"inworld_vad_event=true event_type=%s\", msg_type)\n        \n        elif msg_type == \"response.created\":\n            logger.info(\"inworld_response_created=true\")\n        \n        elif msg_type == \"response.output_item.added\":\n            logger.info(\"inworld_response_output_item_added=true\")\n        \n        elif msg_type == \"response.output_text.delta\":\n            delta = str(payload.get(\"delta\") or \"\")\n            logger.info(\"inworld_response_output_text_delta=true delta_length=%s\", len(delta))\n        \n        elif msg_type == \"response.output_audio.done\":\n            logger.info(\"inworld_response_output_audio_done=true\")\n        \n        elif msg_type == \"response.done\":\n            logger.info(\"inworld_response_done=true\")\n        \n        elif msg_type == \"error\":\n            error = payload.get(\"error\") if isinstance(payload.get(\"error\"), dict) else {}\n            logger.error(\"inworld_server_error=true code=%s message=%s\", error.get(\"code\"), error.get(\"message\"))\n        \n        else:\n            logger.info(\"inworld_server_event_unhandled type=%s\", msg_type)\n\n    async def _send_session_update(self) -> None:\n        \"\"\"Send session.update after session.created.\"\"\"\n        if self._ws is None:\n            return\n        \n        update = build_session_update(self.settings)\n        await self._ws.send_json(update)\n        self._last_outbound_event_type = \"session.update\"\n        \n        logger.info(\n            \"inworld_session_update_sent=true inworld_session_model=%s inworld_stt_model=%s inworld_tts_model=%s inworld_tts_voice=%s inworld_turn_detection_type=%s inworld_turn_detection_create_response=%s inworld_turn_detection_interrupt_response=%s effective_voice_profile_enabled=%s\",\n            self.settings.model,\n            self.settings.stt_model,\n            self.settings.tts_model,\n            self.settings.voice,\n            self.settings.turn_detection_type,\n            self.settings.turn_detection_create_response,\n            self.settings.turn_detection_interrupt_response,\n            self.settings.voice_profile_enabled,\n        )\n\n    async def _run_forced_text_test(self) -> None:\n        \"\"\"Send a forced text test to prove the output path works.\"\"\"\n        if self._ws is None:\n            return\n        \n        # Send conversation.item.create with test text\n        item_create = build_conversation_item_create(\"Say hello in one short sentence.\")\n        await self._ws.send_json(item_create)\n        self._last_outbound_event_type = \"conversation.item.create\"\n        logger.info(\"inworld_force_text_test_sent=true\")\n        \n        # Send response.create\n        response_create = build_response_create()\n        await self._ws.send_json(response_create)\n        self._last_outbound_event_type = \"response.create\"\n        logger.info(\"inworld_response_create_sent=true\")\n\n\nasync def run_inworld_realtime_bridge(room: rtc.Room, *, instructions: str | None = None) -> None:\n    settings = load_inworld_realtime_settings(instructions=instructions)\n    bridge = InworldRealtimeLiveKitBridge(room, settings)\n    await bridge.run()\n
+    -> inworld_to_livekit_receive_loop
+    -> decode output audio
+    -> write PCM frames to LiveKit AudioSource
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+import logging
+import os
+import time
+from dataclasses import dataclass
+from typing import Any
+from urllib.parse import urlencode
+
+import aiohttp
+from livekit import rtc
+
+logger = logging.getLogger(__name__)
+
+INWORLD_INPUT_SAMPLE_RATE = 24000
+INWORLD_OUTPUT_SAMPLE_RATE = 24000
+INWORLD_CHANNELS = 1
+INWORLD_FRAME_MS = 60
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def inworld_realtime_debug() -> bool:
+    return _env_bool("INWORLD_REALTIME_DEBUG", False)
+
+
+def inworld_realtime_log_audio() -> bool:
+    return _env_bool("INWORLD_REALTIME_LOG_AUDIO", False)
+
+
+def inworld_realtime_session_timeout_seconds() -> float:
+    try:
+        return max(1.0, float(os.getenv("INWORLD_REALTIME_SESSION_TIMEOUT_SECONDS", "1800")))
+    except Exception:
+        return 1800.0
+
+
+@dataclass(frozen=True)
+class InworldRealtimeSettings:
+    api_key: str
+    session_id: str
+    websocket_url: str
+    model: str
+    stt_model: str
+    tts_model: str
+    voice: str
+    speed: float
+    turn_detection_type: str
+    turn_detection_eagerness: str
+    turn_detection_create_response: bool
+    turn_detection_interrupt_response: bool
+    instructions: str
+    timeout_seconds: float
+    voice_profile_enabled: bool
+    input_format: str
+    output_format: str
+    auth_scheme: str
+
+    @property
+    def connection_url(self) -> str:
+        query = {"key": self.session_id, "protocol": "realtime"}
+        separator = "&" if "?" in self.websocket_url else "?"
+        return f"{self.websocket_url}{separator}{urlencode(query)}"
+
+    @property
+    def auth_headers(self) -> dict[str, str]:
+        # Inworld server-side WebSocket auth uses the Portal API key directly as
+        # an already-base64-encoded Basic credential.
+        if self.auth_scheme.lower() == "bearer":
+            return {"Authorization": f"Bearer {self.api_key}"}
+        else:
+            return {"Authorization": f"Basic {self.api_key}"}
+
+
+def load_inworld_realtime_settings(*, instructions: str | None = None) -> InworldRealtimeSettings:
+    api_key = (os.getenv("INWORLD_API_KEY") or "").strip()
+    session_id = (os.getenv("INWORLD_REALTIME_SESSION_ID") or os.getenv("LIVEKIT_ROOM_NAME") or f"lucy-{int(time.time() * 1000)}").strip()
+    if not api_key:
+        raise RuntimeError("VOICE_ENGINE=inworld_realtime requires INWORLD_API_KEY")
+    if not session_id:
+        raise RuntimeError("VOICE_ENGINE=inworld_realtime requires INWORLD_REALTIME_SESSION_ID or a room-derived fallback")
+
+    auth_scheme = (os.getenv("INWORLD_AUTH_SCHEME") or "basic").strip().lower()
+    logger.info(
+        "inworld_auth_config raw_INWORLD_AUTH_SCHEME=%s inworld_auth_mode=%s",
+        auth_scheme,
+        "bearer_jwt" if auth_scheme == "bearer" else "basic_base64_api_key",
+    )
+
+    return InworldRealtimeSettings(
+        api_key=api_key,
+        session_id=session_id,
+        websocket_url=(os.getenv("INWORLD_REALTIME_WS_URL") or "wss://api.inworld.ai/api/v1/realtime/session").strip(),
+        model=(os.getenv("INWORLD_REALTIME_MODEL") or os.getenv("OPENROUTER_MODEL") or "openai/gpt-4o-mini").strip(),
+        stt_model=(os.getenv("INWORLD_MODEL_ID") or os.getenv("INWORLD_STT_MODEL_ID") or "inworld/inworld-stt-1").strip(),
+        tts_model=(os.getenv("INWORLD_TTS_MODEL") or "inworld-tts-2").strip(),
+        voice=(os.getenv("INWORLD_TTS_VOICE") or "Luna").strip(),
+        speed=float(os.getenv("INWORLD_TTS_SPEED", "1.0") or "1.0"),
+        turn_detection_type=(os.getenv("INWORLD_TURN_DETECTION_TYPE") or "semantic_vad").strip(),
+        turn_detection_eagerness=(os.getenv("INWORLD_TURN_DETECTION_EAGERNESS") or "medium").strip(),
+        turn_detection_create_response=_env_bool("INWORLD_TURN_DETECTION_CREATE_RESPONSE", True),
+        turn_detection_interrupt_response=_env_bool("INWORLD_TURN_DETECTION_INTERRUPT_RESPONSE", True),
+        instructions=(instructions or os.getenv("INWORLD_REALTIME_INSTRUCTIONS") or "You are a concise, warm voice assistant.").strip(),
+        timeout_seconds=inworld_realtime_session_timeout_seconds(),
+        voice_profile_enabled=_env_bool("INWORLD_VOICE_PROFILE_ENABLED", False),
+        input_format=(os.getenv("INWORLD_REALTIME_INPUT_FORMAT") or "pcm16").strip(),
+        output_format=(os.getenv("INWORLD_REALTIME_OUTPUT_FORMAT") or "pcm16").strip(),
+        auth_scheme=auth_scheme,
+    )
+
+
+def build_session_update(settings: InworldRealtimeSettings) -> dict[str, Any]:
+    return {
+        "type": "session.update",
+        "session": {
+            "type": "realtime",
+            "model": settings.model,
+            "instructions": settings.instructions,
+            "output_modalities": ["audio", "text"],
+            "audio": {
+                "input": {
+                    "format": {"type": settings.input_format, "sample_rate": INWORLD_INPUT_SAMPLE_RATE},
+                    "transcription": {"model": settings.stt_model},
+                    "turn_detection": {
+                        "type": settings.turn_detection_type,
+                        "eagerness": settings.turn_detection_eagerness,
+                        "create_response": settings.turn_detection_create_response,
+                        "interrupt_response": settings.turn_detection_interrupt_response,
+                    },
+                },
+                "output": {
+                    "format": {"type": settings.output_format, "sample_rate": INWORLD_OUTPUT_SAMPLE_RATE},
+                    "model": settings.tts_model,
+                    "voice": settings.voice,
+                    "speed": settings.speed,
+                },
+            },
+            "providerData": {
+                "stt": {"voice_profile": settings.voice_profile_enabled},
+            },
+        },
+    }
+
+
+def build_conversation_item_create(text: str) -> dict[str, Any]:
+    """Build a forced text test message."""
+    return {
+        "type": "conversation.item.create",
+        "item": {
+            "type": "message",
+            "role": "user",
+            "content": {
+                "content_type": "input_text",
+                "text": text,
+            },
+        },
+    }
+
+
+def build_response_create() -> dict[str, Any]:
+    """Build a response.create message."""
+    return {
+        "type": "response.create",
+        "response": {
+            "output_modalities": ["audio", "text"],
+        },
+    }
+
+
+def build_audio_append_message(pcm: bytes) -> dict[str, str]:
+    return {"type": "input_audio_buffer.append", "audio": base64.b64encode(pcm).decode("ascii")}
+
+
+def _frame_bytes(frame: rtc.AudioFrame) -> bytes:
+    data = getattr(frame, "data", b"")
+    try:
+        return bytes(data)
+    except Exception:
+        return b""
+
+
+def _event_audio_bytes(payload: dict[str, Any]) -> bytes:
+    data = payload.get("delta") or payload.get("audio") or payload.get("data")
+    if not isinstance(data, str) or not data:
+        return b""
+    try:
+        return base64.b64decode(data)
+    except Exception:
+        return b""
+
+
+def _iter_pcm_frames(pcm: bytes, *, sample_rate: int = INWORLD_OUTPUT_SAMPLE_RATE, channels: int = INWORLD_CHANNELS):
+    bytes_per_sample = 2
+    samples_per_channel = max(1, int(sample_rate * INWORLD_FRAME_MS / 1000))
+    frame_size = samples_per_channel * channels * bytes_per_sample
+    for offset in range(0, len(pcm), frame_size):
+        chunk = pcm[offset : offset + frame_size]
+        if len(chunk) < frame_size:
+            chunk = chunk + (b"\x00" * (frame_size - len(chunk)))
+        yield rtc.AudioFrame(
+            data=chunk,
+            sample_rate=sample_rate,
+            num_channels=channels,
+            samples_per_channel=samples_per_channel,
+        )
+
+
+class InworldRealtimeLiveKitBridge:
+    def __init__(self, room: rtc.Room, settings: InworldRealtimeSettings) -> None:
+        self.room = room
+        self.settings = settings
+        self._tasks: set[asyncio.Task[Any]] = set()
+        self._closed = asyncio.Event()
+        self._ws: aiohttp.ClientWebSocketResponse | None = None
+        self._output_source = rtc.AudioSource(INWORLD_OUTPUT_SAMPLE_RATE, INWORLD_CHANNELS)
+        self._published = False
+        self._session_ready = asyncio.Event()
+        self._audio_forwarded_count = 0
+        self._last_outbound_event_type: str | None = None
+        self._last_inbound_event_time = time.monotonic()
+
+    async def run(self) -> None:
+        started_at = time.monotonic()
+        logger.info(
+            "inworld_realtime_bridge_started=true voice_engine_selected=inworld_realtime stt_model=%s tts_model=%s tts_voice=%s turn_detection=%s voice_profile_enabled=%s",
+            self.settings.stt_model,
+            self.settings.tts_model,
+            self.settings.voice,
+            self.settings.turn_detection_type,
+            self.settings.voice_profile_enabled,
+        )
+        await self._publish_output_track()
+        try:
+            timeout = aiohttp.ClientTimeout(total=None, sock_connect=20, sock_read=None)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.ws_connect(self.settings.connection_url, headers=self.settings.auth_headers, heartbeat=20) as ws:
+                    self._ws = ws
+                    logger.info("inworld_realtime_connected=true session_id_present=%s", bool(self.settings.session_id))
+
+                    # Start receive loop immediately after socket open
+                    receiver = asyncio.create_task(self._receive_inworld(ws))
+                    self._tasks.add(receiver)
+                    logger.info("inworld_receive_task_created=true")
+
+                    # Subscribe to existing tracks and future tracks
+                    self._subscribe_existing_audio_tracks()
+                    self.room.on("track_subscribed", self._on_track_subscribed)
+
+                    try:
+                        await asyncio.wait_for(self._closed.wait(), timeout=self.settings.timeout_seconds)
+                    except asyncio.TimeoutError:
+                        logger.info(
+                            "inworld_realtime_bridge_closed=true close_reason=session_timeout timeout_seconds=%s audio_forwarded_count=%s last_outbound_event_type=%s receive_task_done=%s websocket_closed=%s",
+                            self.settings.timeout_seconds,
+                            self._audio_forwarded_count,
+                            self._last_outbound_event_type or "none",
+                            receiver.done(),
+                            ws.closed,
+                        )
+                    finally:
+                        self.room.off("track_subscribed", self._on_track_subscribed)
+                        await ws.close()
+                        await self.aclose()
+        except Exception as exc:
+            logger.error("inworld_realtime_bridge_error=true error_type=%s error=%s", type(exc).__name__, exc)
+            await self.aclose()
+            raise
+        finally:
+            logger.info("inworld_realtime_bridge_closed=true duration_seconds=%.3f", time.monotonic() - started_at)
+
+    async def aclose(self) -> None:
+        self._closed.set()
+        for task in list(self._tasks):
+            if not task.done():
+                task.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+            self._tasks.clear()
+        try:
+            await self._output_source.aclose()
+        except Exception:
+            pass
+
+    async def _publish_output_track(self) -> None:
+        if self._published:
+            return
+        track = rtc.LocalAudioTrack.create_audio_track("arche-inworld-realtime", self._output_source)
+        options = rtc.TrackPublishOptions()
+        options.source = rtc.TrackSource.SOURCE_MICROPHONE
+        await self.room.local_participant.publish_track(track, options)
+        self._published = True
+        logger.info("inworld_realtime_audio_published_to_livekit=true track_name=arche-inworld-realtime")
+
+    def _subscribe_existing_audio_tracks(self) -> None:
+        for participant in self.room.remote_participants.values():
+            for publication in getattr(participant, "track_publications", {}).values():
+                track = getattr(publication, "track", None)
+                if track is not None:
+                    self._maybe_start_audio_forwarder(track)
+
+    def _on_track_subscribed(self, track, publication=None, participant=None) -> None:
+        self._maybe_start_audio_forwarder(track)
+
+    def _maybe_start_audio_forwarder(self, track: Any) -> None:
+        if getattr(track, "kind", None) != rtc.TrackKind.KIND_AUDIO:
+            return
+        task = asyncio.create_task(self._forward_livekit_audio(track))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _forward_livekit_audio(self, track: Any) -> None:
+        ws = self._ws
+        if ws is None:
+            return
+        stream = rtc.AudioStream(track, sample_rate=INWORLD_INPUT_SAMPLE_RATE, num_channels=INWORLD_CHANNELS, frame_size_ms=INWORLD_FRAME_MS)
+        try:
+            async for event in stream:
+                frame = getattr(event, "frame", None)
+                pcm = _frame_bytes(frame)
+                if not pcm:
+                    continue
+                await ws.send_json(build_audio_append_message(pcm))
+                self._audio_forwarded_count += 1
+                self._last_outbound_event_type = "input_audio_buffer.append"
+                logger.info("inworld_realtime_audio_input_forwarded=true bytes=%s", len(pcm) if inworld_realtime_log_audio() else "redacted")
+        finally:
+            await stream.aclose()
+
+    async def _receive_inworld(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        logger.info("inworld_receive_loop_started=true")
+        try:
+            async for msg in ws:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    try:
+                        payload = json.loads(msg.data)
+                    except Exception as exc:
+                        logger.error(
+                            "inworld_raw_message_parse_error=true error=%s preview=%s",
+                            exc,
+                            msg.data[:100] if len(msg.data) > 100 else msg.data,
+                        )
+                        continue
+
+                    # Log raw message receipt
+                    logger.info("inworld_raw_message_received=true bytes=%s", len(msg.data))
+
+                    await self._handle_inworld_message(payload)
+                    self._last_inbound_event_time = time.monotonic()
+                elif msg.type in {aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR}:
+                    logger.info("inworld_websocket_closed=true msg_type=%s", msg.type)
+                    break
+        except asyncio.CancelledError:
+            logger.info("inworld_receive_task_cancelled=true")
+            raise
+        except Exception as exc:
+            logger.error("inworld_receive_task_exception=true error_type=%s error=%s", type(exc).__name__, exc)
+            raise
+        finally:
+            self._closed.set()
+
+    async def _handle_inworld_message(self, payload: dict[str, Any]) -> None:
+        msg_type = str(payload.get("type") or "")
+
+        # Log server event type
+        logger.info("inworld_server_event_received type=%s", msg_type)
+
+        if msg_type == "session.created":
+            logger.info("inworld_session_created=true")
+            # Send session.update immediately after session.created
+            await self._send_session_update()
+
+        elif msg_type == "session.updated":
+            logger.info("inworld_session_updated=true")
+            self._session_ready.set()
+            # Run forced text test to prove output path works
+            await self._run_forced_text_test()
+
+        elif msg_type == "response.output_audio.delta":
+            pcm = _event_audio_bytes(payload)
+            if pcm:
+                logger.info("inworld_audio_delta_received=true encoded_bytes=%s", len(payload.get("delta", "")))
+                logger.info("inworld_audio_decoded=true pcm_bytes=%s", len(pcm))
+
+                frame_count = 0
+                for frame in _iter_pcm_frames(pcm):
+                    await self._output_source.capture_frame(frame)
+                    frame_count += 1
+
+                logger.info(
+                    "inworld_audio_written_to_livekit=true frames=%s samples_per_frame=%s sample_rate=%s channels=%s",
+                    frame_count,
+                    INWORLD_OUTPUT_SAMPLE_RATE * INWORLD_FRAME_MS // 1000,
+                    INWORLD_OUTPUT_SAMPLE_RATE,
+                    INWORLD_CHANNELS,
+                )
+
+        elif msg_type == "conversation.item.input_audio_transcription.completed":
+            transcript = str(payload.get("transcript") or "")
+            logger.info("inworld_transcription_completed=true transcript_length=%s", len(transcript))
+
+        elif msg_type == "conversation.item.input_audio_transcription.delta":
+            delta = str(payload.get("delta") or "")
+            logger.info("inworld_transcription_delta=true delta_length=%s", len(delta))
+
+        elif msg_type in {"input_audio_buffer.speech_started", "input_audio_buffer.speech_stopped", "input_audio_buffer.turn_suggestion"}:
+            logger.info("inworld_vad_event=true event_type=%s", msg_type)
+
+        elif msg_type == "response.created":
+            logger.info("inworld_response_created=true")
+
+        elif msg_type == "response.output_item.added":
+            logger.info("inworld_response_output_item_added=true")
+
+        elif msg_type == "response.output_text.delta":
+            delta = str(payload.get("delta") or "")
+            logger.info("inworld_response_output_text_delta=true delta_length=%s", len(delta))
+
+        elif msg_type == "response.output_audio.done":
+            logger.info("inworld_response_output_audio_done=true")
+
+        elif msg_type == "response.done":
+            logger.info("inworld_response_done=true")
+
+        elif msg_type == "error":
+            error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+            logger.error("inworld_server_error=true code=%s message=%s", error.get("code"), error.get("message"))
+
+        else:
+            logger.info("inworld_server_event_unhandled type=%s", msg_type)
+
+    async def _send_session_update(self) -> None:
+        """Send session.update after session.created."""
+        if self._ws is None:
+            return
+
+        update = build_session_update(self.settings)
+        await self._ws.send_json(update)
+        self._last_outbound_event_type = "session.update"
+
+        logger.info(
+            "inworld_session_update_sent=true inworld_session_model=%s inworld_stt_model=%s inworld_tts_model=%s inworld_tts_voice=%s inworld_turn_detection_type=%s inworld_turn_detection_create_response=%s inworld_turn_detection_interrupt_response=%s effective_voice_profile_enabled=%s",
+            self.settings.model,
+            self.settings.stt_model,
+            self.settings.tts_model,
+            self.settings.voice,
+            self.settings.turn_detection_type,
+            self.settings.turn_detection_create_response,
+            self.settings.turn_detection_interrupt_response,
+            self.settings.voice_profile_enabled,
+        )
+
+    async def _run_forced_text_test(self) -> None:
+        """Send a forced text test to prove the output path works."""
+        if self._ws is None:
+            return
+
+        # Send conversation.item.create with test text
+        item_create = build_conversation_item_create("Say hello in one short sentence.")
+        await self._ws.send_json(item_create)
+        self._last_outbound_event_type = "conversation.item.create"
+        logger.info("inworld_force_text_test_sent=true")
+
+        # Send response.create
+        response_create = build_response_create()
+        await self._ws.send_json(response_create)
+        self._last_outbound_event_type = "response.create"
+        logger.info("inworld_response_create_sent=true")
+
+
+async def run_inworld_realtime_bridge(room: rtc.Room, *, instructions: str | None = None) -> None:
+    settings = load_inworld_realtime_settings(instructions=instructions)
+    bridge = InworldRealtimeLiveKitBridge(room, settings)
+    await bridge.run()
+
