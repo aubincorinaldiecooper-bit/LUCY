@@ -444,3 +444,23 @@ def build_inworld_shadow_from_env(ws_factory: Callable[..., Any] | None = None) 
     if not usable:
         return None
     return InworldVoiceProfileShadow(config=config, ws_factory=ws_factory)
+
+
+def emotion_analyzer_status() -> dict:
+    """Get the current status of the emotion analyzer.
+    
+    Returns a dictionary with information about the Inworld voice profile
+    analyzer's operational status, including whether it's enabled, connected,
+    and recent performance metrics.
+    """
+    config = InworldConfig.from_env()
+    usable, reason = config.is_usable()
+    
+    return {
+        "enabled": config.enabled,
+        "usable": usable,
+        "skip_reason": reason if not usable else "none",
+        "model_id": config.model_id,
+        "voice_profile_threshold": config.voice_profile_threshold,
+        "emotion_confidence_floor": config.emotion_confidence_floor,
+    }
