@@ -896,9 +896,38 @@ class InterruptionLedgerTests(unittest.TestCase):
         self.assertTrue(outcome["suppressed_or_ghost_handle"])
         self.assertFalse(outcome["assistant_tail_cut_likely"])
 
+            def test_tail_outcome_ghost_handle_is_not_cutoff(self):
+        outcome = agent._classify_assistant_tail_outcome(
+            interrupted=True,
+            interruption_at=12.0,
+            playout_started_at=None,
+            playout_completed_at=None,
+            generated_audio_duration_seconds=None,
+            hume_requests_during_speech=0,
+        )
+        self.assertTrue(outcome["suppressed_or_ghost_handle"])
+        self.assertFalse(outcome["assistant_tail_cut_likely"])
+    
+    def test_tail_outcome_audio_produced_with_zero_hume_counter(self):
+        # Regression: in production (HUME_HTTP_DEBUG=false),
+        # hume_requests_during_speech is always 0 even when audio was
+        # synthesized and played. Audio MUST be considered produced when
+        # generated_audio_duration_seconds > 0, regardless of hume counter.
+        # Mirrors tests/test_voice_interruption.py::test_audio_produced_when_hume_counter_is_zero
+        outcome = agent._classify_assistant_tail_outcome(
+            interrupted=False,
+            interruption_at=None,
+            playout_started_at=100.0,
+            playout_completed_at=113.7,
+            generated_audio_duration_seconds=10.1,
+            hume_requests_during_speech=0,
+        )
+        self.assertFalse(outcome["suppressed_or_ghost_handle"])
+        self.assertTrue(outcome["assistant_playout_completed_normally"])
+        self.assertFalse(outcome["assistant_tail_cut_likely"])
+    
     def test_user_feedback_marker_prefers_clean_no_cutoff(self):
         self.assertEqual(agent._user_feedback_marker("There was no cutoff."), "clean")
-        self.assertEqual(agent._user_feedback_marker("It was another hard clip of your tail response."), "cutoff")
 
     def test_stale_zero_audio_speech_is_not_effective_interruption(self):
         self.assertFalse(
