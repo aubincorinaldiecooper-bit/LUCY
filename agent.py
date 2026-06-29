@@ -45,6 +45,7 @@ from internet_search import (
 from audiointeraction_shadow import AudioInteractionShadow, audiointeraction_mode, build_shadow_from_env
 from inworld_voice_profile import InworldVoiceProfileShadow, build_inworld_shadow_from_env
 from hume_evi_bridge import run_hume_evi_bridge, voice_engine
+from inworld_realtime_bridge import run_inworld_realtime_bridge
 from interaction_state import (
     ASSISTANT_SPEAKING,
     ASSISTANT_THINKING,
@@ -7693,6 +7694,29 @@ def _attach_optional_interruption_diagnostics(session: AgentSession) -> None:
 
 
 
+async def _run_inworld_realtime_voice_engine(ctx: JobContext) -> None:
+    """Connect LiveKit, then let Inworld Realtime own STT, TTS, and VAD.
+
+    This is an opt-in replacement path selected by VOICE_ENGINE=inworld_realtime.
+    It bypasses the cascaded AgentSession so the current LiveKit STT, TTS, and
+    VAD providers are not instantiated for the session.
+    """
+    logger.info(
+        "voice_engine_selected=inworld_realtime current_pipeline_disabled=true livekit_room_layer=true replaces_stt=true replaces_tts=true replaces_vad=true"
+    )
+    try:
+        await ctx.connect()
+        logger.info("voice_engine_room_connected=true engine=inworld_realtime")
+        await run_inworld_realtime_bridge(ctx.room, instructions=SYSTEM_PROMPT)
+    except Exception as exc:
+        logger.error(
+            "voice_engine_bootstrap_failed=true engine=inworld_realtime error_type=%s error=%s",
+            type(exc).__name__,
+            exc,
+        )
+        raise
+
+
 async def _run_hume_evi_voice_engine(ctx: JobContext) -> None:
     """Connect the LiveKit room, then hand room audio to the Hume EVI bridge.
 
@@ -8277,6 +8301,9 @@ async def entrypoint(ctx: JobContext):
     logger.info("voice_engine_selected=%s", selected_voice_engine)
     if selected_voice_engine == "hume_evi":
         await _run_hume_evi_voice_engine(ctx)
+        return
+    if selected_voice_engine == "inworld_realtime":
+        await _run_inworld_realtime_voice_engine(ctx)
         return
 
     lucy_agent = LucyAgent(
