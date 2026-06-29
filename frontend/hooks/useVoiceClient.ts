@@ -49,9 +49,12 @@ export function useVoiceClient(options?: { onServerDisconnect?: () => void }) {
   const onServerDisconnectRef = useRef<(() => void) | undefined>(options?.onServerDisconnect);
   onServerDisconnectRef.current = options?.onServerDisconnect;
   const remoteAudioElsRef = useRef<Set<HTMLMediaElement>>(new Set());
+  const remoteTrackAudioElsRef = useRef<Map<RemoteTrack, Set<HTMLMediaElement>>>(new Map());
   const audioContextRef = useRef<AudioContext | null>(null);
   const gainNodeRef = useRef<GainNode | null>(null);
   const mediaSourceNodesRef = useRef<Map<HTMLMediaElement, MediaElementAudioSourceNode>>(new Map());
+  const audioCleanupTimersRef = useRef<Map<HTMLMediaElement, ReturnType<typeof setTimeout>>>(new Map());
+  const remoteAudioTailCleanupDelayMs = 500;
 
   const getRemoteAudioGain = useCallback(() => {
     const raw = Number.parseFloat(process.env.NEXT_PUBLIC_REMOTE_AUDIO_GAIN ?? "1.35");
@@ -111,6 +114,7 @@ export function useVoiceClient(options?: { onServerDisconnect?: () => void }) {
       }
     });
     mediaSourceNodesRef.current.clear();
+    remoteTrackAudioElsRef.current.clear();
 
     if (gainNodeRef.current) {
       try {
@@ -129,14 +133,44 @@ export function useVoiceClient(options?: { onServerDisconnect?: () => void }) {
     }
   }, []);
 
-  const clearRemoteAudioElements = useCallback(() => {
-    for (const el of remoteAudioElsRef.current) {
+  const cleanupRemoteAudioElement = useCallback((el: HTMLMediaElement, delayMs = 0) => {
+    const existingTimer = audioCleanupTimersRef.current.get(el);
+    if (existingTimer) {
+      clearTimeout(existingTimer);
+      audioCleanupTimersRef.current.delete(el);
+    }
+
+    const runCleanup = () => {
+      audioCleanupTimersRef.current.delete(el);
       cleanupAudioNodeForElement(el);
+      remoteAudioElsRef.current.delete(el);
+      remoteTrackAudioElsRef.current.forEach((trackEls, remoteTrack) => {
+        trackEls.delete(el);
+        if (trackEls.size === 0) {
+          remoteTrackAudioElsRef.current.delete(remoteTrack);
+        }
+      });
       el.remove();
+    };
+
+    if (delayMs > 0) {
+      const timer = setTimeout(runCleanup, delayMs);
+      audioCleanupTimersRef.current.set(el, timer);
+      return;
+    }
+
+    runCleanup();
+  }, [cleanupAudioNodeForElement]);
+
+  const clearRemoteAudioElements = useCallback(() => {
+    audioCleanupTimersRef.current.forEach((timer) => clearTimeout(timer));
+    audioCleanupTimersRef.current.clear();
+    for (const el of remoteAudioElsRef.current) {
+      cleanupRemoteAudioElement(el);
     }
     remoteAudioElsRef.current.clear();
     teardownAudioGainResources();
-  }, [cleanupAudioNodeForElement, teardownAudioGainResources]);
+  }, [cleanupRemoteAudioElement, teardownAudioGainResources]);
 
   const disconnect = useCallback(async () => {
     connectAttemptRef.current += 1;
@@ -180,26 +214,53 @@ export function useVoiceClient(options?: { onServerDisconnect?: () => void }) {
       });
       room.on(RoomEvent.TrackSubscribed, (track) => {
         if (track.kind !== Track.Kind.Audio) return;
-        const audioElement = (track as RemoteTrack).attach();
+        const remoteTrack = track as RemoteTrack;
+        const audioElement = remoteTrack.attach();
         audioElement.autoplay = true;
         audioElement.volume = 1.0;
         audioElement.setAttribute("playsinline", "true");
         audioElement.style.display = "none";
         document.body.appendChild(audioElement);
         remoteAudioElsRef.current.add(audioElement);
+        const trackEls = remoteTrackAudioElsRef.current.get(remoteTrack) ?? new Set<HTMLMediaElement>();
+        trackEls.add(audioElement);
+        remoteTrackAudioElsRef.current.set(remoteTrack, trackEls);
         setupAudioGainForElement(audioElement);
+        audioElement.addEventListener(
+          "ended",
+          () => cleanupRemoteAudioElement(audioElement, remoteAudioTailCleanupDelayMs),
+          { once: true },
+        );
         audioElement.play().catch((err) => {
           console.warn("Remote audio autoplay was blocked by the browser", err);
         });
       });
       room.on(RoomEvent.TrackUnsubscribed, (track) => {
         if (track.kind !== Track.Kind.Audio) return;
-        const detachedEls = (track as RemoteTrack).detach();
-        detachedEls.forEach((el) => {
-          cleanupAudioNodeForElement(el);
-          remoteAudioElsRef.current.delete(el);
-          el.remove();
-        });
+        const remoteTrack = track as RemoteTrack;
+        const attachedEls = remoteTrackAudioElsRef.current.get(remoteTrack);
+        const cleanupAttachedEl = (el: HTMLMediaElement) => {
+          const timer = setTimeout(() => {
+            try {
+              remoteTrack.detach(el);
+            } catch {
+              // best-effort detach after tail hold
+            }
+            cleanupRemoteAudioElement(el);
+          }, remoteAudioTailCleanupDelayMs);
+          audioCleanupTimersRef.current.set(el, timer);
+        };
+
+        if (attachedEls?.size) {
+          attachedEls.forEach(cleanupAttachedEl);
+          remoteTrackAudioElsRef.current.delete(remoteTrack);
+          return;
+        }
+
+        // Fallback for any element LiveKit knows about that was not tracked above.
+        setTimeout(() => {
+          remoteTrack.detach().forEach((el) => cleanupRemoteAudioElement(el));
+        }, remoteAudioTailCleanupDelayMs);
       });
       setState("connecting");
       await room.connect(session.room_url, session.token);
@@ -218,7 +279,7 @@ export function useVoiceClient(options?: { onServerDisconnect?: () => void }) {
       setState("idle");
       roomRef.current = null;
     }
-  }, [clearRemoteAudioElements, cleanupAudioNodeForElement, isMuted, setupAudioGainForElement]);
+  }, [clearRemoteAudioElements, cleanupRemoteAudioElement, isMuted, setupAudioGainForElement]);
 
   const toggleMute = useCallback(async () => {
     const next = !isMuted;
