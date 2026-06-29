@@ -31,7 +31,7 @@ EVI_FRAME_MS = 20
 
 def voice_engine() -> str:
     value = (os.getenv("VOICE_ENGINE") or "current").strip().lower()
-    return value if value in {"current", "hume_evi"} else "current"
+    return value if value in {"current", "hume_evi", "inworld_realtime"} else "current"
 
 
 def evi_bridge_debug() -> bool:
