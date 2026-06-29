@@ -134,9 +134,9 @@ export function useVoiceClient(options?: { onServerDisconnect?: () => void }) {
 
     if (gainNodeRef.current) {
       try {
-        el.pause();
+        gainNodeRef.current.disconnect();
       } catch {
-        // best-effort pause before teardown
+        // best-effort disconnect before teardown
       }
       gainNodeRef.current = null;
     }
@@ -242,7 +242,8 @@ export function useVoiceClient(options?: { onServerDisconnect?: () => void }) {
         // re-subscribe (reconnect, track republish) can never stack a second
         // audible copy. This app only ever has one remote audio track (the agent).
         clearRemoteAudioElements();
-        const audioElement = (track as RemoteTrack).attach();
+        const remoteTrack = track as RemoteTrack;
+        const audioElement = remoteTrack.attach();
         audioElement.autoplay = true;
         audioElement.volume = 1.0;
         audioElement.setAttribute("playsinline", "true");
