@@ -44,8 +44,21 @@ if (!process.env.DATABASE_URL) {
 // to keep the default host-only behavior.
 const authCookieDomain = process.env.AUTH_COOKIE_DOMAIN?.trim();
 
+// How long a signed-in session stays valid (default 60 days). updateAge rolls the
+// window forward on use, so an active user effectively stays signed in. The cookie
+// is persistent (maxAge follows expiresIn), so it survives browser restarts.
+const SESSION_EXPIRES_DAYS = Number(process.env.AUTH_SESSION_EXPIRES_DAYS ?? "60") || 60;
+const DAY_SECONDS = 60 * 60 * 24;
+
 export const auth = betterAuth({
   database: new Pool({ connectionString: process.env.DATABASE_URL }),
+  session: {
+    expiresIn: SESSION_EXPIRES_DAYS * DAY_SECONDS,
+    updateAge: DAY_SECONDS, // refresh the expiry at most once per day of use
+    // No cookieCache: every getSession hits the DB, so "sign out everywhere"
+    // (revokeSessions) invalidates other devices on their very next request
+    // instead of waiting for a cached cookie to expire.
+  },
   ...(authCookieDomain
     ? { advanced: { crossSubDomainCookies: { enabled: true, domain: authCookieDomain } } }
     : {}),

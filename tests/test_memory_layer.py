@@ -409,3 +409,134 @@ class MemoryConfigTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EmotionalPatternPreloadTests(unittest.TestCase):
+    def test_partition_splits_by_prefix(self):
+        import memory_layer as ml
+        mems = [
+            "They are training for a marathon.",
+            ml.EMOTIONAL_PATTERN_PREFIX + "you asked X and they said pressure not fear.",
+            "  ",
+            "They prefer mornings.",
+        ]
+        general, emotional = ml.partition_emotional_patterns(mems)
+        self.assertEqual(general, ["They are training for a marathon.", "They prefer mornings."])
+        self.assertEqual(emotional, ["you asked X and they said pressure not fear."])
+
+    def test_emotional_note_is_private_and_safe(self):
+        import memory_layer as ml
+        note = ml.emotional_pattern_preload_note(["they framed it as disappointment, not anger"])
+        self.assertIsNotNone(note)
+        low = note.lower()
+        self.assertIn("never reveal", low)
+        self.assertIn("never tell them how they sound", low)
+        self.assertIn("disappointment", note)
+
+    def test_emotional_note_empty(self):
+        import memory_layer as ml
+        self.assertIsNone(ml.emotional_pattern_preload_note([]))
+        self.assertIsNone(ml.emotional_pattern_preload_note(["   "]))
+
+
+class SemanticMemoryTests(unittest.IsolatedAsyncioTestCase):
+    def _layer(self, *, embed_vec, reader_rows=None, writer_calls=None, enabled=True):
+        import memory_layer as ml
+
+        async def _embed(text, **_):
+            return embed_vec
+
+        def _reader(sql, params):
+            self._last_read = {"sql": sql, "params": params}
+            return reader_rows or []
+
+        def _writer(sql, params):
+            (writer_calls if writer_calls is not None else []).append({"sql": sql, "params": params})
+
+        return ml.MemoryLayer(
+            ml.MemoryIdentity(clerk_user_id="user-1"),
+            db_url="postgresql://x",
+            semantic_enabled=enabled,
+            embed_fn=_embed,
+            db_reader=_reader,
+            db_writer=_writer,
+        )
+
+    async def test_no_embedding_falls_back(self):
+        # embed returns None -> semantic unavailable -> None -> falls through to
+        # SimpleMem (absent) -> [] (does not raise)
+        layer = self._layer(embed_vec=None)
+        self.assertEqual(await layer.retrieve("anything"), [])
+
+    async def test_db_error_falls_back(self):
+        import memory_layer as ml
+
+        async def _embed(_, **__):
+            return [0.5]
+
+        def _reader(sql, params):
+            raise RuntimeError("no pgvector column")
+
+        layer = ml.MemoryLayer(
+            ml.MemoryIdentity(clerk_user_id="user-1"),
+            db_url="postgresql://x", semantic_enabled=True, embed_fn=_embed, db_reader=_reader,
+        )
+        self.assertEqual(await layer.retrieve("anything"), [])  # graceful
+
+
+class MemoryReliabilityTests(unittest.IsolatedAsyncioTestCase):
+    def _layer(self, writer):
+        return MemoryLayer(
+            MemoryIdentity(clerk_user_id="u1"),
+            db_url="postgresql://x",
+            vector_enabled=False,
+            db_writer=writer,
+            db_reader=lambda sql, params: [],
+        )
+
+    def test_embed_and_store_exists_with_expected_signature(self):
+        import inspect
+        params = list(inspect.signature(MemoryLayer._embed_and_store).parameters)
+        self.assertEqual(params, ["self", "compact", "role", "turn_id", "modality", "media_url"])
+
+    async def test_remember_does_not_throw_when_db_write_fails(self):
+        def writer(sql, params):
+            raise RuntimeError("db down")
+        layer = self._layer(writer)
+        # Must not raise even though the durable write fails.
+        await layer._remember(role="user", content="hello there friend",
+                              turn_id=1, modality="text", media_url=None)
+
+    async def test_remember_writes_durable_text_when_vector_disabled(self):
+        calls = []
+        def writer(sql, params):
+            calls.append(sql)
+        layer = self._layer(writer)
+        await layer._remember(role="assistant", content="take a breath",
+                              turn_id=2, modality="text", media_url=None)
+        self.assertEqual(len(calls), 1)  # exactly one durable write (no duplicate)
+        self.assertIn("INSERT INTO memory_units", calls[0])
+        self.assertNotIn("embedding", calls[0])  # text-only fallback, no vector column
+
+    async def test_embed_and_store_called_with_expected_args(self):
+        seen = {}
+        layer = self._layer(lambda sql, params: None)
+        orig = layer._embed_and_store
+        async def spy(compact, role, turn_id, modality, media_url):
+            seen.update(compact=compact, role=role, turn_id=turn_id, modality=modality)
+            return await orig(compact, role, turn_id, modality, media_url)
+        layer._embed_and_store = spy
+        await layer._remember(role="user", content="my name is Sam",
+                              turn_id=7, modality="text", media_url=None)
+        self.assertEqual(seen["role"], "user")
+        self.assertEqual(seen["turn_id"], 7)
+        self.assertIn("my name is Sam", seen["compact"])
+
+    async def test_schedule_remember_no_unhandled_task_exception(self):
+        def writer(sql, params):
+            raise RuntimeError("db down")
+        layer = self._layer(writer)
+        layer.schedule_remember("user", "hello there friend", turn_id=3)
+        for t in list(layer._background_tasks):
+            await t
+            self.assertIsNone(t.exception())  # swallowed, never unhandled
