@@ -18,17 +18,20 @@ export async function POST(request: Request) {
   const upstream = await fetch(upstreamUrl, {
     method: "POST",
     headers: {
-      Accept: "application/sdp",
+      Accept: "application/sdp, application/json",
       "Content-Type": "application/sdp",
     },
     body: offerSdp,
     cache: "no-store",
   });
 
-  const answerSdp = await upstream.text();
+  const responseBody = await upstream.text();
+  const upstreamContentType = upstream.headers.get("content-type");
 
-  return new NextResponse(answerSdp, {
+  return new NextResponse(responseBody, {
     status: upstream.status,
-    headers: { "Content-Type": "application/sdp" },
+    headers: {
+      "Content-Type": upstream.ok ? "application/sdp" : (upstreamContentType ?? "application/json"),
+    },
   });
 }
