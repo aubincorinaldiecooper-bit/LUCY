@@ -488,14 +488,26 @@ export function useVoiceClient(options?: { onServerDisconnect?: () => void }) {
 
         const remoteTrack = track as RemoteTrack;
 
-        const isInworldRealtime = (remoteTrack.name || "") === INWORLD_REALTIME_TRACK_NAME;
+        // ``remoteTrack.name`` does not exist on the livekit-client TS types
+
+        // (``RemoteTrack<Kind>`` does not declare it), even though the runtime
+
+        // instance often has a backfilled name. Read from the publication
+
+        // instead — ``RemoteTrackPublication.trackName`` is the documented
+
+        // public API and is always present.
+
+        const trackName = (publication as unknown as { trackName?: string } | undefined)?.trackName ?? "";
+
+        const isInworldRealtime = trackName === INWORLD_REALTIME_TRACK_NAME;
 
 
         if (isInworldRealtime) {
 
           logInworldRealtime("track_subscribed", {
 
-            track_name: remoteTrack.name,
+            track_name: trackName,
 
             track_kind: remoteTrack.kind,
 
@@ -559,7 +571,7 @@ export function useVoiceClient(options?: { onServerDisconnect?: () => void }) {
 
           logInworldRealtime("audio_element_attached", {
 
-            track_name: remoteTrack.name,
+            track_name: trackName,
 
             audio_element_count: remoteAudioElsRef.current.size,
 
@@ -582,7 +594,7 @@ export function useVoiceClient(options?: { onServerDisconnect?: () => void }) {
 
               logInworldRealtime("audio_playback_started", {
 
-                track_name: remoteTrack.name,
+                track_name: trackName,
 
                 current_time: audioElement.currentTime,
 
@@ -610,7 +622,7 @@ export function useVoiceClient(options?: { onServerDisconnect?: () => void }) {
 
               logInworldRealtime("audio_playback_completed", {
 
-                track_name: remoteTrack.name,
+                track_name: trackName,
 
                 duration: audioElement.duration,
 
@@ -636,7 +648,7 @@ export function useVoiceClient(options?: { onServerDisconnect?: () => void }) {
 
               logInworldRealtime("audio_play_success", {
 
-                track_name: remoteTrack.name,
+                track_name: trackName,
 
                 audio_context_state: audioContextRef.current?.state ?? "unknown",
 
