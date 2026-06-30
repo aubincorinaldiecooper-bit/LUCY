@@ -267,7 +267,7 @@ def build_session_update(settings: InworldRealtimeSettings) -> dict[str, Any]:
 
             "instructions": settings.instructions,
 
-            "output_modalities": ["audio", "text"],
+            "output_modalities": ["audio"],  # AUDIO-ONLY EXPERIMENT: forcing audio only to verify Inworld returns PCM bytes
 
             "audio": {
 
@@ -378,7 +378,13 @@ def build_response_create(instructions: str | None = None) -> dict[str, Any]:
 
     response: dict[str, Any] = {
 
-        "output_modalities": ["audio", "text"],
+        # AUDIO-ONLY EXPERIMENT: forcing audio only to verify Inworld returns PCM
+
+        # bytes rather than a transcript-only response. Revert to
+
+        # ``["audio", "text"]`` once the audio path is proven.
+
+        "output_modalities": ["audio"],
 
     }
 
@@ -416,7 +422,7 @@ def _frame_bytes(frame: rtc.AudioFrame) -> bytes:
 
 
 
-def _event_audio_bytes(payload: dict[str, Any]) -> bytes:
+def _event_audio_bytes(payload: dict[str, Any], *, aggressive: bool = False) -> bytes:
 
     """Recursively pull audio bytes out of an Inworld server event payload.
 
@@ -425,17 +431,27 @@ def _event_audio_bytes(payload: dict[str, Any]) -> bytes:
 
     the source-field path. Internal callers that want path logging use the
 
-    candidate function directly.
+    candidate function directly. ``aggressive=True`` enables the Phase 2 fallback
+
+    (try-every-string-value) intended only for smoke-test mode.
 
     """
 
-    pcm, _ = _event_audio_candidate(payload)
+    pcm, _ = _event_audio_candidate(payload, aggressive=aggressive)
 
     return pcm
 
 
 
-def _event_audio_candidate(payload: dict[str, Any]) -> tuple[bytes, str | None]:
+def _event_audio_candidate(
+
+    payload: dict[str, Any] | Any,
+
+    *,
+
+    aggressive: bool = False,
+
+) -> tuple[bytes, str | None]:
 
     """Walk plausible audio-carrying paths; return the first valid base64 PCM and its path.
 
@@ -451,15 +467,23 @@ def _event_audio_candidate(payload: dict[str, Any]) -> tuple[bytes, str | None]:
     up under less obvious field names. Two-phase strategy:
 
 
-      Phase 1. Try audio-named keys (``audio*``) and ``delta``/``data`` — the
+      Phase 1 (always). Try audio-named keys (``audio*``) and ``delta``/``data`` —
 
-      documented Realtime-compatible paths.
+      the documented Realtime-compatible paths.
 
-      Phase 2. FALL BACK to *every other string value* in the payload. If
+      Phase 2 (only with ``aggressive=True``). FALL BACK to *every other
 
-      Inworld names the field ``voice_bytes``, ``audio_blob``, or anything we
+      string value* in the payload. If Inworld names the field ``voice_bytes``,
 
-      haven't predicted, we'll still find it.
+      ``audio_blob``, or anything we haven't predicted, we'll still find it.
+
+      Phase 2 is gated because a long non-audio string (transcript, error
+
+      message) COULD in theory base64-decode to ≥ 80 bytes and satisfy the
+
+      ``_try_decode_audio`` floor — the audio would sound like static, not
+
+      speech. Smoke tests want it on; production wants it off.
 
 
     ``source_field_path`` is included in the ``inworld_audio_candidate_found``
@@ -493,21 +517,23 @@ def _event_audio_candidate(payload: dict[str, Any]) -> tuple[bytes, str | None]:
 
                         return decoded, f"{path}.{key}"
 
-            # Phase 2: every OTHER string value — catches non-standard names.
+            # Phase 2 (only with aggressive=True): every OTHER string value.
 
-            for k, v in obj.items():
+            if aggressive:
 
-                if k in known_already_tried:
+                for k, v in obj.items():
 
-                    continue
+                    if k in known_already_tried:
 
-                if isinstance(v, str) and v:
+                        continue
 
-                    decoded = _try_decode_audio(v)
+                    if isinstance(v, str) and v:
 
-                    if decoded is not None:
+                        decoded = _try_decode_audio(v)
 
-                        return decoded, f"{path}.{k}"
+                        if decoded is not None:
+
+                            return decoded, f"{path}.{k}"
 
             # Phase 3: recurse into nested objects (skip strings — already tried).
 
@@ -542,9 +568,9 @@ def _event_audio_candidate(payload: dict[str, Any]) -> tuple[bytes, str | None]:
 
         logger.info(
 
-            "inworld_audio_candidate_found=true source_field_path=%s decoded_bytes=%s",
+            "inworld_audio_candidate_found=true aggressive=%s source_field_path=%s decoded_bytes=%s",
 
-            source or "<unknown>", len(pcm),
+            aggressive, source or "<unknown>", len(pcm),
 
         )
 
@@ -889,6 +915,32 @@ class InworldRealtimeLiveKitBridge:
 
         self._force_text_test_only: bool = _env_bool("INWORLD_FORCE_TEXT_TEST_ONLY", False)
 
+        # ``INWORLD_AGGRESSIVE_AUDIO_PROBE`` enables the Phase 2 fallback that
+
+        # tries base64-decode on EVERY string value in the payload (catches audio
+
+        # bytes living under non-standard field names). Useful for the smoke test
+
+        # — too aggressive for production (a long transcript could in theory
+
+        # base64-decode to ≥80 bytes and be treated as PCM). Defaults to
+
+        # auto-enabled when ``INWORLD_FORCE_TEXT_TEST_ONLY`` is set (smoke test
+
+        # mode) and disabled otherwise. Operator can override explicitly:
+
+        #   INWORLD_AGGRESSIVE_AUDIO_PROBE=true  forces on in any environment
+
+        #   INWORLD_AGGRESSIVE_AUDIO_PROBE=false forces off (narrow Phase 1 only)
+
+        if "INWORLD_AGGRESSIVE_AUDIO_PROBE" in os.environ:
+
+            self._aggressive_audio_probe: bool = _env_bool("INWORLD_AGGRESSIVE_AUDIO_PROBE", False)
+
+        else:
+
+            self._aggressive_audio_probe = self._force_text_test_only
+
 
     async def run(self) -> None:
 
@@ -896,7 +948,7 @@ class InworldRealtimeLiveKitBridge:
 
         logger.info(
 
-            "inworld_realtime_bridge_started=true voice_engine_selected=inworld_realtime stt_model=%s tts_model=%s tts_voice=%s turn_detection=%s voice_profile_enabled=%s force_text_test_enabled=%s force_text_test_only=%s",
+            "inworld_realtime_bridge_started=true voice_engine_selected=inworld_realtime stt_model=%s tts_model=%s tts_voice=%s turn_detection=%s voice_profile_enabled=%s force_text_test_enabled=%s force_text_test_only=%s aggressive_audio_probe=%s",
 
             self.settings.stt_model,
 
@@ -912,7 +964,23 @@ class InworldRealtimeLiveKitBridge:
 
             self._force_text_test_only,
 
+            self._aggressive_audio_probe,
+
         )
+
+        if self._aggressive_audio_probe and not self._force_text_test_only:
+
+            logger.warning(
+
+                "inworld_aggressive_audio_probe_enabled=true "
+
+                "reason=INWORLD_AGGRESSIVE_AUDIO_PROBE_set_explicitly_outside_smoke_test "
+
+                "action_required=set_INWORLD_AGGRESSIVE_AUDIO_PROBE=false_after_audio_path_is_proven "
+
+                "Phase2_fallback=try_every_string_value_in_payload"
+
+            )
 
         if self._force_text_test_enabled:
 
@@ -1515,11 +1583,19 @@ class InworldRealtimeLiveKitBridge:
 
         elif msg_type == "response.output_item.added":
 
+            # Treat as audio-probable for widest diagnostic net — a future
+
+            # Inworld build could place audio bytes in the item-level envelope.
+
+            summary = _event_audio_payload_summary(payload)
+
             logger.info(
 
-                "inworld_response_output_item_added=true safe_shape=%s",
+                "inworld_response_output_item_added=true safe_shape=%s long_string_candidates=%s",
 
                 _safe_payload_shape(payload) if isinstance(payload, dict) else "<!>",
+
+                summary,
 
             )
 
@@ -1572,22 +1648,36 @@ class InworldRealtimeLiveKitBridge:
 
         elif msg_type == "response.output_audio_transcript.delta":
 
+            # Transcript events are unlikely to carry audio bytes themselves,
+
+            # but logging the top-N long strings confirms that (and would
+
+            # surprise us if Inworld ever put PCM in here).
+
+            summary = _event_audio_payload_summary(payload)
+
             logger.info(
 
-                "inworld_response_audio_transcript_delta=true safe_shape=%s",
+                "inworld_response_audio_transcript_delta=true safe_shape=%s long_string_candidates=%s",
 
                 _safe_payload_shape(payload) if isinstance(payload, dict) else "<!>",
+
+                summary,
 
             )
 
 
         elif msg_type == "response.output_audio_transcript.done":
 
+            summary = _event_audio_payload_summary(payload)
+
             logger.info(
 
-                "inworld_response_audio_transcript_done=true safe_shape=%s",
+                "inworld_response_audio_transcript_done=true safe_shape=%s long_string_candidates=%s",
 
                 _safe_payload_shape(payload) if isinstance(payload, dict) else "<!>",
+
+                summary,
 
             )
 
@@ -1616,11 +1706,17 @@ class InworldRealtimeLiveKitBridge:
 
         elif msg_type == "response.output_item.done":
 
+            # Treat as audio-probable for widest diagnostic net.
+
+            summary = _event_audio_payload_summary(payload)
+
             logger.info(
 
-                "inworld_response_output_item_done=true safe_shape=%s",
+                "inworld_response_output_item_done=true safe_shape=%s long_string_candidates=%s",
 
                 _safe_payload_shape(payload) if isinstance(payload, dict) else "<!>",
+
+                summary,
 
             )
 
@@ -1796,9 +1892,18 @@ class InworldRealtimeLiveKitBridge:
 
     async def _write_inworld_audio_to_livekit(self, payload: dict[str, Any], source_event: str) -> None:
 
-        """Decode PCM out of any payload and push it to the LiveKit output source."""
+        """Decode PCM out of any payload and push it to the LiveKit output source.
 
-        pcm = _event_audio_bytes(payload)
+
+        ``_aggressive_audio_probe`` controls whether the Phase 2 "try every
+
+        string value" fallback is enabled (smoke test mode) or skipped
+
+        (production, narrow Phase 1 only).
+
+        """
+
+        pcm = _event_audio_bytes(payload, aggressive=self._aggressive_audio_probe)
 
         if not pcm:
 
@@ -2000,5 +2105,6 @@ async def run_inworld_realtime_bridge(room: rtc.Room, *, instructions: str | Non
     bridge = InworldRealtimeLiveKitBridge(room, settings)
 
     await bridge.run()
+
 
 
