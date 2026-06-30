@@ -1740,21 +1740,12 @@ async def inworld_webrtc_call(request: Request) -> Response:
 
 
 @app.post("/api/inworld/ws-smoke-test")
-async def inworld_ws_smoke_test() -> JSONResponse:
+async def inworld_ws_smoke_test(request: Request) -> JSONResponse:
     """Backend-only direct Inworld Realtime WebSocket audio smoke test.
 
     This does not use LiveKit or WebRTC. It answers whether Inworld emits usable
     Luna audio as ``response.output_audio.delta`` events for the bridge config.
     """
-    from dataclasses import replace
-
-    from inworld_realtime_bridge import (
-        build_conversation_item_create,
-        build_response_create,
-        build_session_update,
-        load_inworld_realtime_settings,
-    )
-
     result: dict[str, Any] = {
         "connected": False,
         "session_updated": False,
@@ -1770,6 +1761,24 @@ async def inworld_ws_smoke_test() -> JSONResponse:
         "first_events": [],
         "last_events": [],
     }
+
+    if (os.getenv("INWORLD_WS_SMOKE_ENABLED") or "").strip().lower() != "true":
+        return JSONResponse({"error": "ws_smoke_disabled"}, status_code=404)
+
+    expected_token = (os.getenv("INWORLD_WS_SMOKE_TOKEN") or "").strip()
+    auth_header = request.headers.get("authorization") or ""
+    scheme, _, provided_token = auth_header.partition(" ")
+    if not expected_token or scheme.lower() != "bearer" or provided_token.strip() != expected_token:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    from dataclasses import replace
+
+    from inworld_realtime_bridge import (
+        build_conversation_item_create,
+        build_response_create,
+        build_session_update,
+        load_inworld_realtime_settings,
+    )
 
     def bool_str(value: bool) -> str:
         return str(value).lower()
