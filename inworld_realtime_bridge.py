@@ -448,35 +448,40 @@ def _event_audio_candidate(payload: dict[str, Any]) -> tuple[bytes, str | None]:
 
     ``response.output_audio.done`` arrive, but the audio byte delta often shows
 
-    up under less obvious field names. Walk a handful of plausible paths AND
+    up under less obvious field names. Two-phase strategy:
 
-    scan the payload recursively for any base64 string long enough to be a real
 
-    audio chunk, so we don't miss it whatever shape Inworld ships.
+      Phase 1. Try audio-named keys (``audio*``) and ``delta``/``data`` — the
+
+      documented Realtime-compatible paths.
+
+      Phase 2. FALL BACK to *every other string value* in the payload. If
+
+      Inworld names the field ``voice_bytes``, ``audio_blob``, or anything we
+
+      haven't predicted, we'll still find it.
 
 
     ``source_field_path`` is included in the ``inworld_audio_candidate_found``
 
     log so we can iterate from logs to figure out which path actually carries
 
-    audio in *this* Inworld build.
+    audio in *this* Inworld build. False-positive risk is bounded by
+
+    ``_try_decode_audio`` (≥ 80 bytes decoded + even byte length).
 
     """
-
-    # Plausible audio-byte field names — these are intentionally narrow to
-
-    # avoid accidentally treating a transcript string as PCM. The recursive
-
-    # walk picks up paths like ``content[0].audio`` etc.
 
     audio_keys = ("audio", "audioContent", "audio_content", "audio_data")
 
 
-    def _scan(obj: Any, path: str) -> tuple[bytes, str | None]:
+    def _scan(obj: Any, path: str, known_already_tried: tuple[str, ...]) -> tuple[bytes, str | None]:
 
         if isinstance(obj, dict):
 
-            for key in audio_keys:
+            # Phase 1: documented audio/delta/data names.
+
+            for key in known_already_tried:
 
                 raw = obj.get(key)
 
@@ -488,37 +493,39 @@ def _event_audio_candidate(payload: dict[str, Any]) -> tuple[bytes, str | None]:
 
                         return decoded, f"{path}.{key}"
 
-            # Also try a few "delta"/"data" fields, but only at dict level — if
-
-            # the key is *named* something audio-like, it's safe to chase; if
-
-            # it isn't, we don't want to confuse transcripts with PCM.
-
-            for key in ("delta", "data"):
-
-                raw = obj.get(key)
-
-                if isinstance(raw, str) and raw:
-
-                    decoded = _try_decode_audio(raw)
-
-                    if decoded is not None:
-
-                        return decoded, f"{path}.{key}"
+            # Phase 2: every OTHER string value — catches non-standard names.
 
             for k, v in obj.items():
 
-                found, found_path = _scan(v, f"{path}.{k}")
+                if k in known_already_tried:
 
-                if found:
+                    continue
 
-                    return found, found_path
+                if isinstance(v, str) and v:
+
+                    decoded = _try_decode_audio(v)
+
+                    if decoded is not None:
+
+                        return decoded, f"{path}.{k}"
+
+            # Phase 3: recurse into nested objects (skip strings — already tried).
+
+            for k, v in obj.items():
+
+                if isinstance(v, (dict, list)):
+
+                    found, found_path = _scan(v, f"{path}.{k}", known_already_tried)
+
+                    if found:
+
+                        return found, found_path
 
         elif isinstance(obj, list):
 
             for i, item in enumerate(obj):
 
-                found, found_path = _scan(item, f"{path}[{i}]")
+                found, found_path = _scan(item, f"{path}[{i}]", known_already_tried)
 
                 if found:
 
@@ -527,7 +534,9 @@ def _event_audio_candidate(payload: dict[str, Any]) -> tuple[bytes, str | None]:
         return b"", None
 
 
-    pcm, source = _scan(payload if isinstance(payload, dict) else {}, "payload")
+    known_already_tried = audio_keys + ("delta", "data")
+
+    pcm, source = _scan(payload if isinstance(payload, dict) else {}, "payload", known_already_tried)
 
     if pcm:
 
@@ -543,14 +552,69 @@ def _event_audio_candidate(payload: dict[str, Any]) -> tuple[bytes, str | None]:
 
 
 
+def _event_audio_payload_summary(payload: dict[str, Any] | Any) -> list[tuple[str, int]]:
+
+    """Diagnostic: return the top-5 longest string values in the payload with their field paths.
+
+
+    Used as a fallback diagnostic when ``_event_audio_candidate`` returns no
+
+    bytes. Lets us answer "is there even a base64-shaped string in here, and if
+
+    so where?" — which is the question we need to ask when ``inworld_audio_
+
+    written_to_livekit`` never fires. Length threshold is 100 chars (≈75 decoded
+
+    bytes) so very short transcripts/transcript-id-like strings don't pollute.
+
+    """
+
+    candidates: list[tuple[str, int]] = []
+
+
+    def _walk(obj: Any, path: str) -> None:
+
+        if isinstance(obj, dict):
+
+            for k, v in obj.items():
+
+                if isinstance(v, str) and len(v) >= 100:
+
+                    candidates.append((f"{path}.{k}", len(v)))
+
+                elif isinstance(v, (dict, list)):
+
+                    _walk(v, f"{path}.{k}")
+
+        elif isinstance(obj, list):
+
+            for i, x in enumerate(obj):
+
+                _walk(x, f"{path}[{i}]")
+
+
+    _walk(payload if isinstance(payload, dict) else {}, "payload")
+
+    candidates.sort(key=lambda x: -x[1])
+
+    return candidates[:5]
+
+
+
 def _try_decode_audio(raw: str) -> bytes | None:
 
     """Return base64-decoded bytes if ``raw`` looks like a real PCM frame, else None.
 
 
-    Real PCM at 24 kHz mono 16-bit is >= 80 bytes per frame, and the byte count
+    Real PCM at 24 kHz mono 16-bit is ≥ 80 bytes per 60-ms frame, and the byte
 
-    must be even. Anything smaller / odd / non-base64 is rejected.
+    count must be even. Anything smaller / odd / non-base64 is rejected. The
+
+    80-byte floor is intentionally low so we don't miss small deltas; the
+
+    `_event_audio_payload_summary` log lets us eyeball whether we're being too
+
+    lax if anything suspicious shows up downstream.
 
     """
 
@@ -1468,20 +1532,11 @@ class InworldRealtimeLiveKitBridge:
 
             "response.content_part.added",
 
+            "response.content_part.done",
+
             "response.audio",
 
             "response.output_audio_buffer",
-
-        }:
-
-            # One handler for any audio-bearing payload (the docs don't put a clear
-
-            # name on the main-audio-bytes event). _event_audio_bytes recursively scans.
-
-            await self._write_inworld_audio_to_livekit(payload, msg_type)
-
-
-        elif msg_type in {
 
             "response.output_audio.done",
 
@@ -1489,30 +1544,30 @@ class InworldRealtimeLiveKitBridge:
 
         }:
 
+            # One handler for any event that might carry the audio bytes. The
+
+            # docs don't name a single event for ``inworld-tts-2`` audio, and
+
+            # some pipelines stash the full audio in the snapshot rather than
+
+            # the delta. Always log the top-N longest strings (``inworld_audio_
+
+            # probe_summary``) so we can see exactly what's in the payload even
+
+            # when our extractor returns zero bytes.
+
+            summary = _event_audio_payload_summary(payload)
+
             logger.info(
 
-                "inworld_response_audio_done=true event_type=%s safe_shape=%s",
+                "inworld_audio_probe_summary=true event=%s long_string_candidates=%s",
 
-                msg_type, _safe_payload_shape(payload) if isinstance(payload, dict) else "<!>",
+                msg_type, summary,
 
             )
-
-
-        # ``response.content_part.done`` may carry audio bytes — Inworld's docs
-
-        # are ambiguous about which event holds the actual PCM. Probe both.
-
-        elif msg_type == "response.content_part.done":
 
             await self._write_inworld_audio_to_livekit(payload, msg_type)
 
-            logger.info(
-
-                "inworld_response_content_part_done=true safe_shape=%s",
-
-                _safe_payload_shape(payload) if isinstance(payload, dict) else "<!>",
-
-            )
 
 
         elif msg_type == "response.output_audio_transcript.delta":
@@ -1633,6 +1688,24 @@ class InworldRealtimeLiveKitBridge:
                 self._forced_test_phase,
 
             )
+
+            # ``response.done`` carries the FULL response snapshot. Some Inworld
+
+            # pipelines bake the audio bytes into this snapshot (rather than
+
+            # streaming them in delta events). Probe it like any audio event.
+
+            summary = _event_audio_payload_summary(payload)
+
+            logger.info(
+
+                "inworld_audio_probe_summary=true event=response.done long_string_candidates=%s",
+
+                summary,
+
+            )
+
+            await self._write_inworld_audio_to_livekit(payload, msg_type)
 
             # Forced text test state machine: complete and unpause mic.
 
