@@ -145,6 +145,26 @@ class InworldRealtimeSettings:
 
     auth_scheme: str
 
+    # TTS provider-data fields that go into ``session.update.providerData.tts``.
+
+    # These tell the Inworld Realtime stack HOW to deliver (and segment) the
+
+    # synthesized audio bytes; in our smoke-test session they were missing,
+
+    # and Inworld responded with text-only events despite
+
+    # ``output_modalities=["audio"]``. Confirmed-runtime defaults match the
+
+    # values that have been observed to make ``response.output_audio.delta``
+
+    # actually carry PCM on a Luna / inworld-tts-2 configuration.
+
+    tts_delivery_mode: str
+
+    tts_segmenter_strategy: str
+
+    tts_steering_handling: str
+
 
     @property
 
@@ -249,6 +269,20 @@ def load_inworld_realtime_settings(*, instructions: str | None = None) -> Inworl
 
         auth_scheme=auth_scheme,
 
+        # TTS provider-data (see InworldRealtimeSettings docstring). Defaults
+
+        # match the values confirmed-runtime for an inworld-tts-2 + Luna smoke
+
+        # test session where ``response.output_audio.delta`` is expected to
+
+        # carry PCM bytes.
+
+        tts_delivery_mode=(os.getenv("INWORLD_TTS_DELIVERY_MODE") or "CREATIVE").strip(),
+
+        tts_segmenter_strategy=(os.getenv("INWORLD_TTS_SEGMENTER_STRATEGY") or "full_turn").strip(),
+
+        tts_steering_handling=(os.getenv("INWORLD_TTS_STEERING_HANDLING") or "emit_once").strip(),
+
     )
 
 
@@ -308,6 +342,16 @@ def build_session_update(settings: InworldRealtimeSettings) -> dict[str, Any]:
             "providerData": {
 
                 "stt": {"voice_profile": settings.voice_profile_enabled},
+
+                "tts": {
+
+                    "delivery_mode": settings.tts_delivery_mode,
+
+                    "segmenter_strategy": settings.tts_segmenter_strategy,
+
+                    "steering_handling": settings.tts_steering_handling,
+
+                },
 
             },
 
@@ -1991,6 +2035,29 @@ class InworldRealtimeLiveKitBridge:
         await self._send_inworld_message(update, reason="session_created")
 
 
+        # TTS provider-data confirmation — emitted so we can prove from logs
+
+        # that the new ``providerData.tts`` block was included in the
+
+        # session.update we just sent. Logs only the Inworld-controlled keys
+
+        # we pass in (delivery_mode / segmenter_strategy / steering_handling)
+
+        # and their values — no secrets, no audio bytes.
+
+        logger.info(
+
+            "inworld_tts_provider_data_enabled=true delivery_mode=%s segmenter_strategy=%s steering_handling=%s",
+
+            self.settings.tts_delivery_mode,
+
+            self.settings.tts_segmenter_strategy,
+
+            self.settings.tts_steering_handling,
+
+        )
+
+
         logger.info(
 
             "inworld_session_update_sent=true inworld_session_model=%s inworld_stt_model=%s inworld_tts_model=%s inworld_tts_voice=%s inworld_turn_detection_type=%s inworld_turn_detection_create_response=%s inworld_turn_detection_interrupt_response=%s effective_voice_profile_enabled=%s",
@@ -2105,6 +2172,5 @@ async def run_inworld_realtime_bridge(room: rtc.Room, *, instructions: str | Non
     bridge = InworldRealtimeLiveKitBridge(room, settings)
 
     await bridge.run()
-
 
 
