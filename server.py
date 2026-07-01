@@ -1520,17 +1520,25 @@ def _inworld_web_auth_header() -> str | None:
     (``/v1/realtime/ice-servers``, ``/v1/realtime/calls``).
 
 
-    Per Inworld's WebRTC REST docs these endpoints require Bearer auth. The
+    Inworld's own reference WebRTC client sends the already-base64-encoded
 
-    WebSocket bridge (``INWORLD_AUTH_SCHEME``) is independently configurable —
+    Portal API key with the ``Basic`` scheme on both endpoints — the same
 
-    we do NOT share its scheme here, because a workspace using ``basic`` for
+    credential shape our WebSocket bridge already sends as ``Basic``. A
 
-    the WebSocket bridge may still need ``bearer`` for the REST endpoints.
+    minted JWT would use ``Bearer`` instead, but that requires separate
 
-    Override with ``INWORLD_WEBRTC_AUTH_SCHEME`` (default ``bearer``). The
+    INWORLD_KEY/INWORLD_SECRET credentials we don't have wired up. Sending
 
-    key is NEVER logged.
+    the raw key as ``Bearer`` is rejected upstream and was the cause of
+
+    ``/api/inworld/webrtc/call`` returning 502 (an upstream 401 collapsed
+
+    into a flat 502 by this proxy). Override with
+
+    ``INWORLD_WEBRTC_AUTH_SCHEME`` (default ``basic``). The key is NEVER
+
+    logged.
 
     """
 
@@ -1540,15 +1548,13 @@ def _inworld_web_auth_header() -> str | None:
 
         return None
 
-    scheme = (os.getenv("INWORLD_WEBRTC_AUTH_SCHEME") or "bearer").strip().lower()
+    scheme = (os.getenv("INWORLD_WEBRTC_AUTH_SCHEME") or "basic").strip().lower()
 
-    if scheme == "basic":
+    if scheme == "bearer":
 
-        # Defensive: some workspaces may still expect this. Default is bearer.
+        return f"Bearer {api_key}"
 
-        return f"Basic {api_key}"
-
-    return f"Bearer {api_key}"
+    return f"Basic {api_key}"
 
 
 
@@ -1561,7 +1567,7 @@ async def inworld_webrtc_ice() -> JSONResponse:
 
     Inworld docs: ``GET https://api.inworld.ai/v1/realtime/ice-servers``
 
-    Auth: ``Authorization: Bearer <INWORLD_API_KEY>``
+    Auth: ``Authorization: Basic <INWORLD_API_KEY>``
 
     """
 
@@ -1640,7 +1646,7 @@ async def inworld_webrtc_call(request: Request) -> Response:
     """Accept raw SDP offer from the browser, forward to Inworld, return SDP answer.
 
     Inworld docs: ``POST https://api.inworld.ai/v1/realtime/calls``
-    Auth: ``Authorization: Bearer <INWORLD_API_KEY>``
+    Auth: ``Authorization: Basic <INWORLD_API_KEY>``
     Content-Type: ``application/sdp``
     Body: SDP offer (text)
     Returns: SDP answer (text)
@@ -1648,9 +1654,9 @@ async def inworld_webrtc_call(request: Request) -> Response:
     sdp_offer = await request.body()
     sdp_bytes_in = len(sdp_offer)
     api_key = _inworld_bearer_token()
-    auth_scheme = (os.getenv("INWORLD_WEBRTC_AUTH_SCHEME") or "bearer").strip().lower()
+    auth_scheme = (os.getenv("INWORLD_WEBRTC_AUTH_SCHEME") or "basic").strip().lower()
     if auth_scheme not in {"bearer", "basic"}:
-        auth_scheme = "bearer"
+        auth_scheme = "basic"
 
     print(
         "inworld_webrtc_call_proxy_start "
