@@ -1636,109 +1636,275 @@ async def inworld_webrtc_ice() -> JSONResponse:
 
 
 @app.post("/api/inworld/webrtc/call")
-
 async def inworld_webrtc_call(request: Request) -> Response:
-
     """Accept raw SDP offer from the browser, forward to Inworld, return SDP answer.
 
-
     Inworld docs: ``POST https://api.inworld.ai/v1/realtime/calls``
-
     Auth: ``Authorization: Bearer <INWORLD_API_KEY>``
-
     Content-Type: ``application/sdp``
-
     Body: SDP offer (text)
-
     Returns: SDP answer (text)
-
     """
-
+    sdp_offer = await request.body()
+    sdp_bytes_in = len(sdp_offer)
     api_key = _inworld_bearer_token()
+    auth_scheme = (os.getenv("INWORLD_WEBRTC_AUTH_SCHEME") or "bearer").strip().lower()
+    if auth_scheme not in {"bearer", "basic"}:
+        auth_scheme = "bearer"
+
+    print(
+        "inworld_webrtc_call_proxy_start "
+        f"sdp_bytes_in={sdp_bytes_in} "
+        f"auth_scheme={auth_scheme} "
+        f"api_key_present={str(bool(api_key)).lower()}",
+        flush=True,
+    )
 
     if not api_key:
-
         return JSONResponse(
-
-            {"error": "inworld_webrtc_call_unavailable reason=INWORLD_API_KEY_missing"},
-
+            {
+                "error": "inworld_webrtc_call_failed",
+                "upstream_status": None,
+                "upstream_content_type": None,
+                "body_snippet": "INWORLD_API_KEY_missing",
+                "sdp_bytes_in": sdp_bytes_in,
+                "upstream_bytes": 0,
+            },
             status_code=503,
-
         )
-
-    sdp_offer = await request.body()
-
     if not sdp_offer:
-
-        return JSONResponse({"error": "empty_sdp_offer"}, status_code=400)
-
+        return JSONResponse(
+            {
+                "error": "inworld_webrtc_call_failed",
+                "upstream_status": None,
+                "upstream_content_type": None,
+                "body_snippet": "empty_sdp_offer",
+                "sdp_bytes_in": sdp_bytes_in,
+                "upstream_bytes": 0,
+            },
+            status_code=400,
+        )
     try:
-
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as sess:
-
             async with sess.post(
-
                 "https://api.inworld.ai/v1/realtime/calls",
-
                 headers={
-
                     "Authorization": _inworld_web_auth_header(),
-
                     "Content-Type": "application/sdp",
-
                 },
-
                 data=sdp_offer,
-
             ) as r:
+                answer_bytes = await r.read()
+                upstream_bytes = len(answer_bytes)
+                upstream_content_type = r.headers.get("content-type")
+                answer_text = answer_bytes.decode("utf-8", errors="replace")
+                body_snippet = answer_text[:500]
 
-                answer_text = await r.text()
-
-                logger.info(
-
-                    "inworld_webrtc_call_proxy status=%s sdp_bytes_in=%s sdp_bytes_out=%s",
-
-                    r.status, len(sdp_offer), len(answer_text),
-
+                print(
+                    "inworld_webrtc_call_proxy_result "
+                    f"upstream_status={r.status} "
+                    f"sdp_bytes_in={sdp_bytes_in} "
+                    f"upstream_bytes={upstream_bytes} "
+                    f"upstream_content_type={upstream_content_type} "
+                    f"body_snippet={body_snippet!r}",
+                    flush=True,
                 )
 
                 if r.status == 200:
-
                     return Response(
-
-                        content=answer_text,
-
+                        content=answer_bytes,
                         status_code=200,
-
                         media_type="application/sdp",
-
                     )
-
                 return JSONResponse(
-
                     {
-
                         "error": "inworld_webrtc_call_failed",
-
-                        "status": r.status,
-
-                        "body": answer_text[:2048],
-
+                        "upstream_status": r.status,
+                        "upstream_content_type": upstream_content_type,
+                        "body_snippet": body_snippet,
+                        "sdp_bytes_in": sdp_bytes_in,
+                        "upstream_bytes": upstream_bytes,
                     },
-
                     status_code=502,
-
                 )
-
     except Exception as exc:  # noqa: BLE001
-
-        logger.error("inworld_webrtc_call_proxy_exception error=%s", exc)
-
+        print(f"inworld_webrtc_call_proxy_exception error={exc!r}", flush=True)
         return JSONResponse(
-
-            {"error": "inworld_webrtc_call_exception", "detail": str(exc)},
-
+            {
+                "error": "inworld_webrtc_call_exception",
+                "detail": repr(exc),
+                "sdp_bytes_in": sdp_bytes_in,
+            },
             status_code=502,
-
         )
 
+
+@app.post("/api/inworld/ws-smoke-test")
+async def inworld_ws_smoke_test(request: Request) -> JSONResponse:
+    """Backend-only direct Inworld Realtime WebSocket audio smoke test.
+
+    This does not use LiveKit or WebRTC. It answers whether Inworld emits usable
+    Luna audio as ``response.output_audio.delta`` events for the bridge config.
+    """
+    result: dict[str, Any] = {
+        "connected": False,
+        "session_updated": False,
+        "response_created": False,
+        "event_counts": {},
+        "audio_delta_count": 0,
+        "audio_delta_total_chars": 0,
+        "saw_audio_done": False,
+        "saw_audio_transcript": False,
+        "saw_text_done": False,
+        "saw_response_done": False,
+        "errors": [],
+        "first_events": [],
+        "last_events": [],
+    }
+
+    if (os.getenv("INWORLD_WS_SMOKE_ENABLED") or "").strip().lower() != "true":
+        return JSONResponse({"error": "ws_smoke_disabled"}, status_code=404)
+
+    expected_token = (os.getenv("INWORLD_WS_SMOKE_TOKEN") or "").strip()
+    auth_header = request.headers.get("authorization") or ""
+    scheme, _, provided_token = auth_header.partition(" ")
+    if not expected_token or scheme.lower() != "bearer" or provided_token.strip() != expected_token:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    from dataclasses import replace
+
+    from inworld_realtime_bridge import (
+        build_conversation_item_create,
+        build_response_create,
+        build_session_update,
+        load_inworld_realtime_settings,
+    )
+
+    def bool_str(value: bool) -> str:
+        return str(value).lower()
+
+    def record_event(payload: dict[str, Any]) -> str:
+        event_type = str(payload.get("type") or "unknown")
+        event_counts = result["event_counts"]
+        event_counts[event_type] = int(event_counts.get(event_type, 0)) + 1
+        event_summary = {"type": event_type, "keys": sorted(str(key) for key in payload.keys())}
+        if "error" in payload:
+            event_summary["error"] = payload.get("error")
+        if len(result["first_events"]) < 20:
+            result["first_events"].append(event_summary)
+        result["last_events"].append(event_summary)
+        result["last_events"] = result["last_events"][-20:]
+        print(f"inworld_ws_smoke_event type={event_type}", flush=True)
+        return event_type
+
+    print("inworld_ws_smoke_started=true", flush=True)
+
+    try:
+        settings = load_inworld_realtime_settings(instructions="Say hello in one short sentence.")
+        settings = replace(
+            settings,
+            model="groq/openai/gpt-oss-120b",
+            stt_model="assemblyai/u3-rt-pro",
+            tts_model="inworld-tts-2",
+            voice="Luna",
+            input_format="pcm16",
+            output_format="pcm16",
+            turn_detection_type="semantic_vad",
+            tts_delivery_mode="CREATIVE",
+            tts_segmenter_strategy="full_turn",
+            tts_steering_handling="emit_once",
+        )
+    except Exception as exc:  # noqa: BLE001
+        result["errors"].append(repr(exc))
+        print(f"inworld_ws_smoke_exception error={exc!r}", flush=True)
+        return JSONResponse(result, status_code=500)
+
+    session_update_sent = False
+    prompt_sent = False
+    response_create_sent = False
+    deadline = time.monotonic() + 15.0
+
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
+            async with session.ws_connect(
+                settings.connection_url,
+                headers=settings.auth_headers,
+                heartbeat=20,
+            ) as ws:
+                result["connected"] = True
+                print("inworld_ws_smoke_connected=true", flush=True)
+
+                while time.monotonic() < deadline:
+                    timeout = max(0.1, deadline - time.monotonic())
+                    try:
+                        msg = await ws.receive(timeout=timeout)
+                    except asyncio.TimeoutError:
+                        break
+
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        try:
+                            payload = json.loads(msg.data)
+                        except Exception as exc:  # noqa: BLE001
+                            result["errors"].append(f"json_parse_error: {exc!r}")
+                            continue
+
+                        event_type = record_event(payload)
+
+                        if event_type == "session.created" and not session_update_sent:
+                            await ws.send_json(build_session_update(settings))
+                            session_update_sent = True
+                            print("inworld_ws_smoke_session_update_sent=true", flush=True)
+
+                        if event_type == "session.updated":
+                            result["session_updated"] = True
+                            if not prompt_sent:
+                                await ws.send_json(build_conversation_item_create("Say hello in one short sentence."))
+                                prompt_sent = True
+
+                        if event_type == "conversation.item.done" and prompt_sent and not response_create_sent:
+                            await ws.send_json(build_response_create("Say hello in one short sentence."))
+                            response_create_sent = True
+                            result["response_created"] = True
+                            print("inworld_ws_smoke_response_create_sent=true", flush=True)
+
+                        if event_type == "response.created":
+                            result["response_created"] = True
+                        elif event_type == "response.output_audio.delta":
+                            delta = payload.get("delta")
+                            chars = len(delta) if isinstance(delta, str) else 0
+                            result["audio_delta_count"] += 1
+                            result["audio_delta_total_chars"] += chars
+                            print(f"inworld_ws_smoke_audio_delta chars={chars}", flush=True)
+                        elif event_type == "response.output_audio.done":
+                            result["saw_audio_done"] = True
+                        elif event_type in {
+                            "response.output_audio_transcript.delta",
+                            "response.output_audio_transcript.done",
+                        }:
+                            result["saw_audio_transcript"] = True
+                        elif event_type in {"response.output_text.done", "response.text.done"}:
+                            result["saw_text_done"] = True
+                        elif event_type == "response.done":
+                            result["saw_response_done"] = True
+                            break
+                        elif event_type == "error":
+                            result["errors"].append(payload.get("error") or payload)
+
+                    elif msg.type in {aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE}:
+                        break
+                    elif msg.type == aiohttp.WSMsgType.ERROR:
+                        result["errors"].append(repr(ws.exception()))
+                        break
+    except Exception as exc:  # noqa: BLE001
+        result["errors"].append(repr(exc))
+        print(f"inworld_ws_smoke_exception error={exc!r}", flush=True)
+
+    print(
+        "inworld_ws_smoke_summary "
+        f"audio_delta_count={result['audio_delta_count']} "
+        f"audio_delta_total_chars={result['audio_delta_total_chars']} "
+        f"saw_audio_done={bool_str(bool(result['saw_audio_done']))} "
+        f"saw_response_done={bool_str(bool(result['saw_response_done']))}",
+        flush=True,
+    )
+    return JSONResponse(result)
