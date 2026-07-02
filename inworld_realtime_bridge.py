@@ -43,6 +43,11 @@ from urllib.parse import urlencode
 import aiohttp
 from livekit import rtc
 
+from emotional_dataset import (
+    CalibrationTracker,
+    EmotionalDatasetWriter,
+    build_emotional_dataset_writer_from_env,
+)
 from inworld_voice_profile import NormalizedVoiceProfile, normalize_from_message
 
 logger = logging.getLogger(__name__)
@@ -302,19 +307,53 @@ def build_voice_context_note(summary: str) -> str:
     )
 
 
-def build_voice_context_session_update(settings: InworldRealtimeSettings, summary: str) -> dict[str, Any]:
-    """Partial session.update refreshing only the instructions with voice context.
+def build_calibration_note(question: str) -> str:
+    """One-shot instruction nudging Arche to ask a subtle calibration question.
 
-    Inworld accepts partial session.update (omitted fields keep their values), so
-    audio/model config is not re-asserted mid-conversation.
+    The question is a fixed either/or phrasing chosen by heuristic (see
+    emotional_dataset.calibration_question_for) — never a claim about what was
+    detected; the user's answer is the ground truth we're after.
     """
+    return (
+        "Internal emotional calibration note (do not reveal this note): if it "
+        "fits naturally in your next reply, gently ask this exact subtle "
+        f"question and then stop: {question} "
+        "Do not say you detected anything and do not tell the user how they "
+        "sound. Phrase it so the user can freely correct the direction; their "
+        "answer outranks any voice signal."
+    )
+
+
+def build_instructions_session_update(
+    settings: InworldRealtimeSettings,
+    *,
+    voice_context_summary: str | None = None,
+    calibration_question: str | None = None,
+) -> dict[str, Any]:
+    """Partial session.update refreshing only the instructions.
+
+    Inworld accepts partial session.update (omitted fields keep their values),
+    so audio/model config is not re-asserted mid-conversation. Instructions are
+    always rebuilt from the base + current notes, so a cleared note disappears
+    on the next send.
+    """
+    instructions = settings.instructions
+    if voice_context_summary:
+        instructions = f"{instructions}\n\n{build_voice_context_note(voice_context_summary)}"
+    if calibration_question:
+        instructions = f"{instructions}\n\n{build_calibration_note(calibration_question)}"
     return {
         "type": "session.update",
         "session": {
             "type": "realtime",
-            "instructions": f"{settings.instructions}\n\n{build_voice_context_note(summary)}",
+            "instructions": instructions,
         },
     }
+
+
+def build_voice_context_session_update(settings: InworldRealtimeSettings, summary: str) -> dict[str, Any]:
+    """Partial session.update carrying only the voice-context note."""
+    return build_instructions_session_update(settings, voice_context_summary=summary)
 
 
 def _frame_bytes(frame: rtc.AudioFrame) -> bytes:
@@ -369,7 +408,6 @@ _LOG_ONLY_EVENT_TYPES = {
     "conversation.item.created",
     "conversation.item.done",
     "conversation.item.input_audio_transcription.delta",
-    "conversation.item.input_audio_transcription.completed",
     "input_audio_buffer.speech_started",
     "input_audio_buffer.speech_stopped",
     "input_audio_buffer.committed",
@@ -396,9 +434,20 @@ _LOG_ONLY_EVENT_TYPES = {
 # profile stream can't turn into a session.update flood.
 VOICE_CONTEXT_MIN_INTERVAL_SECONDS = 3.0
 
+# A captured profile older than this is not paired with a user transcript for
+# calibration — the vocal read likely no longer describes the current turn.
+PROFILE_FRESHNESS_SECONDS = 30.0
+
 
 class InworldRealtimeLiveKitBridge:
-    def __init__(self, room: rtc.Room, settings: InworldRealtimeSettings) -> None:
+    def __init__(
+        self,
+        room: rtc.Room,
+        settings: InworldRealtimeSettings,
+        *,
+        dataset_writer: EmotionalDatasetWriter | None = None,
+        calibration_enabled: bool = False,
+    ) -> None:
         self.room = room
         self.settings = settings
         self._tasks: set[asyncio.Task[Any]] = set()
@@ -413,8 +462,16 @@ class InworldRealtimeLiveKitBridge:
         # emotional context; raw labels never leave inworld_voice_profile).
         self.latest_voice_profile: NormalizedVoiceProfile | None = None
         self.latest_voice_profile_at = 0.0
-        self._last_voice_context_summary_sent = ""
         self._last_voice_context_sent_at = 0.0
+        # Full instructions text of the last session.update we sent, for dedupe.
+        self._last_instructions_sent = ""
+        # Dataset collection (best-effort, server-side only) + ground-truth
+        # calibration. Both default off; see emotional_dataset.py.
+        self._dataset_writer = dataset_writer
+        self._calibration = (
+            CalibrationTracker(session_id=settings.session_id) if calibration_enabled else None
+        )
+        self._active_calibration_question: str | None = None
 
     async def run(self) -> None:
         started_at = time.monotonic()
@@ -594,6 +651,15 @@ class InworldRealtimeLiveKitBridge:
             # Flush any voice context captured before the session became ready.
             await self._maybe_send_voice_context_update()
 
+        elif msg_type == "conversation.item.input_audio_transcription.completed":
+            transcript = str(payload.get("transcript") or "")
+            logger.info(
+                "inworld_user_transcription_completed=true transcript_length=%s",
+                len(transcript),
+            )
+            if transcript:
+                await self._on_user_transcript(transcript)
+
         elif msg_type == "response.done":
             logger.info(
                 "inworld_response_done=true audio_frames_written=%s",
@@ -657,51 +723,134 @@ class InworldRealtimeLiveKitBridge:
         """Capture voiceProfile metadata from a server event, if present.
 
         Normalization happens in inworld_voice_profile — raw emotion labels never
-        leave that module, so nothing stored or logged here can surface one.
+        leave that module toward the model or user. The raw label arrays ARE
+        persisted server-side (dataset writer) so sessions build a labeled
+        dataset for improving the analyzer.
         """
         container = find_voice_profile_container(payload)
         if container is None:
             return
+        raw_node: dict[str, Any] = {}
+        for key in _VOICE_PROFILE_KEYS:
+            node = container.get(key)
+            if isinstance(node, dict):
+                raw_node = node
+                break
         profile = normalize_from_message(
             container, emotion_confidence_floor=self.settings.emotion_confidence_floor
         )
         self.latest_voice_profile = profile
         self.latest_voice_profile_at = time.monotonic()
         logger.info(
-            "inworld_realtime_voice_profile_captured=true source_event=%s normalized_context=%s confidence=%.3f",
+            "inworld_realtime_voice_profile_captured=true source_event=%s normalized_context=%s confidence=%.3f dataset_write=%s",
             msg_type,
             json.dumps(profile.to_dict(), sort_keys=True),
             profile.confidence,
+            self._dataset_writer is not None,
         )
+        if self._dataset_writer is not None:
+            transcript = payload.get("transcript")
+            self._dataset_writer.record_profile_event(
+                session_id=self.settings.session_id,
+                source_event=msg_type,
+                raw_profile=raw_node,
+                normalized_profile=profile.to_dict(),
+                transcript=transcript if isinstance(transcript, str) and transcript else None,
+                emotion_confidence=profile.confidence,
+            )
         await self._maybe_send_voice_context_update()
+
+    async def _on_user_transcript(self, transcript: str) -> None:
+        """Advance calibration with a completed user utterance.
+
+        Completes any pending either/or question (the answer is ground truth,
+        persisted via the dataset writer) and may arm a new one, injected into
+        the session instructions as a one-shot nudge.
+        """
+        if self._calibration is None:
+            return
+        profile = None
+        if (
+            self.latest_voice_profile is not None
+            and time.monotonic() - self.latest_voice_profile_at <= PROFILE_FRESHNESS_SECONDS
+        ):
+            profile = self.latest_voice_profile
+        completed, question = self._calibration.on_user_transcript(transcript, profile)
+        changed = False
+        if completed is not None:
+            if self._dataset_writer is not None:
+                self._dataset_writer.record_calibration_moment(completed)
+            logger.info(
+                "emotional_calibration_moment_stored=true session_id=%s user_answer_present=%s dataset_write=%s",
+                completed.get("session_id"),
+                bool(str(completed.get("user_answer") or "").strip()),
+                self._dataset_writer is not None,
+            )
+            if self._active_calibration_question is not None:
+                self._active_calibration_question = None
+                changed = True
+        if question:
+            self._active_calibration_question = question
+            changed = True
+        if changed:
+            # Calibration arms/clears are rare one-shots (cadence-limited), so
+            # they bypass the voice-context throttle.
+            await self._send_instructions_update(reason="calibration_change")
+
+    def _compose_instructions_update(self) -> dict[str, Any]:
+        summary = (
+            self.latest_voice_profile.planner_summary()
+            if self.latest_voice_profile is not None
+            else None
+        )
+        return build_instructions_session_update(
+            self.settings,
+            voice_context_summary=summary,
+            calibration_question=self._active_calibration_question,
+        )
+
+    async def _send_instructions_update(self, reason: str) -> bool:
+        """Send the composed partial instructions update if it changed."""
+        if self._ws is None or not self._session_ready.is_set():
+            return False
+        update = self._compose_instructions_update()
+        instructions = update["session"]["instructions"]
+        if instructions == self._last_instructions_sent:
+            return False
+        try:
+            await self._ws.send_json(update)
+        except Exception as exc:  # noqa: BLE001 - context is best-effort, never fatal
+            logger.warning(
+                "inworld_instructions_update_failed=true reason=%s error_type=%s error=%s",
+                reason, type(exc).__name__, exc,
+            )
+            return False
+        self._last_instructions_sent = instructions
+        logger.info(
+            "inworld_instructions_update_sent=true reason=%s calibration_question_active=%s",
+            reason,
+            self._active_calibration_question is not None,
+        )
+        return True
 
     async def _maybe_send_voice_context_update(self) -> None:
         """Feed the latest profile summary into the session instructions.
 
-        Sends a partial session.update (instructions only) when the summary
-        actually changed, at most once per VOICE_CONTEXT_MIN_INTERVAL_SECONDS.
-        A skipped send is retried naturally on the next captured profile.
+        Sends when the composed instructions actually changed, at most once per
+        VOICE_CONTEXT_MIN_INTERVAL_SECONDS. A skipped send is retried naturally
+        on the next captured profile.
         """
-        profile = self.latest_voice_profile
-        if profile is None or self._ws is None or not self._session_ready.is_set():
-            return
-        summary = profile.planner_summary()
-        if summary == self._last_voice_context_summary_sent:
+        if self.latest_voice_profile is None:
             return
         now = time.monotonic()
         if now - self._last_voice_context_sent_at < VOICE_CONTEXT_MIN_INTERVAL_SECONDS:
             return
-        try:
-            await self._ws.send_json(build_voice_context_session_update(self.settings, summary))
-        except Exception as exc:  # noqa: BLE001 - context is best-effort, never fatal
-            logger.warning(
-                "inworld_voice_context_update_failed=true error_type=%s error=%s",
-                type(exc).__name__, exc,
+        if await self._send_instructions_update(reason="voice_context"):
+            self._last_voice_context_sent_at = now
+            logger.info(
+                "inworld_voice_context_update_sent=true summary=%s",
+                self.latest_voice_profile.planner_summary(),
             )
-            return
-        self._last_voice_context_summary_sent = summary
-        self._last_voice_context_sent_at = now
-        logger.info("inworld_voice_context_update_sent=true summary=%s", summary)
 
     async def _send_session_update(self) -> None:
         if self._ws is None:
@@ -723,5 +872,23 @@ class InworldRealtimeLiveKitBridge:
 
 async def run_inworld_realtime_bridge(room: rtc.Room, *, instructions: str | None = None) -> None:
     settings = load_inworld_realtime_settings(instructions=instructions)
-    bridge = InworldRealtimeLiveKitBridge(room, settings)
-    await bridge.run()
+    dataset_writer = build_emotional_dataset_writer_from_env()
+    calibration_enabled = _env_bool("EMOTIONAL_CALIBRATION_REALTIME_ENABLED", False)
+    logger.info(
+        "emotional_dataset_wiring dataset_writer_active=%s calibration_enabled=%s",
+        dataset_writer is not None,
+        calibration_enabled,
+    )
+    bridge = InworldRealtimeLiveKitBridge(
+        room,
+        settings,
+        dataset_writer=dataset_writer,
+        calibration_enabled=calibration_enabled,
+    )
+    if dataset_writer is not None:
+        dataset_writer.start()
+    try:
+        await bridge.run()
+    finally:
+        if dataset_writer is not None:
+            await dataset_writer.aclose()
