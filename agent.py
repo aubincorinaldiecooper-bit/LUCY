@@ -41,9 +41,7 @@ from internet_search import (
     search_provider,
     search_timeout_seconds,
 )
-from audiointeraction_shadow import AudioInteractionShadow, audiointeraction_mode, build_shadow_from_env
 from inworld_voice_profile import InworldVoiceProfileShadow, build_inworld_shadow_from_env
-from hume_evi_bridge import run_hume_evi_bridge, voice_engine
 from inworld_realtime_bridge import run_inworld_realtime_bridge
 from interaction_state import (
     ASSISTANT_SPEAKING,
@@ -105,9 +103,6 @@ from voice_interruption import (
     peak_dbfs,
     tail_ends_in_silence,
 )
-from omnivoice_tts import OmniVoiceConfig, OmniVoiceTTS, find_omnivoice_tts
-from omnivoice_voice_pool import get_session_selector
-from omnivoice_language import detect_language_request, language_name
 
 
 load_dotenv()
@@ -184,21 +179,10 @@ if "SYSTEM_PROMPT" in os.environ:
     logger.warning("SYSTEM_PROMPT env override detected; code-level prompt edits may not affect production unless Railway SYSTEM_PROMPT is updated; mirror the runtime capability contract in Railway SYSTEM_PROMPT for consistency")
 
 TTS_PROVIDER = os.getenv("TTS_PROVIDER", "hume").strip().lower()
-# When the primary provider fails/times out/returns invalid audio, LiveKit's
-# tts.FallbackAdapter moves on to this provider so the session never goes silent.
-# Currently wired for the omnivoice -> hume path; empty/"none" disables fallback.
-TTS_FALLBACK_PROVIDER = (os.getenv("TTS_FALLBACK_PROVIDER", "hume") or "").strip().lower()
 STT_PROVIDER = os.getenv("STT_PROVIDER", "mistral").strip().lower()
 # Active/session language Arche is configured to operate in. Logged at turn commit
 # so a transcript-language candidate can be compared against the intended language.
 SESSION_LANGUAGE = (os.getenv("SESSION_LANGUAGE") or os.getenv("DEEPGRAM_STT_LANGUAGE") or "en").strip() or "en"
-# Mutable active language for the current session: starts at SESSION_LANGUAGE and
-# changes when the user asks Arche to switch (e.g. "speak French"). Drives the
-# OmniVoice synthesis language and an LLM directive to reply in that language.
-_active_session_language = SESSION_LANGUAGE
-# The OmniVoiceTTS for this session (bare or inside the FallbackAdapter), so a
-# runtime voice/language switch can reach it. None when OmniVoice isn't active.
-_session_omnivoice_tts: "OmniVoiceTTS | None" = None
 VAD_PROVIDER = os.getenv("VAD_PROVIDER", "ai_coustics").strip().lower()
 LIVEKIT_TURN_DETECTION_MODE = os.getenv("LIVEKIT_TURN_DETECTION_MODE", "vad").strip().lower()
 # LiveKit audio end-of-turn detector (livekit-agents >= 1.6.1: inference.TurnDetector).
@@ -344,7 +328,6 @@ _recent_turn_candidate_times: list[float] = []
 _AUDIO_ENV_WINDOW_SECONDS = 12.0
 _interaction_state = InteractionStateMachine()
 _active_memory_layer: MemoryLayer | None = None
-_audiointeraction_shadow: AudioInteractionShadow | None = None
 _inworld_voice_profile_shadow: InworldVoiceProfileShadow | None = None
 _held_turn_fragment_text = ""
 _held_turn_fragment_created_at = 0.0
@@ -3967,27 +3950,6 @@ def _build_single_tts(provider: str):
             model=os.getenv("DEEPGRAM_TTS_MODEL", "aura-2-asteria-en")
         )
 
-    if provider == "omnivoice":
-        omni_cfg = OmniVoiceConfig.from_env()
-        usable, reason = omni_cfg.is_usable()
-        logger.info(
-            "Using OmniVoice TTS provider: omnivoice_enabled=%s omnivoice_url_present=%s device=%s default_language=%s expressive_tags_enabled=%s audio_format=%s sample_rate=%s usable=%s reason=%s",
-            omni_cfg.enabled,
-            bool(omni_cfg.base_url),
-            omni_cfg.device,
-            omni_cfg.default_language,
-            omni_cfg.expressive_tags_enabled,
-            omni_cfg.audio_format,
-            omni_cfg.sample_rate,
-            usable,
-            reason,
-        )
-        if not usable:
-            # Don't hand back a provider that can't synthesize; surface it so the
-            # caller can decide (build_tts falls back to the configured fallback).
-            raise RuntimeError(f"OmniVoice TTS not usable: {reason}")
-        return OmniVoiceTTS(config=omni_cfg)
-
     if provider == "hume":
         _last_hume_tts_build_started_at = time.monotonic()
         logger.info("Using Hume TTS provider")
@@ -4236,111 +4198,19 @@ def _build_single_tts(provider: str):
         )
         return tts_instance
 
-    raise RuntimeError("Unsupported TTS_PROVIDER. Use 'deepgram', 'hume', or 'omnivoice'.")
+    raise RuntimeError("Unsupported TTS_PROVIDER. Use 'deepgram' or 'hume'.")
 
 
 def build_tts():
-    """Build the session TTS, wrapping the primary in a FallbackAdapter when a
-    distinct fallback provider is configured.
-
-    Only the omnivoice path is wrapped today: a sidecar-backed OmniVoice can fail,
-    time out, or return invalid audio, and we never want the session to go silent,
-    so it degrades to Hume via LiveKit's tts.FallbackAdapter. Hume/Deepgram are
-    returned bare, exactly as before (no behavior change for the existing path).
-    If OmniVoice can't even be built (disabled / no URL), we fall straight to the
-    fallback provider so a misconfigured worker still speaks.
-    """
-    fallback_enabled = (
-        TTS_PROVIDER == "omnivoice"
-        and TTS_FALLBACK_PROVIDER not in ("", "none", TTS_PROVIDER)
-    )
-    if not fallback_enabled:
-        return _build_single_tts(TTS_PROVIDER)
-
-    try:
-        primary = _build_single_tts(TTS_PROVIDER)
-    except Exception as exc:  # noqa: BLE001 - degrade to fallback instead of crashing
-        logger.warning(
-            "TTS primary build failed; using fallback provider only: tts_provider=%s tts_fallback_provider=%s error=%s",
-            TTS_PROVIDER,
-            TTS_FALLBACK_PROVIDER,
-            _redact_sensitive_text(exc),
-        )
-        return _build_single_tts(TTS_FALLBACK_PROVIDER)
-
-    fallback = _build_single_tts(TTS_FALLBACK_PROVIDER)
-    logger.info(
-        "TTS provider selected: tts_provider=%s tts_fallback_provider=%s fallback_adapter_enabled=true",
-        TTS_PROVIDER,
-        TTS_FALLBACK_PROVIDER,
-    )
-    return tts.FallbackAdapter([primary, fallback])
-
-
-def _init_session_voice_and_language(session_tts: object) -> None:
-    """Pick one stable voice preset for this session and prime the active language.
-
-    Run once at session start. Finds the OmniVoiceTTS (bare or wrapped), selects a
-    preset from the rotating pool (stable for the whole session), and points it at
-    the active language. No-op when OmniVoice isn't the active provider. Best-effort
-    — any failure leaves OmniVoice on its default voice rather than breaking start.
-    """
-    global _session_omnivoice_tts, _active_session_language
-    _active_session_language = SESSION_LANGUAGE
-    _session_omnivoice_tts = find_omnivoice_tts(session_tts)
-    if _session_omnivoice_tts is None:
-        return
-    preset = None
-    try:
-        preset = get_session_selector().select()
-    except Exception as exc:  # noqa: BLE001 - pool issues must not break the session
-        logger.warning("omnivoice_voice_pool_select_failed=true error=%s", _redact_sensitive_text(exc))
-    if preset is not None:
-        _session_omnivoice_tts.update_options(voice=preset.id, language=_active_session_language)
-    else:
-        _session_omnivoice_tts.update_options(language=_active_session_language)
-    logger.info(
-        "omnivoice_session_voice_selected=true voice_preset_id=%s voice_preset_name=%s active_language=%s pool_used=%s",
-        preset.id if preset else "default",
-        preset.name if preset else "",
-        _active_session_language,
-        preset is not None,
-    )
-
-
-def _maybe_switch_language(user_text: str) -> tuple[str, str] | None:
-    """If the user asked to switch language, update active state + OmniVoice.
-
-    Returns (code, English name) on a switch (so the caller can nudge the LLM),
-    else None. Skips no-op requests for the already-active language.
-    """
-    global _active_session_language
-    detected = detect_language_request(user_text)
-    if detected is None:
-        return None
-    code, name = detected
-    if code == _active_session_language:
-        return None
-    previous = _active_session_language
-    _active_session_language = code
-    if _session_omnivoice_tts is not None:
-        _session_omnivoice_tts.update_options(language=code)
-    logger.info(
-        "language_switch_request=true from_language=%s to_language=%s to_language_name=%s omnivoice_active=%s",
-        previous,
-        code,
-        name,
-        _session_omnivoice_tts is not None,
-    )
-    return code, name
+    """Build the session TTS for the configured provider."""
+    return _build_single_tts(TTS_PROVIDER)
 
 
 async def _close_tts_owned_session(tts_obj: object) -> None:
     """Close http sessions/handles a build owns for this TTS instance.
 
-    Three things to clean up, all best-effort:
+    Two things to clean up, all best-effort:
       - the Hume debug http_session build_tts created (_lucy_owned_http_session),
-      - an OmniVoiceTTS's own aiohttp session (via its aclose()),
       - children of a FallbackAdapter (recurse), since FallbackAdapter.aclose()
         does not close the wrapped providers' sessions.
     The Hume/Deepgram plugins won't close a caller-provided session, so without
@@ -4351,12 +4221,6 @@ async def _close_tts_owned_session(tts_obj: object) -> None:
     if isinstance(children, (list, tuple)):
         for child in children:
             await _close_tts_owned_session(child)
-
-    if isinstance(tts_obj, OmniVoiceTTS):
-        try:
-            await tts_obj.aclose()
-        except Exception:  # noqa: BLE001 - cleanup is best-effort
-            pass
 
     session = getattr(tts_obj, "_lucy_owned_http_session", None)
     if session is not None:
@@ -6079,12 +5943,11 @@ class LucyAgent(Agent):
         return normalized
 
     async def stt_node(self, audio, model_settings):
-        # Observational AudioInteraction fork: tee user audio frames to the shadow
-        # sidecar without altering the production STT stream. feed_frame never
+        # Observational fork: tee user audio frames to the Inworld voice-profile
+        # shadow without altering the production STT stream. feed_frame never
         # blocks or raises; when shadow mode is off the stream passes through as-is.
-        shadows = tuple(s for s in (_audiointeraction_shadow, _inworld_voice_profile_shadow) if s is not None)
-        if shadows:
-            audio = _tee_audio_to_shadows(audio, *shadows)
+        if _inworld_voice_profile_shadow is not None:
+            audio = _tee_audio_to_shadows(audio, _inworld_voice_profile_shadow)
         async for event in Agent.default.stt_node(self, audio, model_settings):
             yield event
 
@@ -6527,20 +6390,6 @@ class LucyAgent(Agent):
 
     def llm_node(self, chat_ctx, tools, model_settings):
         datetime_user_text = _extract_latest_user_text_from_chat_ctx(chat_ctx)
-        # Honor a user request to switch languages: update the active language +
-        # OmniVoice, and nudge the LLM to reply in it (skip if no real change).
-        language_switch = _maybe_switch_language(datetime_user_text)
-        if language_switch is not None:
-            _lang_code, _lang_name = language_switch
-            chat_ctx = chat_ctx.copy()
-            chat_ctx.add_message(
-                role="system",
-                content=(
-                    f"The user asked you to speak {_lang_name}. Respond only in {_lang_name} "
-                    "from now on — including this reply — until they ask for another language. "
-                    "Do not announce the switch or comment on their language."
-                ),
-            )
         datetime_intent = detect_datetime_intent(datetime_user_text)
         if datetime_intent and self.runtime_context is not None:
             async def _datetime_guard_stream():
@@ -7373,19 +7222,6 @@ class LucyAgent(Agent):
                 classification=turn_policy.classification,
                 recent_turns=_recent_turn_previews_from_chat_ctx(turn_ctx),
             )
-        if _audiointeraction_shadow is not None:
-            try:
-                _audiointeraction_shadow.compare_at_turn_commit(
-                    _current_turn_id,
-                    turn_policy.decision,
-                    turn_policy.should_start_generation,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "audiointeraction_shadow_comparison_failed=true error_type=%s error=%s",
-                    type(exc).__name__,
-                    _redact_sensitive_text(exc),
-                )
         if turn_policy.decision == "IGNORE_LOW_INFORMATION_FILLER" and not turn_policy.should_start_generation:
             logger.info(
                 "turn_generation_skipped=true skip_reason=low_information_filler turn_id=%s transcript_classification=%s classification_reason=%s transcript_length=%s",
@@ -7710,30 +7546,6 @@ async def _run_inworld_realtime_voice_engine(ctx: JobContext) -> None:
     except Exception as exc:
         logger.error(
             "voice_engine_bootstrap_failed=true engine=inworld_realtime error_type=%s error=%s",
-            type(exc).__name__,
-            exc,
-        )
-        raise
-
-
-async def _run_hume_evi_voice_engine(ctx: JobContext) -> None:
-    """Connect the LiveKit room, then hand room audio to the Hume EVI bridge.
-
-    The bridge publishes an output track and subscribes to remote audio, both of
-    which require a connected room/local participant. The cascaded pipeline gets
-    this connect for free via ``AgentSession.start()``; the EVI path has no
-    session, so it must connect explicitly before bridging. Bootstrap failures
-    are logged with a clear, parseable line (no secrets) before re-raising so the
-    job fails visibly rather than via an opaque traceback.
-    """
-    logger.info("voice_engine_selected=hume_evi current_pipeline_disabled=true livekit_room_layer=true")
-    try:
-        await ctx.connect()
-        logger.info("voice_engine_room_connected=true engine=hume_evi")
-        await run_hume_evi_bridge(ctx.room)
-    except Exception as exc:
-        logger.error(
-            "voice_engine_bootstrap_failed=true engine=hume_evi error_type=%s error=%s",
             type(exc).__name__,
             exc,
         )
@@ -8240,33 +8052,13 @@ async def entrypoint(ctx: JobContext):
         True,
     )
 
-    global _active_memory_layer, _audiointeraction_shadow, _inworld_voice_profile_shadow, _calibration_session_id
-    global _active_memory_layer, _audiointeraction_shadow, _inworld_voice_profile_shadow, _calibration_session_id, _active_agent_session
+    global _active_memory_layer, _inworld_voice_profile_shadow, _calibration_session_id, _active_agent_session
     _calibration_session_id = str(_safe_attr(_safe_attr(ctx, "room"), "name") or "unknown")
     logger.info(
-        "tts_runtime_selection hume_active=%s tts_provider=%s tts_fallback_provider=%s omnivoice_inactive=%s omnivoice_enabled=%s omnivoice_expressive_planner_enabled=%s",
+        "tts_runtime_selection hume_active=%s tts_provider=%s",
         TTS_PROVIDER == "hume",
         TTS_PROVIDER,
-        TTS_FALLBACK_PROVIDER,
-        TTS_PROVIDER != "omnivoice",
-        env_bool("OMNIVOICE_ENABLED", False),
-        env_bool("OMNIVOICE_EXPRESSIVE_PLANNER_ENABLED", False),
     )
-    _audiointeraction_shadow = build_shadow_from_env()
-    if _audiointeraction_shadow is not None:
-        _audiointeraction_shadow.start()
-        logger.info(
-            "AudioInteraction shadow startup: audiointeraction_mode=shadow endpoint_present=true timeout_ms=%s debug_text=%s",
-            _audiointeraction_shadow.timeout_ms,
-            _audiointeraction_shadow.debug_text,
-        )
-        try:
-            ctx.add_shutdown_callback(_audiointeraction_shadow.aclose)
-        except Exception as exc:
-            logger.warning("audiointeraction_shutdown_callback_unavailable=true error_type=%s error=%s", type(exc).__name__, exc)
-    else:
-        logger.info("AudioInteraction shadow startup: audiointeraction_mode=%s shadow_active=false", audiointeraction_mode())
-
     _inworld_voice_profile_shadow = build_inworld_shadow_from_env()
     if _inworld_voice_profile_shadow is not None:
         _inworld_voice_profile_shadow.start()
@@ -8310,11 +8102,6 @@ async def entrypoint(ctx: JobContext):
     else:
         logger.info("Memory layer startup: memory_enabled=false")
     _active_memory_layer = memory_layer_instance
-    selected_voice_engine = voice_engine()
-    logger.info("voice_engine_selected=%s", selected_voice_engine)
-    if selected_voice_engine == "hume_evi":
-        await _run_hume_evi_voice_engine(ctx)
-        return
     lucy_agent = LucyAgent(
         runtime_context=runtime_context,
         memory_layer=memory_layer_instance,
@@ -8322,8 +8109,6 @@ async def entrypoint(ctx: JobContext):
     )
 
     session_tts = build_tts()
-    # Pick this session's stable voice preset and prime the active language.
-    _init_session_voice_and_language(session_tts)
     # If this TTS owns a debug http_session, close it on shutdown so the
     # long-lived session doesn't leak it the way the pre-render did.
     try:

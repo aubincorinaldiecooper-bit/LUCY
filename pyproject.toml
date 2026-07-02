@@ -12,8 +12,8 @@ dependencies = [
   "livekit-api",
   "livekit-plugins-ai-coustics>=0.2.15",
   "psycopg[binary]",
-  # Used directly by the OmniVoice sidecar client and the Inworld voice-profile
-  # shadow (and the Hume TTS path). Declared explicitly so a clean install/CI has
+  # Used directly by the Inworld Realtime bridge, the Inworld voice-profile
+  # shadow, and the Hume TTS path. Declared explicitly so a clean install/CI has
   # it rather than relying on it arriving transitively.
   "aiohttp>=3.9",
   # Default embeddings provider for semantic memory recall (pgvector). Lightweight
