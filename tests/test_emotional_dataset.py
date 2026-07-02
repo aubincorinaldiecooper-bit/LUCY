@@ -1,0 +1,372 @@
+"""Dataset collection + calibration ground truth for the emotional analyzer.
+
+Pins the product rules:
+  - profile captures and calibration moments are persisted through a bounded,
+    best-effort background writer (never blocks, never raises into the bridge),
+  - calibration asks at most one subtle either/or question at a time, cadence
+    limited, only when emotionally useful, and the user's next utterance
+    completes the moment,
+  - the bridge injects the question as a one-shot instructions note and clears
+    it after the answer,
+  - raw *detected* labels still never appear in anything sent to Inworld.
+"""
+
+import asyncio
+import time
+import types
+import unittest
+
+import emotional_dataset as ed
+import inworld_realtime_bridge as irb
+from inworld_voice_profile import NormalizedVoiceProfile
+
+
+# ---------------------------------------------------------------------------
+# Writer
+# ---------------------------------------------------------------------------
+
+
+class _RecordingDb:
+    def __init__(self, fail=False):
+        self.rows = []
+        self.fail = fail
+
+    def __call__(self, sql, params):
+        if self.fail:
+            raise RuntimeError("db down")
+        self.rows.append((sql, params))
+
+
+def _writer(db=None, **kwargs):
+    config = ed.EmotionalDatasetConfig(enabled=True, db_url="postgres://test")
+    return ed.EmotionalDatasetWriter(config, db_writer=db or _RecordingDb(), **kwargs)
+
+
+class ConfigTests(unittest.TestCase):
+    def test_disabled_without_flag(self):
+        config = ed.EmotionalDatasetConfig(enabled=False, db_url="postgres://x")
+        self.assertEqual(config.is_usable(), (False, "dataset_disabled"))
+
+    def test_disabled_without_db_url(self):
+        config = ed.EmotionalDatasetConfig(enabled=True, db_url="")
+        self.assertEqual(config.is_usable(), (False, "database_url_missing"))
+
+    def test_usable(self):
+        config = ed.EmotionalDatasetConfig(enabled=True, db_url="postgres://x")
+        self.assertEqual(config.is_usable(), (True, "ok"))
+
+
+class WriterTests(unittest.TestCase):
+    def test_profile_event_row_written(self):
+        db = _RecordingDb()
+
+        async def scenario():
+            writer = _writer(db)
+            writer.record_profile_event(
+                session_id="s1",
+                source_event="conversation.item.input_audio_transcription.completed",
+                raw_profile={"emotion": [{"label": "happy", "confidence": 0.9}]},
+                normalized_profile={"energy": "high"},
+                transcript="hello there friend",
+                emotion_confidence=0.9,
+            )
+            await writer._flush_pending()
+            return writer
+
+        writer = asyncio.run(scenario())
+        self.assertEqual(len(db.rows), 1)
+        sql, params = db.rows[0]
+        self.assertIn("voice_profile_events", sql)
+        self.assertEqual(params[0], "s1")
+        self.assertIn("happy", params[3])  # raw labels DO land in the dataset
+        self.assertEqual(writer.counters["rows_written"], 1)
+
+    def test_calibration_moment_row_written(self):
+        db = _RecordingDb()
+
+        async def scenario():
+            writer = _writer(db)
+            writer.record_calibration_moment(
+                {
+                    "session_id": "s1",
+                    "turn_id": "4",
+                    "transcript": "i feel stuck about this decision",
+                    "arche_question": "Is this more about fear, guilt, or the pressure of choosing?",
+                    "user_answer": "honestly, pressure",
+                    "user_confirmed_or_corrected": True,
+                    "inferred_emotional_pattern": "energy=low; tension=high; certainty=medium",
+                    "normalized_profile": {"energy": "low"},
+                }
+            )
+            await writer._flush_pending()
+
+        asyncio.run(scenario())
+        self.assertEqual(len(db.rows), 1)
+        sql, params = db.rows[0]
+        self.assertIn("emotional_calibration_moments", sql)
+        self.assertEqual(params[4], "honestly, pressure")
+        self.assertTrue(params[5])
+
+    def test_write_error_counted_not_raised(self):
+        async def scenario():
+            writer = _writer(_RecordingDb(fail=True))
+            writer.record_calibration_moment({"session_id": "s"})
+            await writer._flush_pending()
+            return writer
+
+        writer = asyncio.run(scenario())
+        self.assertEqual(writer.counters["write_errors"], 1)
+        self.assertEqual(writer.counters["rows_written"], 0)
+
+    def test_bounded_queue_drops_oldest(self):
+        async def scenario():
+            writer = _writer(max_queue_rows=2)
+            for i in range(3):
+                writer.record_calibration_moment({"session_id": f"s{i}"})
+            return writer
+
+        writer = asyncio.run(scenario())
+        self.assertEqual(writer.counters["rows_dropped"], 1)
+        self.assertEqual(len(writer._queue), 2)
+
+    def test_aclose_drains_queue(self):
+        db = _RecordingDb()
+
+        async def scenario():
+            writer = _writer(db)
+            writer.start()
+            writer.record_calibration_moment({"session_id": "s"})
+            await writer.aclose()
+
+        asyncio.run(scenario())
+        self.assertEqual(len(db.rows), 1)
+
+
+# ---------------------------------------------------------------------------
+# Calibration heuristics + tracker
+# ---------------------------------------------------------------------------
+
+
+def _profile(**overrides):
+    kwargs = dict(energy="low", tension="high", certainty="medium", confidence=0.8)
+    kwargs.update(overrides)
+    return NormalizedVoiceProfile(**kwargs)
+
+
+class CalibrationQuestionTests(unittest.TestCase):
+    def test_no_profile_no_question(self):
+        question, reason = ed.calibration_question_for("i feel really worried about it", None)
+        self.assertIsNone(question)
+        self.assertEqual(reason, "no_voice_profile_context")
+
+    def test_short_transcript_skipped(self):
+        question, reason = ed.calibration_question_for("i am fine", _profile())
+        self.assertIsNone(question)
+        self.assertEqual(reason, "transcript_too_short")
+
+    def test_neutral_and_irrelevant_skipped(self):
+        question, reason = ed.calibration_question_for(
+            "the weather is quite nice today", _profile(energy="medium", tension="medium")
+        )
+        self.assertIsNone(question)
+        self.assertEqual(reason, "not_emotionally_useful")
+
+    def test_low_certainty_question(self):
+        question, reason = ed.calibration_question_for(
+            "i do not really know how to say this", _profile(certainty="low")
+        )
+        self.assertEqual(reason, "low_certainty_or_ambiguous")
+        self.assertIn("heavy, tense, or just unclear", question)
+
+    def test_high_tension_question(self):
+        question, reason = ed.calibration_question_for(
+            "there is just so much going on right now", _profile(tension="high")
+        )
+        self.assertEqual(reason, "high_tension_or_worry")
+        self.assertIn("anxiety", question)
+
+
+class CalibrationTrackerTests(unittest.TestCase):
+    def test_arms_then_completes_with_next_turn(self):
+        tracker = ed.CalibrationTracker(session_id="room-1")
+        completed, question = tracker.on_user_transcript(
+            "i feel really worried about all of this", _profile(tension="high")
+        )
+        self.assertIsNone(completed)
+        self.assertIsNotNone(question)
+        completed, question2 = tracker.on_user_transcript("more like pressure honestly", _profile())
+        self.assertIsNone(question2)  # cadence blocks an immediate second question
+        self.assertEqual(completed["user_answer"], "more like pressure honestly")
+        self.assertTrue(completed["user_confirmed_or_corrected"])
+        self.assertEqual(completed["session_id"], "room-1")
+        self.assertIn("tension=high", completed["inferred_emotional_pattern"])
+
+    def test_cadence_allows_question_after_min_turns(self):
+        tracker = ed.CalibrationTracker(session_id="r")
+        emotional = "i feel really worried about all of this"
+        _, q1 = tracker.on_user_transcript(emotional, _profile(tension="high"))
+        self.assertIsNotNone(q1)
+        _, q2 = tracker.on_user_transcript(emotional, _profile(tension="high"))
+        _, q3 = tracker.on_user_transcript(emotional, _profile(tension="high"))
+        self.assertIsNone(q2)
+        self.assertIsNone(q3)
+        _, q4 = tracker.on_user_transcript(emotional, _profile(tension="high"))
+        self.assertIsNotNone(q4)
+
+
+# ---------------------------------------------------------------------------
+# Bridge integration
+# ---------------------------------------------------------------------------
+
+
+def _settings():
+    return irb.InworldRealtimeSettings(
+        api_key="k",
+        session_id="room-1",
+        websocket_url="wss://example.test/session",
+        model="openai/gpt-4o-mini",
+        stt_model="assemblyai/u3-rt-pro",
+        tts_model="inworld-tts-2",
+        voice="Luna",
+        speed=1.0,
+        turn_detection_type="semantic_vad",
+        turn_detection_eagerness="medium",
+        turn_detection_create_response=True,
+        turn_detection_interrupt_response=True,
+        instructions="Be concise.",
+        timeout_seconds=60.0,
+        voice_profile_enabled=True,
+        input_format="pcm16",
+        output_format="pcm16",
+        auth_scheme="basic",
+        tts_delivery_mode="CREATIVE",
+        tts_segmenter_strategy="full_turn",
+        tts_steering_handling="emit_once",
+        emotion_confidence_floor=0.5,
+    )
+
+
+class _FakeWs:
+    def __init__(self):
+        self.sent = []
+
+    async def send_json(self, payload):
+        self.sent.append(payload)
+
+
+class _FakeWriter:
+    def __init__(self):
+        self.profile_events = []
+        self.calibration_moments = []
+
+    def record_profile_event(self, **kwargs):
+        self.profile_events.append(kwargs)
+
+    def record_calibration_moment(self, moment):
+        self.calibration_moments.append(moment)
+
+
+def _profile_event(emotion="frustrated", confidence=0.9, transcript="i am so frustrated with all of this"):
+    return {
+        "type": "conversation.item.input_audio_transcription.completed",
+        "transcript": transcript,
+        "voiceProfile": {"emotion": [{"label": emotion, "confidence": confidence}]},
+    }
+
+
+def _run_bridge_scenario(*events, calibration_enabled=True):
+    async def scenario():
+        room = types.SimpleNamespace(
+            local_participant=types.SimpleNamespace(publish_track=lambda *a, **k: asyncio.sleep(0)),
+            remote_participants={},
+            on=lambda *a, **k: None,
+            off=lambda *a, **k: None,
+        )
+        bridge = irb.InworldRealtimeLiveKitBridge(
+            room,
+            _settings(),
+            dataset_writer=_FakeWriter(),
+            calibration_enabled=calibration_enabled,
+        )
+        bridge._ws = _FakeWs()
+        bridge._session_ready.set()
+        for event in events:
+            await bridge._handle_inworld_message(event)
+        return bridge
+
+    return asyncio.run(scenario())
+
+
+class BridgeDatasetIntegrationTests(unittest.TestCase):
+    def test_profile_capture_persists_raw_and_normalized(self):
+        bridge = _run_bridge_scenario(_profile_event())
+        events = bridge._dataset_writer.profile_events
+        self.assertEqual(len(events), 1)
+        row = events[0]
+        self.assertEqual(row["session_id"], "room-1")
+        self.assertEqual(row["raw_profile"]["emotion"][0]["label"], "frustrated")
+        self.assertEqual(row["normalized_profile"]["tension"], "high")
+        self.assertEqual(row["transcript"], "i am so frustrated with all of this")
+
+    def test_calibration_question_injected_and_answer_persisted(self):
+        first = _profile_event()
+        answer = {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "transcript": "more like disappointment i think",
+        }
+        bridge = _run_bridge_scenario(first, answer)
+        # The question went out as a one-shot instructions note...
+        instruction_sends = [
+            m["session"]["instructions"] for m in bridge._ws.sent if m["type"] == "session.update"
+        ]
+        self.assertTrue(any("calibration note" in text.lower() for text in instruction_sends))
+        # ...and the user's next utterance became a persisted ground-truth moment.
+        moments = bridge._dataset_writer.calibration_moments
+        self.assertEqual(len(moments), 1)
+        self.assertEqual(moments[0]["user_answer"], "more like disappointment i think")
+        self.assertTrue(moments[0]["user_confirmed_or_corrected"])
+        # The note is cleared after the answer: the final instructions sent no
+        # longer carry the calibration note.
+        self.assertNotIn("calibration note", instruction_sends[-1].lower())
+
+    def test_calibration_disabled_no_questions_no_moments(self):
+        bridge = _run_bridge_scenario(_profile_event(), calibration_enabled=False)
+        self.assertEqual(bridge._dataset_writer.calibration_moments, [])
+        instruction_sends = [
+            m["session"]["instructions"] for m in bridge._ws.sent if m["type"] == "session.update"
+        ]
+        for text in instruction_sends:
+            self.assertNotIn("calibration", text.lower())
+
+    def test_detected_labels_never_sent_to_inworld(self):
+        bridge = _run_bridge_scenario(_profile_event(emotion="angry"))
+        sent_text = str(bridge._ws.sent).lower()
+        for label in ("angry", "happy", "sad", "fearful", "surprised", "tender"):
+            self.assertNotIn(label, sent_text)
+
+    def test_no_writer_is_safe(self):
+        async def scenario():
+            room = types.SimpleNamespace(
+                local_participant=types.SimpleNamespace(publish_track=lambda *a, **k: asyncio.sleep(0)),
+                remote_participants={},
+                on=lambda *a, **k: None,
+                off=lambda *a, **k: None,
+            )
+            bridge = irb.InworldRealtimeLiveKitBridge(room, _settings(), calibration_enabled=True)
+            bridge._ws = _FakeWs()
+            bridge._session_ready.set()
+            await bridge._handle_inworld_message(_profile_event())
+            await bridge._handle_inworld_message(
+                {
+                    "type": "conversation.item.input_audio_transcription.completed",
+                    "transcript": "more like disappointment i think",
+                }
+            )
+            return bridge
+
+        bridge = asyncio.run(scenario())
+        self.assertIsNotNone(bridge.latest_voice_profile)
+
+
+if __name__ == "__main__":
+    unittest.main()
