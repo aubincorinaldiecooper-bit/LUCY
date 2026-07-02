@@ -284,9 +284,15 @@ class InworldRealtimeMessageShapeTests(unittest.TestCase):
 
         session = update["session"]
 
-        self.assertEqual(session["audio"]["input"]["format"]["type"], "pcm16")
+        # GA-schema MIME-style type, not the legacy "pcm16" shorthand — see
+        # _AUDIO_FORMAT_TYPE_MAP.
+        self.assertEqual(session["audio"]["input"]["format"]["type"], "audio/pcm")
 
-        self.assertEqual(session["audio"]["output"]["format"]["type"], "pcm16")
+        self.assertEqual(session["audio"]["output"]["format"]["type"], "audio/pcm")
+
+        self.assertEqual(session["audio"]["input"]["format"]["rate"], irb.INWORLD_INPUT_SAMPLE_RATE)
+
+        self.assertEqual(session["audio"]["output"]["format"]["rate"], irb.INWORLD_OUTPUT_SAMPLE_RATE)
 
 
     def test_audio_append_message_is_base64_realtime_event(self):

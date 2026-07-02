@@ -287,6 +287,32 @@ def load_inworld_realtime_settings(*, instructions: str | None = None) -> Inworl
 
 
 
+# Maps our legacy shorthand format names (also the OpenAI Realtime *preview*
+# names) to the GA-era MIME-style ``audio.*.format.type`` values Inworld's
+# realtime schema actually validates against. Sending the old shorthand as an
+# object field (``{"type": "pcm16", "sample_rate": ...}``) doesn't match the
+# ``audio/pcm`` | ``audio/pcmu`` | ``audio/pcma`` | ``audio/float32`` enum, so
+# it was silently accepted (session.update didn't error) but never wired the
+# session up to actually stream ``response.output_audio.delta`` bytes.
+_AUDIO_FORMAT_TYPE_MAP = {
+    "pcm16": "audio/pcm",
+    "audio/pcm": "audio/pcm",
+    "g711_ulaw": "audio/pcmu",
+    "pcmu": "audio/pcmu",
+    "audio/pcmu": "audio/pcmu",
+    "g711_alaw": "audio/pcma",
+    "pcma": "audio/pcma",
+    "audio/pcma": "audio/pcma",
+    "float32": "audio/float32",
+    "audio/float32": "audio/float32",
+}
+
+
+def _audio_format(format_name: str, sample_rate: int) -> dict[str, Any]:
+    format_type = _AUDIO_FORMAT_TYPE_MAP.get((format_name or "").strip().lower(), "audio/pcm")
+    return {"type": format_type, "rate": sample_rate}
+
+
 def build_session_update(settings: InworldRealtimeSettings) -> dict[str, Any]:
 
     return {
@@ -307,7 +333,7 @@ def build_session_update(settings: InworldRealtimeSettings) -> dict[str, Any]:
 
                 "input": {
 
-                    "format": {"type": settings.input_format, "sample_rate": INWORLD_INPUT_SAMPLE_RATE},
+                    "format": _audio_format(settings.input_format, INWORLD_INPUT_SAMPLE_RATE),
 
                     "transcription": {"model": settings.stt_model},
 
@@ -327,7 +353,7 @@ def build_session_update(settings: InworldRealtimeSettings) -> dict[str, Any]:
 
                 "output": {
 
-                    "format": {"type": settings.output_format, "sample_rate": INWORLD_OUTPUT_SAMPLE_RATE},
+                    "format": _audio_format(settings.output_format, INWORLD_OUTPUT_SAMPLE_RATE),
 
                     "model": settings.tts_model,
 

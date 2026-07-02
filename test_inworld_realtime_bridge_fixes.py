@@ -76,8 +76,11 @@ class ConversationItemShapeTests(unittest.TestCase):
             settings = irb.load_inworld_realtime_settings()
         update = irb.build_session_update(settings)
         session = update["session"]
-        assert session["audio"]["input"]["format"]["type"] == "pcm16"
-        assert session["audio"]["output"]["format"]["type"] == "pcm16"
+        # GA-schema MIME-style type ("audio/pcm"), not the legacy "pcm16"
+        # shorthand — sending "pcm16" as the nested object type silently
+        # failed schema validation and never streamed audio deltas.
+        assert session["audio"]["input"]["format"]["type"] == "audio/pcm"
+        assert session["audio"]["output"]["format"]["type"] == "audio/pcm"
         assert session["audio"]["output"]["model"] == "inworld-tts-2"
 
     def test_response_create_keeps_audio_and_text_modalities(self):
