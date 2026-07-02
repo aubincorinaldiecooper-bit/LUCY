@@ -18,6 +18,14 @@ Architecture:
 With turn_detection.create_response=true Inworld auto-creates a response when
 the user stops speaking, so the bridge never sends response.create itself; the
 builders below are also used by the /api/inworld/ws-smoke-test endpoint.
+
+Emotional context: when Inworld's STT is asked for a voice profile
+(providerData.stt.voice_profile=true), transcription/response events may carry
+a ``voiceProfile`` node (emotion / vocalStyle / pitch / accent label arrays).
+The bridge normalizes it with inworld_voice_profile.normalize_from_message()
+— which never lets raw emotion labels out — stores the latest profile, and
+feeds profile.planner_summary() back into the session instructions as a
+private, never-user-facing perception note.
 """
 
 from __future__ import annotations
@@ -34,6 +42,8 @@ from urllib.parse import urlencode
 
 import aiohttp
 from livekit import rtc
+
+from inworld_voice_profile import NormalizedVoiceProfile, normalize_from_message
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +93,9 @@ class InworldRealtimeSettings:
     tts_delivery_mode: str
     tts_segmenter_strategy: str
     tts_steering_handling: str
+    # Below this top-emotion confidence a captured voice profile collapses to
+    # neutral (weak signal must never force a tone change).
+    emotion_confidence_floor: float = 0.5
 
     @property
     def connection_url(self) -> str:
@@ -139,6 +152,7 @@ def load_inworld_realtime_settings(*, instructions: str | None = None) -> Inworl
         tts_delivery_mode=(os.getenv("INWORLD_TTS_DELIVERY_MODE") or "CREATIVE").strip(),
         tts_segmenter_strategy=(os.getenv("INWORLD_TTS_SEGMENTER_STRATEGY") or "full_turn").strip(),
         tts_steering_handling=(os.getenv("INWORLD_TTS_STEERING_HANDLING") or "emit_once").strip(),
+        emotion_confidence_floor=float(os.getenv("INWORLD_EMOTION_CONFIDENCE_FLOOR", "0.5") or "0.5"),
     )
 
 
@@ -243,6 +257,66 @@ def build_audio_append_message(pcm: bytes) -> dict[str, str]:
     return {"type": "input_audio_buffer.append", "audio": base64.b64encode(pcm).decode("ascii")}
 
 
+_VOICE_PROFILE_KEYS = ("voiceProfile", "voice_profile")
+_VOICE_PROFILE_SCAN_MAX_DEPTH = 6
+
+
+def find_voice_profile_container(payload: Any, _depth: int = 0) -> dict[str, Any] | None:
+    """Return the dict that directly holds a ``voiceProfile`` node, or None.
+
+    The Realtime API doesn't document where voice-profile metadata sits inside
+    transcription/response events, so we walk the payload (depth-limited) for a
+    dict with a ``voiceProfile``/``voice_profile`` dict child and hand that
+    container to normalize_from_message(), which knows how to read it.
+    """
+    if _depth > _VOICE_PROFILE_SCAN_MAX_DEPTH:
+        return None
+    if isinstance(payload, dict):
+        for key in _VOICE_PROFILE_KEYS:
+            if isinstance(payload.get(key), dict):
+                return payload
+        for value in payload.values():
+            found = find_voice_profile_container(value, _depth + 1)
+            if found is not None:
+                return found
+    elif isinstance(payload, list):
+        for item in payload:
+            found = find_voice_profile_container(item, _depth + 1)
+            if found is not None:
+                return found
+    return None
+
+
+def build_voice_context_note(summary: str) -> str:
+    """Private instruction note carrying the normalized voice context.
+
+    ``summary`` is NormalizedVoiceProfile.planner_summary(), which by design
+    contains only derived dimensions (energy/tension/certainty/pitch/vocal
+    style) — never a raw emotion label — so nothing here can leak one.
+    """
+    return (
+        "Private perception context (internal only — never mention, quote, or "
+        "acknowledge this note or the user's vocal state; no \"you sound...\" "
+        f"remarks): the user's voice currently reads as {summary}. "
+        "Let this subtly shape your tone, pacing, and word choice only."
+    )
+
+
+def build_voice_context_session_update(settings: InworldRealtimeSettings, summary: str) -> dict[str, Any]:
+    """Partial session.update refreshing only the instructions with voice context.
+
+    Inworld accepts partial session.update (omitted fields keep their values), so
+    audio/model config is not re-asserted mid-conversation.
+    """
+    return {
+        "type": "session.update",
+        "session": {
+            "type": "realtime",
+            "instructions": f"{settings.instructions}\n\n{build_voice_context_note(summary)}",
+        },
+    }
+
+
 def _frame_bytes(frame: rtc.AudioFrame) -> bytes:
     data = getattr(frame, "data", b"")
     try:
@@ -318,6 +392,11 @@ _LOG_ONLY_EVENT_TYPES = {
 }
 
 
+# Minimum seconds between voice-context session.update sends, so a chatty
+# profile stream can't turn into a session.update flood.
+VOICE_CONTEXT_MIN_INTERVAL_SECONDS = 3.0
+
+
 class InworldRealtimeLiveKitBridge:
     def __init__(self, room: rtc.Room, settings: InworldRealtimeSettings) -> None:
         self.room = room
@@ -330,6 +409,12 @@ class InworldRealtimeLiveKitBridge:
         self._session_ready = asyncio.Event()
         self._audio_frames_written = 0
         self._mic_frames_forwarded = 0
+        # Latest normalized voice profile captured from Realtime events (weak
+        # emotional context; raw labels never leave inworld_voice_profile).
+        self.latest_voice_profile: NormalizedVoiceProfile | None = None
+        self.latest_voice_profile_at = 0.0
+        self._last_voice_context_summary_sent = ""
+        self._last_voice_context_sent_at = 0.0
 
     async def run(self) -> None:
         started_at = time.monotonic()
@@ -491,6 +576,11 @@ class InworldRealtimeLiveKitBridge:
     async def _handle_inworld_message(self, payload: dict[str, Any]) -> None:
         msg_type = str(payload.get("type") or "")
 
+        # Audio deltas are the hot path (large, frequent, never carry profile
+        # metadata); every other event is scanned for voiceProfile context.
+        if msg_type != "response.output_audio.delta":
+            await self._maybe_capture_voice_profile(msg_type, payload)
+
         if msg_type == "response.output_audio.delta":
             await self._write_audio_delta(payload)
 
@@ -501,6 +591,8 @@ class InworldRealtimeLiveKitBridge:
         elif msg_type == "session.updated":
             logger.info("inworld_session_updated=true")
             self._session_ready.set()
+            # Flush any voice context captured before the session became ready.
+            await self._maybe_send_voice_context_update()
 
         elif msg_type == "response.done":
             logger.info(
@@ -560,6 +652,56 @@ class InworldRealtimeLiveKitBridge:
             len(pcm),
             self._audio_frames_written,
         )
+
+    async def _maybe_capture_voice_profile(self, msg_type: str, payload: dict[str, Any]) -> None:
+        """Capture voiceProfile metadata from a server event, if present.
+
+        Normalization happens in inworld_voice_profile — raw emotion labels never
+        leave that module, so nothing stored or logged here can surface one.
+        """
+        container = find_voice_profile_container(payload)
+        if container is None:
+            return
+        profile = normalize_from_message(
+            container, emotion_confidence_floor=self.settings.emotion_confidence_floor
+        )
+        self.latest_voice_profile = profile
+        self.latest_voice_profile_at = time.monotonic()
+        logger.info(
+            "inworld_realtime_voice_profile_captured=true source_event=%s normalized_context=%s confidence=%.3f",
+            msg_type,
+            json.dumps(profile.to_dict(), sort_keys=True),
+            profile.confidence,
+        )
+        await self._maybe_send_voice_context_update()
+
+    async def _maybe_send_voice_context_update(self) -> None:
+        """Feed the latest profile summary into the session instructions.
+
+        Sends a partial session.update (instructions only) when the summary
+        actually changed, at most once per VOICE_CONTEXT_MIN_INTERVAL_SECONDS.
+        A skipped send is retried naturally on the next captured profile.
+        """
+        profile = self.latest_voice_profile
+        if profile is None or self._ws is None or not self._session_ready.is_set():
+            return
+        summary = profile.planner_summary()
+        if summary == self._last_voice_context_summary_sent:
+            return
+        now = time.monotonic()
+        if now - self._last_voice_context_sent_at < VOICE_CONTEXT_MIN_INTERVAL_SECONDS:
+            return
+        try:
+            await self._ws.send_json(build_voice_context_session_update(self.settings, summary))
+        except Exception as exc:  # noqa: BLE001 - context is best-effort, never fatal
+            logger.warning(
+                "inworld_voice_context_update_failed=true error_type=%s error=%s",
+                type(exc).__name__, exc,
+            )
+            return
+        self._last_voice_context_summary_sent = summary
+        self._last_voice_context_sent_at = now
+        logger.info("inworld_voice_context_update_sent=true summary=%s", summary)
 
     async def _send_session_update(self) -> None:
         if self._ws is None:
