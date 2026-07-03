@@ -273,6 +273,32 @@ class MemoryLayerWriteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(calls), 1)
         self.assertIn("User said: hello", calls[0][0])
 
+    async def test_remember_preserves_emotional_pattern_prefix_unwrapped(self):
+        """A confirmed-pattern note must round-trip through preload() with
+        EMOTIONAL_PATTERN_PREFIX still at the very start (needed for
+        partition_emotional_patterns to file it as a learned pattern, not
+        general memory) — so it must NOT get the usual 'User said:'/'Lucy
+        replied:' wrapping ordinary content gets.
+        """
+        layer, written = make_layer()
+        content = memory_layer.EMOTIONAL_PATTERN_PREFIX + "energy=low; tension=high"
+        layer.schedule_remember(role="emotional_calibration", content=content, turn_id=3)
+        await asyncio.gather(*list(layer._background_tasks))
+        self.assertEqual(len(written), 1)
+        params = written[0][1]
+        self.assertIn(content, params)
+        for p in params:
+            if isinstance(p, str):
+                self.assertNotIn("Lucy replied:", p)
+                self.assertNotIn("User said:", p)
+
+    async def test_remember_still_wraps_ordinary_content(self):
+        layer, written = make_layer()
+        layer.schedule_remember(role="assistant", content="Good luck!", turn_id=1)
+        await asyncio.gather(*list(layer._background_tasks))
+        params = written[0][1]
+        self.assertIn("Lucy replied: Good luck!", params)
+
     async def test_embed_and_store_semantic_failure_falls_back_to_text_write(self):
         written = []
 

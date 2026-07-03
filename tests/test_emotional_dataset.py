@@ -266,6 +266,18 @@ class _FakeWriter:
         self.calibration_moments.append(moment)
 
 
+class _FakeMemoryLayer:
+    def __init__(self):
+        self.remembered = []
+        self.closed = False
+
+    def schedule_remember(self, role, content, turn_id=None, **kw):
+        self.remembered.append({"role": role, "content": content, "turn_id": turn_id})
+
+    async def aclose(self):
+        self.closed = True
+
+
 def _profile_event(emotion="frustrated", confidence=0.9, transcript="i am so frustrated with all of this"):
     return {
         "type": "conversation.item.input_audio_transcription.completed",
@@ -274,7 +286,7 @@ def _profile_event(emotion="frustrated", confidence=0.9, transcript="i am so fru
     }
 
 
-def _run_bridge_scenario(*events, calibration_enabled=True):
+def _run_bridge_scenario(*events, calibration_enabled=True, memory_layer=None):
     async def scenario():
         room = types.SimpleNamespace(
             local_participant=types.SimpleNamespace(publish_track=lambda *a, **k: asyncio.sleep(0)),
@@ -287,6 +299,7 @@ def _run_bridge_scenario(*events, calibration_enabled=True):
             _settings(),
             dataset_writer=_FakeWriter(),
             calibration_enabled=calibration_enabled,
+            memory_layer=memory_layer,
         )
         bridge._ws = _FakeWs()
         bridge._session_ready.set()
@@ -366,6 +379,129 @@ class BridgeDatasetIntegrationTests(unittest.TestCase):
 
         bridge = asyncio.run(scenario())
         self.assertIsNotNone(bridge.latest_voice_profile)
+
+
+# ---------------------------------------------------------------------------
+# Long-term memory wiring (preload note is exercised at the run_inworld_
+# realtime_bridge level via agent.py; these cover the per-turn writes and the
+# confirmed-pattern-to-memory bridge that make up the rest of the loop).
+# ---------------------------------------------------------------------------
+
+
+class FormatConfirmedPatternContentTests(unittest.TestCase):
+    def test_starts_with_prefix_and_includes_answer(self):
+        content = ed.format_confirmed_pattern_content("energy=low; tension=high", "more like pressure")
+        self.assertTrue(content.startswith(ed.EMOTIONAL_PATTERN_PREFIX))
+        self.assertIn("more like pressure", content)
+
+    def test_no_answer_still_valid(self):
+        content = ed.format_confirmed_pattern_content("energy=low", "")
+        self.assertEqual(content, ed.EMOTIONAL_PATTERN_PREFIX + "energy=low")
+
+
+class RememberConfirmedPatternTests(unittest.TestCase):
+    def _moment(self, confirmed=True, pattern="energy=high; tension=medium"):
+        return {
+            "session_id": "s",
+            "turn_id": "4",
+            "transcript": "i have a big decision to make",
+            "arche_question": "fear or pressure?",
+            "user_answer": "more like pressure" if confirmed else "",
+            "inferred_emotional_pattern": pattern,
+            "user_confirmed_or_corrected": confirmed,
+        }
+
+    def test_confirmed_pattern_written(self):
+        mem = _FakeMemoryLayer()
+        ed.remember_confirmed_pattern(mem, self._moment(confirmed=True))
+        self.assertEqual(len(mem.remembered), 1)
+        entry = mem.remembered[0]
+        self.assertEqual(entry["role"], "emotional_calibration")
+        self.assertTrue(entry["content"].startswith(ed.EMOTIONAL_PATTERN_PREFIX))
+        self.assertIn("more like pressure", entry["content"])
+        self.assertEqual(entry["turn_id"], 4)
+
+    def test_unconfirmed_not_written(self):
+        mem = _FakeMemoryLayer()
+        ed.remember_confirmed_pattern(mem, self._moment(confirmed=False))
+        self.assertEqual(mem.remembered, [])
+
+    def test_none_memory_layer_is_noop(self):
+        ed.remember_confirmed_pattern(None, self._moment(confirmed=True))  # must not raise
+
+    def test_empty_pattern_not_written(self):
+        mem = _FakeMemoryLayer()
+        ed.remember_confirmed_pattern(mem, self._moment(confirmed=True, pattern=""))
+        self.assertEqual(mem.remembered, [])
+
+    def test_non_numeric_turn_id_degrades_to_none(self):
+        mem = _FakeMemoryLayer()
+        moment = self._moment(confirmed=True)
+        moment["turn_id"] = "not-a-number"
+        ed.remember_confirmed_pattern(mem, moment)
+        self.assertIsNone(mem.remembered[0]["turn_id"])
+
+
+class BridgeMemoryIntegrationTests(unittest.TestCase):
+    def test_user_transcript_remembered(self):
+        mem = _FakeMemoryLayer()
+        answer = {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "transcript": "i am training for a marathon",
+        }
+        bridge = _run_bridge_scenario(answer, calibration_enabled=False, memory_layer=mem)
+        self.assertEqual(len(mem.remembered), 1)
+        entry = mem.remembered[0]
+        self.assertEqual(entry["role"], "user")
+        self.assertEqual(entry["content"], "i am training for a marathon")
+        self.assertEqual(entry["turn_id"], 1)
+        self.assertIs(bridge._memory_layer, mem)
+
+    def test_assistant_transcript_remembered(self):
+        mem = _FakeMemoryLayer()
+        user_turn = {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "transcript": "how do i train for a marathon",
+        }
+        assistant_turn = {
+            "type": "response.output_audio_transcript.done",
+            "transcript": "start with a slow weekly long run.",
+        }
+        _run_bridge_scenario(user_turn, assistant_turn, calibration_enabled=False, memory_layer=mem)
+        self.assertEqual(len(mem.remembered), 2)
+        self.assertEqual(mem.remembered[0]["role"], "user")
+        self.assertEqual(mem.remembered[1]["role"], "assistant")
+        self.assertEqual(mem.remembered[1]["content"], "start with a slow weekly long run.")
+        # Assistant turn shares the same turn_id as the user turn that triggered it.
+        self.assertEqual(mem.remembered[1]["turn_id"], mem.remembered[0]["turn_id"])
+
+    def test_turn_id_increments_across_multiple_user_turns(self):
+        mem = _FakeMemoryLayer()
+        first = {"type": "conversation.item.input_audio_transcription.completed", "transcript": "first turn here"}
+        second = {"type": "conversation.item.input_audio_transcription.completed", "transcript": "second turn here"}
+        _run_bridge_scenario(first, second, calibration_enabled=False, memory_layer=mem)
+        self.assertEqual([e["turn_id"] for e in mem.remembered], [1, 2])
+
+    def test_confirmed_calibration_pattern_reaches_memory(self):
+        mem = _FakeMemoryLayer()
+        first = _profile_event()
+        answer = {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "transcript": "more like disappointment i think",
+        }
+        _run_bridge_scenario(first, answer, calibration_enabled=True, memory_layer=mem)
+        pattern_entries = [e for e in mem.remembered if e["role"] == "emotional_calibration"]
+        self.assertEqual(len(pattern_entries), 1)
+        self.assertTrue(pattern_entries[0]["content"].startswith(ed.EMOTIONAL_PATTERN_PREFIX))
+        self.assertIn("more like disappointment i think", pattern_entries[0]["content"])
+
+    def test_no_memory_layer_is_safe(self):
+        answer = {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "transcript": "i am training for a marathon",
+        }
+        bridge = _run_bridge_scenario(answer, calibration_enabled=False, memory_layer=None)  # must not raise
+        self.assertIsNone(bridge._memory_layer)
 
 
 if __name__ == "__main__":

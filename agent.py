@@ -41,6 +41,7 @@ from internet_search import (
     search_provider,
     search_timeout_seconds,
 )
+from emotional_dataset import remember_confirmed_pattern
 from inworld_voice_profile import InworldVoiceProfileShadow, build_inworld_shadow_from_env
 from inworld_realtime_bridge import run_inworld_realtime_bridge
 from interaction_state import (
@@ -4787,6 +4788,16 @@ def _persist_calibration_moment(moment: dict[str, Any]) -> None:
         )
 
 
+def _remember_calibration_pattern(moment: dict[str, Any]) -> None:
+    """Store a confirmed calibration moment in durable per-user memory so a
+    returning signed-in user's confirmed emotional patterns inform future
+    sessions via the normal memory preload. Best-effort; never raises. Guests
+    are scoped by guest_id, so this also persists within a still-open guest
+    session (see memory_layer.identity_from_metadata).
+    """
+    remember_confirmed_pattern(_active_memory_layer, moment)
+
+
 def _complete_pending_calibration_moment(user_answer: str) -> None:
     global _pending_calibration_moment
     if _pending_calibration_moment is None:
@@ -7529,6 +7540,96 @@ def _attach_optional_interruption_diagnostics(session: AgentSession) -> None:
 
 
 
+def _realtime_metadata_candidates(ctx: JobContext) -> list[Any]:
+    """Gather job/room/participant metadata for identity resolution.
+
+    Deliberately does NOT reuse ``_metadata_candidates_from_context`` /
+    ``_metadata_debug_entries_from_context``: both route every lookup through
+    ``_safe_attr``, which is a logging helper that ``str()``-converts
+    whatever it fetches. Chaining it (``_safe_attr(_safe_attr(ctx, "job"),
+    "metadata")``) calls ``getattr`` on the *stringified* job object, which
+    always fails and silently falls back to the default — so those two
+    helpers never actually return real metadata. Uses plain ``getattr`` here
+    so job-level metadata (how the signed-in user id actually arrives, per
+    SESSION_IDENTITY_SHARED_SECRET) is genuinely read.
+    """
+    candidates: list[Any] = []
+    job = getattr(ctx, "job", None)
+    room = getattr(ctx, "room", None)
+    for obj in (job, room):
+        metadata = getattr(obj, "metadata", None)
+        if metadata:
+            candidates.append(metadata)
+    for attr_name in ("participant", "participant_info"):
+        participant = getattr(job, attr_name, None)
+        metadata = getattr(participant, "metadata", None)
+        if metadata:
+            candidates.append(metadata)
+    remote_participants = getattr(room, "remote_participants", None)
+    if isinstance(remote_participants, dict):
+        for participant in remote_participants.values():
+            metadata = getattr(participant, "metadata", None)
+            if metadata:
+                candidates.append(metadata)
+    return candidates
+
+
+def _realtime_room_name(ctx: JobContext) -> str | None:
+    room = getattr(ctx, "room", None)
+    name = getattr(room, "name", None)
+    return name if isinstance(name, str) and name.strip() else None
+
+
+async def _build_memory_layer_for_realtime(ctx: JobContext) -> tuple[MemoryLayer | None, str | None]:
+    """Resolve identity + preload long-term memory for the Inworld Realtime path.
+
+    Mirrors entrypoint()'s legacy-pipeline memory setup (identity resolution,
+    preload, emotional-pattern note split) so a returning user gets the same
+    continuity on the realtime engine. Never raises — a resolution failure
+    degrades to no memory for this session rather than blocking voice startup.
+    """
+    global _active_memory_layer
+    # Reset unconditionally first: a pre-warmed worker process handles many
+    # sessions over its lifetime, and a previous session's instance must never
+    # leak forward into one where memory is disabled or setup fails.
+    _active_memory_layer = None
+    if not memory_enabled():
+        logger.info("Memory layer startup: memory_enabled=false engine=inworld_realtime")
+        return None, None
+    try:
+        metadata_candidates = _realtime_metadata_candidates(ctx)
+        room_name = _realtime_room_name(ctx)
+        memory_identity = identity_from_metadata(metadata_candidates, fallback_guest_id=room_name)
+        memory_layer_instance = MemoryLayer(memory_identity)
+        try:
+            preloaded_memories = await asyncio.wait_for(memory_layer_instance.preload(), timeout=2.0)
+        except asyncio.TimeoutError:
+            preloaded_memories = []
+            logger.warning("memory_preload status=timeout timeout_seconds=2.0 engine=inworld_realtime")
+        general_memories, emotional_patterns = partition_emotional_patterns(preloaded_memories)
+        general_note = MemoryLayer.preload_note(general_memories)
+        emotional_note = emotional_pattern_preload_note(emotional_patterns)
+        memory_preload_note = "\n\n".join(n for n in (general_note, emotional_note) if n) or None
+        logger.info(
+            "Memory layer startup: memory_enabled=true engine=inworld_realtime memory_scope=%s memory_identity_present=%s preloaded_memory_count=%s emotional_pattern_count=%s preload_note_present=%s",
+            memory_identity.scope,
+            memory_identity.present,
+            len(general_memories),
+            len(emotional_patterns),
+            bool(memory_preload_note),
+        )
+        asyncio.create_task(memory_layer_instance.rebuild_index_if_empty())
+        _active_memory_layer = memory_layer_instance
+        return memory_layer_instance, memory_preload_note
+    except Exception as exc:  # noqa: BLE001 - memory setup must never block voice startup
+        logger.warning(
+            "memory_layer_setup_failed=true engine=inworld_realtime error_type=%s error=%s",
+            type(exc).__name__,
+            exc,
+        )
+        return None, None
+
+
 async def _run_inworld_realtime_voice_engine(ctx: JobContext) -> None:
     """Connect LiveKit, then let Inworld Realtime own STT, TTS, and VAD.
 
@@ -7542,7 +7643,13 @@ async def _run_inworld_realtime_voice_engine(ctx: JobContext) -> None:
     try:
         await ctx.connect()
         logger.info("voice_engine_room_connected=true engine=inworld_realtime")
-        await run_inworld_realtime_bridge(ctx.room, instructions=SYSTEM_PROMPT)
+        memory_layer_instance, memory_preload_note = await _build_memory_layer_for_realtime(ctx)
+        await run_inworld_realtime_bridge(
+            ctx.room,
+            instructions=SYSTEM_PROMPT,
+            memory_layer=memory_layer_instance,
+            memory_preload_note=memory_preload_note,
+        )
     except Exception as exc:
         logger.error(
             "voice_engine_bootstrap_failed=true engine=inworld_realtime error_type=%s error=%s",
