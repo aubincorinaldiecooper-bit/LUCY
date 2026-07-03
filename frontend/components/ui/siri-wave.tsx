@@ -294,24 +294,36 @@ export function SiriWave({
     const gl = canvas.getContext("webgl", { alpha: true, premultipliedAlpha: false })
     if (!gl) return
 
+    // Never throw here: this effect runs during a live voice call and the
+    // app has no error boundary anywhere, so an uncaught error would unmount
+    // the whole React tree over a purely decorative animation. GPU/driver
+    // GLSL quirks (e.g. no fragment-shader highp support) are a real
+    // possibility on some devices — degrade to "no animation" instead,
+    // matching the same no-op pattern ShaderBackground already uses.
     const compile = (type: number, src: string) => {
-      const shader = gl.createShader(type)!
+      const shader = gl.createShader(type)
+      if (!shader) return null
       gl.shaderSource(shader, src)
       gl.compileShader(shader)
       if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
-        const log = gl.getShaderInfoLog(shader)
+        console.warn("SiriWave: shader compile failed", gl.getShaderInfoLog(shader))
         gl.deleteShader(shader)
-        throw new Error(log ?? "shader compile error")
+        return null
       }
       return shader
     }
 
-    const program = gl.createProgram()!
+    const program = gl.createProgram()
     const vs = compile(gl.VERTEX_SHADER, VERTEX_SHADER)
     const fs = compile(gl.FRAGMENT_SHADER, FRAGMENT_SHADERS[variant])
+    if (!program || !vs || !fs) return
     gl.attachShader(program, vs)
     gl.attachShader(program, fs)
     gl.linkProgram(program)
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+      console.warn("SiriWave: program link failed", gl.getProgramInfoLog(program))
+      return
+    }
     gl.useProgram(program)
 
     const buffer = gl.createBuffer()
