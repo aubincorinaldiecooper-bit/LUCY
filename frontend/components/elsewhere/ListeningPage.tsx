@@ -1,12 +1,17 @@
 "use client";
 
 import { motion } from "framer-motion";
-import { Mic, MicOff, PhoneOff } from "lucide-react";
+import { Mic, MicOff, PhoneOff, Video, VideoOff } from "lucide-react";
 import { useState } from "react";
 import { SiriWave } from "@/components/ui/siri-wave";
 import { BrandHome } from "./BrandHome";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { PageTransition } from "./PageTransition";
+
+// The camera button only renders when vision context is deliberately enabled —
+// the backend ignores video tracks unless its own VISION_CONTEXT_ENABLED flag
+// is on, so offering the button without it would be a dead control.
+const VISION_ENABLED = process.env.NEXT_PUBLIC_VISION_ENABLED === "true";
 
 function formatTime(seconds: number) {
   const minutes = Math.floor(seconds / 60);
@@ -20,12 +25,16 @@ export function ListeningPage({
   onToggleMute,
   onEnd,
   onLeaveHome,
+  isCameraOn = false,
+  onToggleCamera,
 }: {
   isMuted: boolean;
   timer: number;
   onToggleMute: () => void;
   onEnd: () => void;
   onLeaveHome: () => void;
+  isCameraOn?: boolean;
+  onToggleCamera?: () => void;
 }) {
   // Clicking the brand during a live session would leave the conversation, so
   // confirm first to guard against an accidental tap.
@@ -57,12 +66,19 @@ export function ListeningPage({
           <div className="relative z-10 mb-8 text-center md:mb-10">
             <motion.p initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.2 }} className="font-mono text-2xl font-bold tracking-wider text-white md:text-3xl">{formatTime(timer)}</motion.p>
             {isMuted ? <p className="mt-2 text-xs text-white/50">Microphone muted</p> : null}
+            {VISION_ENABLED && isCameraOn ? <p className="mt-2 text-xs text-white/50">Camera on — Arche can see your surroundings</p> : null}
           </div>
           <div className="relative z-10 mb-10 flex items-center gap-4 md:mb-14 md:gap-6">
             <motion.button whileTap={{ scale: 0.96 }} onClick={onToggleMute} className={`flex w-28 items-center justify-center gap-2 rounded-xl py-3 text-sm font-light backdrop-blur-sm transition-all ${isMuted ? "border border-white/20 bg-white/15 text-white hover:bg-white/25" : "border border-white/10 bg-white/5 text-white/70 hover:bg-white/10"}`}>
               {isMuted ? <MicOff size={16} /> : <Mic size={16} />}
               {isMuted ? "Unmute" : "Mute"}
             </motion.button>
+            {VISION_ENABLED && onToggleCamera ? (
+              <motion.button whileTap={{ scale: 0.96 }} onClick={onToggleCamera} className={`flex w-28 items-center justify-center gap-2 rounded-xl py-3 text-sm font-light backdrop-blur-sm transition-all ${isCameraOn ? "border border-white/20 bg-white/15 text-white hover:bg-white/25" : "border border-white/10 bg-white/5 text-white/70 hover:bg-white/10"}`}>
+                {isCameraOn ? <Video size={16} /> : <VideoOff size={16} />}
+                Camera
+              </motion.button>
+            ) : null}
             <motion.button whileTap={{ scale: 0.96 }} onClick={onEnd} className="flex w-28 items-center justify-center gap-2 rounded-xl border border-[#FF6B6B]/40 bg-[#FF6B6B]/10 py-3 text-sm font-light text-[#FF8C8C] backdrop-blur-sm transition-all hover:border-[#FF6B6B] hover:bg-[#FF6B6B]/20">
               <PhoneOff size={16} />
               End

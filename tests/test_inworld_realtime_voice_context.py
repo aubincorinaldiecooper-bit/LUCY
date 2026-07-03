@@ -17,9 +17,11 @@ import asyncio
 import time
 import types
 import unittest
+from unittest import mock
 
 import inworld_realtime_bridge as irb
 from inworld_voice_profile import NormalizedVoiceProfile
+from vision_context import VisionContextConfig
 
 
 def _settings(**overrides):
@@ -254,6 +256,192 @@ class BuilderTests(unittest.TestCase):
             content[0], {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}
         )
         self.assertEqual(content[1], {"type": "input_text", "text": "What do you see?"})
+
+    def test_session_update_builder_includes_vision_note(self):
+        update = irb.build_instructions_session_update(
+            _settings(), vision_summary="a desk with a laptop"
+        )
+        instructions = update["session"]["instructions"]
+        self.assertTrue(instructions.startswith("Be concise."))
+        self.assertIn("a desk with a laptop", instructions)
+        self.assertIn("never mention", instructions.lower())
+
+    def test_session_update_builder_composes_vision_with_voice_context(self):
+        update = irb.build_instructions_session_update(
+            _settings(),
+            voice_context_summary="energy low, tension low, certainty medium",
+            vision_summary="a desk with a laptop",
+        )
+        instructions = update["session"]["instructions"]
+        self.assertIn("energy low", instructions)
+        self.assertIn("a desk with a laptop", instructions)
+
+
+def _vision_config(**overrides):
+    kwargs = dict(
+        enabled=True,
+        model="openai/gpt-4o-mini",
+        api_key="or-key",
+        min_interval_seconds=12.0,
+        frame_sample_interval_seconds=2.0,
+        max_frame_dimension=512,
+        request_timeout_seconds=6.0,
+    )
+    kwargs.update(overrides)
+    return VisionContextConfig(**kwargs)
+
+
+_SPEECH_STARTED = {"type": "input_audio_buffer.speech_started"}
+
+
+class VisionContextBridgeTests(unittest.TestCase):
+    """speech_started → background describe → instructions update, all gated."""
+
+    def _drain_tasks(self, bridge):
+        async def drain():
+            pending = [t for t in bridge._tasks if not t.done()]
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+        return drain()
+
+    def _scenario(self, *, config, frame="data:image/jpeg;base64,AAAA", describe=None, events=(_SPEECH_STARTED,), between=None):
+        async def run():
+            bridge = _make_bridge()
+            bridge._session_ready.set()
+            bridge._vision_config = config
+            bridge._latest_video_frame_data_url = frame
+            fake_describe = describe or mock.AsyncMock(return_value="a red mug on a desk")
+            with mock.patch.object(irb, "describe_frame", fake_describe):
+                for i, event in enumerate(events):
+                    if between is not None and i > 0:
+                        between(bridge)
+                    await bridge._handle_inworld_message(event)
+                    # Let the background describe task finish before the next
+                    # event — in production consecutive speech_started events
+                    # are min_interval_seconds apart, far beyond the call
+                    # timeout, so the previous call is never still in flight.
+                    await self._drain_tasks(bridge)
+            return bridge, fake_describe
+
+        return asyncio.run(run())
+
+    def test_disabled_config_never_calls_describe(self):
+        bridge, fake_describe = self._scenario(config=_vision_config(enabled=False))
+        fake_describe.assert_not_awaited()
+        self.assertEqual(bridge._ws.sent, [])
+
+    def test_no_held_frame_never_calls_describe(self):
+        bridge, fake_describe = self._scenario(config=_vision_config(), frame=None)
+        fake_describe.assert_not_awaited()
+        self.assertEqual(bridge._ws.sent, [])
+
+    def test_speech_started_sends_vision_instructions_update(self):
+        bridge, fake_describe = self._scenario(config=_vision_config())
+        fake_describe.assert_awaited_once()
+        self.assertEqual(bridge.latest_vision_summary, "a red mug on a desk")
+        self.assertEqual(len(bridge._ws.sent), 1)
+        update = bridge._ws.sent[0]
+        self.assertEqual(update["type"], "session.update")
+        self.assertIn("a red mug on a desk", update["session"]["instructions"])
+
+    def test_failed_describe_sends_nothing(self):
+        bridge, _ = self._scenario(
+            config=_vision_config(), describe=mock.AsyncMock(return_value=None)
+        )
+        self.assertIsNone(bridge.latest_vision_summary)
+        self.assertEqual(bridge._ws.sent, [])
+
+    def test_second_speech_started_within_interval_is_throttled(self):
+        bridge, fake_describe = self._scenario(
+            config=_vision_config(), events=(_SPEECH_STARTED, _SPEECH_STARTED)
+        )
+        fake_describe.assert_awaited_once()
+        self.assertEqual(len(bridge._ws.sent), 1)
+
+    def test_second_speech_started_after_interval_sends_again(self):
+        def age_last_send(bridge):
+            bridge._last_vision_context_sent_at = (
+                time.monotonic() - bridge._vision_config.min_interval_seconds - 1
+            )
+
+        summaries = iter(["a red mug on a desk", "a person holding a book"])
+
+        async def next_summary(*args, **kwargs):
+            return next(summaries)
+
+        bridge, _ = self._scenario(
+            config=_vision_config(),
+            describe=mock.AsyncMock(side_effect=next_summary),
+            events=(_SPEECH_STARTED, _SPEECH_STARTED),
+            between=age_last_send,
+        )
+        self.assertEqual(len(bridge._ws.sent), 2)
+        self.assertIn("a person holding a book", bridge._ws.sent[1]["session"]["instructions"])
+
+    def test_video_sampler_not_started_when_disabled(self):
+        async def run():
+            bridge = _make_bridge()
+            # Default env: disabled. A video track must be ignored entirely.
+            bridge._vision_config = _vision_config(enabled=False)
+            track = types.SimpleNamespace(kind=irb.rtc.TrackKind.KIND_VIDEO)
+            bridge._maybe_start_video_sampler(track)
+            return bridge
+
+        bridge = asyncio.run(run())
+        self.assertFalse(bridge._video_sampler_started)
+        self.assertEqual(len(bridge._tasks), 0)
+
+    def test_audio_track_never_starts_video_sampler(self):
+        async def run():
+            bridge = _make_bridge()
+            bridge._vision_config = _vision_config()
+            track = types.SimpleNamespace(kind=irb.rtc.TrackKind.KIND_AUDIO)
+            bridge._maybe_start_video_sampler(track)
+            return bridge
+
+        bridge = asyncio.run(run())
+        self.assertFalse(bridge._video_sampler_started)
+
+
+class _FakeVideoFrame:
+    """Stands in for rtc.VideoFrame: convert() returns RGBA self-description."""
+
+    def __init__(self, width, height):
+        self.width = width
+        self.height = height
+
+    def convert(self, buffer_type):
+        return types.SimpleNamespace(
+            width=self.width,
+            height=self.height,
+            data=bytes(self.width * self.height * 4),  # opaque-black RGBA
+        )
+
+
+class EncodeVideoFrameTests(unittest.TestCase):
+    def test_encodes_to_jpeg_data_url(self):
+        encoded = irb._encode_video_frame_jpeg(_FakeVideoFrame(64, 48), max_dimension=512)
+        self.assertIsNotNone(encoded)
+        self.assertTrue(encoded.startswith("data:image/jpeg;base64,"))
+
+    def test_downscales_to_max_dimension(self):
+        import base64 as b64
+        import io as io_
+
+        from PIL import Image
+
+        encoded = irb._encode_video_frame_jpeg(_FakeVideoFrame(1280, 720), max_dimension=512)
+        raw = b64.b64decode(encoded.split(",", 1)[1])
+        image = Image.open(io_.BytesIO(raw))
+        self.assertEqual(max(image.width, image.height), 512)
+
+    def test_bad_frame_returns_none_never_raises(self):
+        class Broken:
+            def convert(self, buffer_type):
+                raise RuntimeError("no buffer")
+
+        self.assertIsNone(irb._encode_video_frame_jpeg(Broken(), max_dimension=512))
 
 
 if __name__ == "__main__":

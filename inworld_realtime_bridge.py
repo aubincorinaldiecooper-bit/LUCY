@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import json
 import logging
 import os
@@ -42,6 +43,7 @@ from urllib.parse import urlencode
 
 import aiohttp
 from livekit import rtc
+from PIL import Image
 
 from emotional_dataset import (
     CalibrationTracker,
@@ -51,6 +53,12 @@ from emotional_dataset import (
 )
 from inworld_voice_profile import NormalizedVoiceProfile, normalize_from_message
 from memory_layer import MemoryLayer
+from vision_context import (
+    VisionContextConfig,
+    build_vision_context_note,
+    describe_frame,
+    load_vision_context_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -351,6 +359,7 @@ def build_instructions_session_update(
     *,
     voice_context_summary: str | None = None,
     calibration_question: str | None = None,
+    vision_summary: str | None = None,
 ) -> dict[str, Any]:
     """Partial session.update refreshing only the instructions.
 
@@ -364,6 +373,8 @@ def build_instructions_session_update(
         instructions = f"{instructions}\n\n{build_voice_context_note(voice_context_summary)}"
     if calibration_question:
         instructions = f"{instructions}\n\n{build_calibration_note(calibration_question)}"
+    if vision_summary:
+        instructions = f"{instructions}\n\n{build_vision_context_note(vision_summary)}"
     return {
         "type": "session.update",
         "session": {
@@ -376,6 +387,33 @@ def build_instructions_session_update(
 def build_voice_context_session_update(settings: InworldRealtimeSettings, summary: str) -> dict[str, Any]:
     """Partial session.update carrying only the voice-context note."""
     return build_instructions_session_update(settings, voice_context_summary=summary)
+
+
+def _encode_video_frame_jpeg(frame: Any, *, max_dimension: int, quality: int = 70) -> str | None:
+    """Downscale + JPEG-encode a LiveKit video frame into a data URL, or None.
+
+    Downscaling before the vision call (not after) is what keeps per-call cost
+    low regardless of the camera's native resolution — most vision APIs price
+    by image size/tokens.
+    """
+    try:
+        converted = frame.convert(rtc.VideoBufferType.RGBA)
+        image = Image.frombytes(
+            "RGBA", (converted.width, converted.height), bytes(converted.data)
+        ).convert("RGB")
+        if max(image.width, image.height) > max_dimension:
+            scale = max_dimension / max(image.width, image.height)
+            new_size = (max(1, int(image.width * scale)), max(1, int(image.height * scale)))
+            image = image.resize(new_size)
+        buf = io.BytesIO()
+        image.save(buf, format="JPEG", quality=quality)
+        encoded = base64.b64encode(buf.getvalue()).decode("ascii")
+        return f"data:image/jpeg;base64,{encoded}"
+    except Exception as exc:  # noqa: BLE001 - a bad frame must never break the sampler loop
+        logger.warning(
+            "inworld_video_frame_encode_failed=true error_type=%s error=%s", type(exc).__name__, exc
+        )
+        return None
 
 
 def _frame_bytes(frame: rtc.AudioFrame) -> bytes:
@@ -430,7 +468,6 @@ _LOG_ONLY_EVENT_TYPES = {
     "conversation.item.created",
     "conversation.item.done",
     "conversation.item.input_audio_transcription.delta",
-    "input_audio_buffer.speech_started",
     "input_audio_buffer.speech_stopped",
     "input_audio_buffer.committed",
     "input_audio_buffer.cleared",
@@ -506,6 +543,16 @@ class InworldRealtimeLiveKitBridge:
         self._memory_preload_note: str | None = None
         self._memory_resolved = asyncio.Event()
         self._turn_counter = 0
+        # Vision context: off unless VISION_CONTEXT_ENABLED=true, in which case
+        # a camera track (if the user publishes one) is sampled at a fixed
+        # cadence and described via vision_context.describe_frame(). See
+        # vision_context.py for the model-agnostic OpenRouter call.
+        self._vision_config: VisionContextConfig = load_vision_context_config()
+        self.latest_vision_summary: str | None = None
+        self._last_vision_context_sent_at = 0.0
+        self._latest_video_frame_data_url: str | None = None
+        self._video_sampler_started = False
+        self._vision_call_in_flight = False
 
     async def _ensure_memory_resolved(self) -> None:
         """Await the background memory-resolution task exactly once.
@@ -620,9 +667,11 @@ class InworldRealtimeLiveKitBridge:
                 track = getattr(publication, "track", None)
                 if track is not None:
                     self._maybe_start_audio_forwarder(track)
+                    self._maybe_start_video_sampler(track)
 
     def _on_track_subscribed(self, track, publication=None, participant=None) -> None:
         self._maybe_start_audio_forwarder(track)
+        self._maybe_start_video_sampler(track)
 
     def _maybe_start_audio_forwarder(self, track: Any) -> None:
         if getattr(track, "kind", None) != rtc.TrackKind.KIND_AUDIO:
@@ -630,6 +679,48 @@ class InworldRealtimeLiveKitBridge:
         task = asyncio.create_task(self._forward_livekit_audio(track))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+
+    def _maybe_start_video_sampler(self, track: Any) -> None:
+        # Gated on the feature flag, not just track kind: with vision context
+        # disabled (the default) we never touch a published camera track at
+        # all, so there is zero CPU/behavior change unless deliberately
+        # enabled.
+        if not self._vision_config.enabled:
+            return
+        if getattr(track, "kind", None) != rtc.TrackKind.KIND_VIDEO:
+            return
+        if self._video_sampler_started:
+            return
+        self._video_sampler_started = True
+        task = asyncio.create_task(self._sample_video_track(track))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _sample_video_track(self, track: Any) -> None:
+        """Hold the most recent camera frame as a downscaled JPEG data URL.
+
+        Sampled at a fixed cadence (frame_sample_interval_seconds), not every
+        incoming frame — encoding every frame would burn CPU for no benefit,
+        since a frame is used at most once per min_interval_seconds anyway.
+        """
+        stream = rtc.VideoStream(track)
+        last_sampled_at = 0.0
+        try:
+            async for event in stream:
+                now = time.monotonic()
+                if now - last_sampled_at < self._vision_config.frame_sample_interval_seconds:
+                    continue
+                frame = getattr(event, "frame", None)
+                if frame is None:
+                    continue
+                encoded = _encode_video_frame_jpeg(
+                    frame, max_dimension=self._vision_config.max_frame_dimension
+                )
+                if encoded is not None:
+                    self._latest_video_frame_data_url = encoded
+                    last_sampled_at = now
+        finally:
+            await stream.aclose()
 
     async def _forward_livekit_audio(self, track: Any) -> None:
         ws = self._ws
@@ -746,6 +837,14 @@ class InworldRealtimeLiveKitBridge:
                 self._memory_layer.schedule_remember(
                     role="assistant", content=transcript, turn_id=self._turn_counter
                 )
+
+        elif msg_type == "input_audio_buffer.speech_started":
+            logger.info("inworld_server_event=true type=%s", msg_type)
+            # Refresh vision context right as the user starts talking, so
+            # Arche's next reply is grounded in a fresh-ish frame rather than
+            # a stale one from earlier in the call. No-ops entirely unless
+            # VISION_CONTEXT_ENABLED=true and a camera frame has been sampled.
+            await self._maybe_send_vision_context_update()
 
         elif msg_type == "response.done":
             logger.info(
@@ -896,6 +995,7 @@ class InworldRealtimeLiveKitBridge:
             self.settings,
             voice_context_summary=summary,
             calibration_question=self._active_calibration_question,
+            vision_summary=self.latest_vision_summary,
         )
 
     async def _send_instructions_update(self, reason: str) -> bool:
@@ -940,6 +1040,43 @@ class InworldRealtimeLiveKitBridge:
                 "inworld_voice_context_update_sent=true summary=%s",
                 self.latest_voice_profile.planner_summary(),
             )
+
+    async def _maybe_send_vision_context_update(self) -> None:
+        """Kick a background vision-description call, rate-limited.
+
+        Fire-and-forget: the OpenRouter round trip (up to
+        VISION_CONTEXT_TIMEOUT_SECONDS) must never block the receive loop or
+        delay the user's turn. The result folds into instructions via the same
+        session.update path as voice context — never a new conversation item —
+        so a slow or failed call can only skip an update, never interrupt or
+        duplicate a turn.
+        """
+        if not self._vision_config.enabled or self._vision_call_in_flight:
+            return
+        if self._latest_video_frame_data_url is None:
+            return
+        now = time.monotonic()
+        if now - self._last_vision_context_sent_at < self._vision_config.min_interval_seconds:
+            return
+        self._last_vision_context_sent_at = now
+        self._vision_call_in_flight = True
+        task = asyncio.create_task(self._run_vision_context_update())
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _run_vision_context_update(self) -> None:
+        try:
+            frame = self._latest_video_frame_data_url
+            if frame is None:
+                return
+            summary = await describe_frame(frame, self._vision_config)
+            if not summary:
+                return
+            self.latest_vision_summary = summary
+            await self._send_instructions_update(reason="vision_context")
+            logger.info("inworld_vision_context_update_sent=true summary_length=%s", len(summary))
+        finally:
+            self._vision_call_in_flight = False
 
     async def _send_session_update(self) -> None:
         if self._ws is None:

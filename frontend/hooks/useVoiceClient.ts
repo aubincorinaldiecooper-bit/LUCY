@@ -38,6 +38,54 @@ const FRONTEND_BUILD = { id: "2026-07-09-inworld-realtime-state-machine", audioP
 const INWORLD_REALTIME_TRACK_NAME = "arche-inworld-realtime";
 
 
+// Mirrors the flag gating the Camera button in ListeningPage: with vision off,
+
+// the hook must never auto-publish a camera track either.
+
+const VISION_ENABLED = process.env.NEXT_PUBLIC_VISION_ENABLED === "true";
+
+
+// Turning the camera on is sticky: it stays on (including across sessions on
+
+// this device) until the user explicitly turns it off. Stored client-side only.
+
+const CAMERA_PREFERENCE_STORAGE_KEY = "arche.cameraPreferred";
+
+
+function readCameraPreference(): boolean {
+
+  if (typeof window === "undefined") return false;
+
+  try {
+
+    return window.localStorage.getItem(CAMERA_PREFERENCE_STORAGE_KEY) === "true";
+
+  } catch {
+
+    return false;
+
+  }
+
+}
+
+
+function writeCameraPreference(on: boolean) {
+
+  if (typeof window === "undefined") return;
+
+  try {
+
+    window.localStorage.setItem(CAMERA_PREFERENCE_STORAGE_KEY, on ? "true" : "false");
+
+  } catch {
+
+    // Storage unavailable (private mode etc.): the choice just won't persist.
+
+  }
+
+}
+
+
 function logInworldRealtime(
 
   event: string,
@@ -121,6 +169,12 @@ export function useVoiceClient(options?: { onServerDisconnect?: () => void }) {
   const [state, setState] = useState<VoiceState>("idle");
 
   const [isMuted, setIsMuted] = useState(false);
+
+  // Camera requires one explicit opt-in, then stays on — including across
+  // sessions on this device — until the user explicitly turns it off. The
+  // remembered choice is re-applied (visibly) on each connect; it is never
+  // enabled without the user having chosen it at some point.
+  const [isCameraOn, setIsCameraOn] = useState(false);
 
   const roomRef = useRef<Room | null>(null);
 
@@ -403,6 +457,8 @@ export function useVoiceClient(options?: { onServerDisconnect?: () => void }) {
 
       setIsMuted(false);
 
+      setIsCameraOn(false);
+
       return;
 
     }
@@ -416,6 +472,8 @@ export function useVoiceClient(options?: { onServerDisconnect?: () => void }) {
     setState("idle");
 
     setIsMuted(false);
+
+    setIsCameraOn(false);
 
   }, [clearRemoteAudioElements]);
 
@@ -467,6 +525,8 @@ export function useVoiceClient(options?: { onServerDisconnect?: () => void }) {
         roomRef.current = null;
 
         setState("idle");
+
+        setIsCameraOn(false);
 
         // Server/agent ended the room (e.g. session time limit) rather than the
 
@@ -774,6 +834,32 @@ export function useVoiceClient(options?: { onServerDisconnect?: () => void }) {
 
       await room.localParticipant.setMicrophoneEnabled(!isMuted);
 
+      // Re-apply the remembered camera choice: a user who turned the camera on
+
+      // keeps it on for future sessions until they turn it off. The visible
+
+      // "Camera on" state + status line make this never covert.
+
+      if (VISION_ENABLED && readCameraPreference()) {
+
+        try {
+
+          await room.localParticipant.setCameraEnabled(true);
+
+          setIsCameraOn(true);
+
+        } catch (err) {
+
+          // Permission revoked / camera gone since last time: stay off.
+
+          console.warn("Failed to re-enable camera from remembered preference", err);
+
+          setIsCameraOn(false);
+
+        }
+
+      }
+
     } catch {
 
       clearRemoteAudioElements();
@@ -800,6 +886,51 @@ export function useVoiceClient(options?: { onServerDisconnect?: () => void }) {
   }, [isMuted]);
 
 
+  // Publishes/unpublishes the camera track over the existing LiveKit room. The
+
+  // agent-side bridge samples it for vision context only when the backend's
+
+  // VISION_CONTEXT_ENABLED flag is on; with it off a published track is ignored.
+
+  // The chosen state is remembered (localStorage) and re-applied on future
+
+  // connects until the user toggles it off.
+
+  const toggleCamera = useCallback(async () => {
+
+    const room = roomRef.current;
+
+    if (!room) return;
+
+    const next = !isCameraOn;
+
+    try {
+
+      await room.localParticipant.setCameraEnabled(next);
+
+      setIsCameraOn(next);
+
+      writeCameraPreference(next);
+
+    } catch (err) {
+
+      // Permission denied / no camera: stay off rather than showing a lying
+
+      // "camera on" state, and don't persist an ON choice that never took
+
+      // effect.
+
+      console.warn("Failed to toggle camera", err);
+
+      setIsCameraOn(false);
+
+      if (!next) writeCameraPreference(false);
+
+    }
+
+  }, [isCameraOn]);
+
+
   useEffect(() => () => {
 
     clearRemoteAudioElements();
@@ -809,7 +940,7 @@ export function useVoiceClient(options?: { onServerDisconnect?: () => void }) {
   }, [clearRemoteAudioElements, disconnect]);
 
 
-  return { state, connect, disconnect, toggleMute, isMuted };
+  return { state, connect, disconnect, toggleMute, isMuted, toggleCamera, isCameraOn };
 
 }
 
