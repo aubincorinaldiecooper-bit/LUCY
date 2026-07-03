@@ -3,6 +3,7 @@
 import { motion } from "framer-motion";
 import { Mic, MicOff, PhoneOff } from "lucide-react";
 import { useState } from "react";
+import { SiriWave } from "@/components/ui/siri-wave";
 import { BrandHome } from "./BrandHome";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { PageTransition } from "./PageTransition";
@@ -49,11 +50,9 @@ export function ListeningPage({
           }}
         />
         <div className="relative z-10 flex flex-1 flex-col items-center justify-center px-6 pt-20">
-          {/* Warm soft gradient blob — kept, tuned to glow on the dark backdrop. */}
+          {/* Siri-style voice animation — replaces the old gradient blob. */}
           <div className="relative mb-8 flex h-[100px] w-[100px] items-center justify-center md:mb-10 md:h-[130px] md:w-[130px]" aria-hidden="true">
-            <motion.div animate={{ scale: [1, 1.1, 1], rotate: [0, 10, -10, 0] }} transition={{ duration: 8, repeat: Infinity, ease: "easeInOut" }} className="absolute inset-0 rounded-full bg-gradient-to-tr from-[#FF9A9E] via-[#FECFEF] to-[#FFD194] opacity-70 blur-[30px]" />
-            <motion.div animate={{ scale: [1.1, 0.9, 1.1], rotate: [0, -20, 20, 0] }} transition={{ duration: 6, repeat: Infinity, ease: "easeInOut" }} className="absolute inset-2 rounded-full bg-gradient-to-bl from-[#FF6B6B] via-[#FF8C42] to-[#F9D423] opacity-60 blur-[25px]" />
-            <motion.div animate={{ scale: [1, 1.05, 1], rotate: [0, 5, -5, 0] }} transition={{ duration: 5, repeat: Infinity, ease: "easeInOut" }} className="absolute inset-0 rounded-full bg-gradient-to-r from-[#FFD194] via-[#FF9A9E] to-[#FF6B6B] opacity-50 blur-[15px] mix-blend-screen" />
+            <SiriWave variant="fluid-dots" size={130} />
           </div>
           <div className="relative z-10 mb-8 text-center md:mb-10">
             <motion.p initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.2 }} className="font-mono text-2xl font-bold tracking-wider text-white md:text-3xl">{formatTime(timer)}</motion.p>
