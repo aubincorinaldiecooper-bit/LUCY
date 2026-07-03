@@ -448,7 +448,7 @@ class InworldRealtimeLiveKitBridge:
         *,
         dataset_writer: EmotionalDatasetWriter | None = None,
         calibration_enabled: bool = False,
-        memory_layer: MemoryLayer | None = None,
+        memory_task: "asyncio.Task[tuple[MemoryLayer | None, str | None]] | None" = None,
     ) -> None:
         self.room = room
         self.settings = settings
@@ -474,11 +474,39 @@ class InworldRealtimeLiveKitBridge:
             CalibrationTracker(session_id=settings.session_id) if calibration_enabled else None
         )
         self._active_calibration_question: str | None = None
-        # Long-term memory (preloaded/closed by the caller); None when
-        # MEMORY_ENABLED=false or identity resolution failed. A simple
+        # Long-term memory resolves in the background (identity lookup + up to
+        # a 2s Postgres preload) concurrently with WebSocket connect + LiveKit
+        # audio-track subscription below, so a fast talker's opening words
+        # are never dropped waiting on the database. _ensure_memory_resolved()
+        # awaits memory_task exactly once, lazily, the first time memory is
+        # actually needed (building the first session.update). A simple
         # per-session counter stands in for the legacy pipeline's turn id.
-        self._memory_layer = memory_layer
+        self._memory_task = memory_task
+        self._memory_layer: MemoryLayer | None = None
+        self._memory_preload_note: str | None = None
+        self._memory_resolved = asyncio.Event()
         self._turn_counter = 0
+
+    async def _ensure_memory_resolved(self) -> None:
+        """Await the background memory-resolution task exactly once.
+
+        No-ops instantly once resolved (or if no task was given). Errors are
+        already handled inside _build_memory_layer_for_realtime (it never
+        raises, only degrades to (None, None)); this is a last-resort net for
+        cancellation or an unexpected failure so memory never crashes a turn.
+        """
+        if self._memory_resolved.is_set():
+            return
+        if self._memory_task is not None:
+            try:
+                self._memory_layer, self._memory_preload_note = await self._memory_task
+            except Exception as exc:  # noqa: BLE001 - memory resolution must never break the bridge
+                logger.warning(
+                    "inworld_memory_task_failed=true error_type=%s error=%s",
+                    type(exc).__name__, exc,
+                )
+                self._memory_layer, self._memory_preload_note = None, None
+        self._memory_resolved.set()
 
     async def run(self) -> None:
         started_at = time.monotonic()
@@ -535,6 +563,22 @@ class InworldRealtimeLiveKitBridge:
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
             self._tasks.clear()
+        if self._memory_task is not None:
+            if self._memory_task.done():
+                await self._ensure_memory_resolved()
+            else:
+                # Session ended before memory ever resolved (very short call);
+                # nothing was constructed, so just cancel cleanly.
+                self._memory_task.cancel()
+                try:
+                    await self._memory_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+        if self._memory_layer is not None:
+            try:
+                await self._memory_layer.aclose()
+            except Exception:
+                pass
         try:
             await self._output_source.aclose()
         except Exception:
@@ -880,9 +924,19 @@ class InworldRealtimeLiveKitBridge:
     async def _send_session_update(self) -> None:
         if self._ws is None:
             return
+        # Resolve memory here (not earlier): this is the first point the
+        # preload note is actually needed, and by now WebSocket connect +
+        # LiveKit audio-track subscription are already underway/complete, so
+        # waiting on Postgres here no longer risks missing the user's mic.
+        await self._ensure_memory_resolved()
+        if self._memory_preload_note:
+            self.settings = replace(
+                self.settings,
+                instructions=f"{self.settings.instructions}\n\n{self._memory_preload_note}",
+            )
         await self._ws.send_json(build_session_update(self.settings))
         logger.info(
-            "inworld_session_update_sent=true inworld_session_model=%s inworld_stt_model=%s inworld_tts_model=%s inworld_tts_voice=%s inworld_turn_detection_type=%s tts_delivery_mode=%s tts_segmenter_strategy=%s tts_steering_handling=%s effective_voice_profile_enabled=%s",
+            "inworld_session_update_sent=true inworld_session_model=%s inworld_stt_model=%s inworld_tts_model=%s inworld_tts_voice=%s inworld_turn_detection_type=%s tts_delivery_mode=%s tts_segmenter_strategy=%s tts_steering_handling=%s effective_voice_profile_enabled=%s memory_preload_note_present=%s",
             self.settings.model,
             self.settings.stt_model,
             self.settings.tts_model,
@@ -892,6 +946,7 @@ class InworldRealtimeLiveKitBridge:
             self.settings.tts_segmenter_strategy,
             self.settings.tts_steering_handling,
             self.settings.voice_profile_enabled,
+            bool(self._memory_preload_note),
         )
 
 
@@ -899,29 +954,23 @@ async def run_inworld_realtime_bridge(
     room: rtc.Room,
     *,
     instructions: str | None = None,
-    memory_layer: MemoryLayer | None = None,
-    memory_preload_note: str | None = None,
+    memory_task: "asyncio.Task[tuple[MemoryLayer | None, str | None]] | None" = None,
 ) -> None:
     settings = load_inworld_realtime_settings(instructions=instructions)
-    if memory_preload_note:
-        # Preload note is baked into the *initial* instructions (unlike the
-        # voice-context/calibration notes, which arrive later via a partial
-        # session.update) — it's stable for the session and known up front.
-        settings = replace(settings, instructions=f"{settings.instructions}\n\n{memory_preload_note}")
     dataset_writer = build_emotional_dataset_writer_from_env()
     calibration_enabled = _env_bool("EMOTIONAL_CALIBRATION_REALTIME_ENABLED", False)
     logger.info(
-        "emotional_dataset_wiring dataset_writer_active=%s calibration_enabled=%s memory_layer_active=%s",
+        "emotional_dataset_wiring dataset_writer_active=%s calibration_enabled=%s memory_resolution_pending=%s",
         dataset_writer is not None,
         calibration_enabled,
-        memory_layer is not None,
+        memory_task is not None,
     )
     bridge = InworldRealtimeLiveKitBridge(
         room,
         settings,
         dataset_writer=dataset_writer,
         calibration_enabled=calibration_enabled,
-        memory_layer=memory_layer,
+        memory_task=memory_task,
     )
     if dataset_writer is not None:
         dataset_writer.start()
@@ -930,5 +979,6 @@ async def run_inworld_realtime_bridge(
     finally:
         if dataset_writer is not None:
             await dataset_writer.aclose()
-        if memory_layer is not None:
-            await memory_layer.aclose()
+        # bridge.aclose() (called from bridge.run()'s own finally/except paths)
+        # already resolves-or-cancels memory_task and closes the memory layer,
+        # so there is nothing left to do with it here.

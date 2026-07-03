@@ -7643,12 +7643,20 @@ async def _run_inworld_realtime_voice_engine(ctx: JobContext) -> None:
     try:
         await ctx.connect()
         logger.info("voice_engine_room_connected=true engine=inworld_realtime")
-        memory_layer_instance, memory_preload_note = await _build_memory_layer_for_realtime(ctx)
+        # Fire memory resolution (identity lookup + up-to-2s Postgres preload)
+        # as a background task rather than awaiting it here: the bridge needs
+        # to start subscribing to the LiveKit mic track and connecting to
+        # Inworld's WebSocket immediately, or a user who starts talking right
+        # after joining can have their opening words silently dropped while
+        # nothing is listening yet. The bridge awaits this task lazily, only
+        # once it actually needs the preload note (building the first
+        # session.update) — by which point audio-track subscription is
+        # already live.
+        memory_task = asyncio.create_task(_build_memory_layer_for_realtime(ctx))
         await run_inworld_realtime_bridge(
             ctx.room,
             instructions=SYSTEM_PROMPT,
-            memory_layer=memory_layer_instance,
-            memory_preload_note=memory_preload_note,
+            memory_task=memory_task,
         )
     except Exception as exc:
         logger.error(
