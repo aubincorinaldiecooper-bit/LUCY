@@ -247,6 +247,26 @@ def build_conversation_item_create(text: str) -> dict[str, Any]:
     }
 
 
+def build_image_conversation_item_create(image_data_url: str, text: str) -> dict[str, Any]:
+    """Build a user message carrying an image plus a text prompt.
+
+    Uses the OpenAI Realtime GA ``input_image`` content-part shape (``image_url``
+    is a data URL string). Used by the /api/inworld/ws-smoke-test endpoint to
+    probe whether Inworld's Realtime session accepts image content parts.
+    """
+    return {
+        "type": "conversation.item.create",
+        "item": {
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_image", "image_url": image_data_url},
+                {"type": "input_text", "text": text},
+            ],
+        },
+    }
+
+
 def build_response_create(instructions: str | None = None) -> dict[str, Any]:
     """Build a response.create message (used by the ws-smoke-test endpoint)."""
     response: dict[str, Any] = {

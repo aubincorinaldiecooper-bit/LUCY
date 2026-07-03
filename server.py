@@ -1745,14 +1745,40 @@ async def inworld_webrtc_call(request: Request) -> Response:
         )
 
 
+# 128x128 PNG, large red circle on white — unmistakable content for the image
+# smoke test: if Inworld's Realtime session accepts input_image content parts
+# and routes them to a vision-capable LLM, the reply must mention red/circle.
+_WS_SMOKE_TEST_IMAGE_DATA_URL = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAIAAABMXPacAAAB3ElEQVR42u3dzVFDMQxF4URDH1nQf0ks"
+    "UsmjhTA8Wz/+zpoZdHUsGRjAz+u6HsgjtIAAAkAAASCAABBAAAggAAQQAAIIAAEEgAACQAABIIAA3M9X"
+    "r3J/Xq9PPuz7/e6S6Fn/F7M+bHpTGXUF/LPvXUyUE3B734ubKCRgQ+sLaighYHPrS2mIk7uf/tmTJyA9"
+    "fIVRCN3PrSd0P7eq3SuoZusT11Hofm6dofu51Ybu59bsx9HJhOOfW3nofm79ofu5KdwBc++AGcd/dZbQ"
+    "/dxEVtDEFTTv+K/LZQLGTcDU478onQmY+2UoEgTM3j8rMpoAK4gA+ycxqQmwggjABAHnXAD35jUBVhAB"
+    "IIAAEEAACCAABBAAAgj4M43+Q0ypvCbACiIAQwSccw3cmNQEWEEE2EKJGU2AFUSALZSYzgRMXEFTh2BF"
+    "LhMw9BKeNwSLEkW7iid13wqa/n3AjCFYmiJaV9+9+5tWUF8HGyp3B4y+A1oPwZ6aY1iedtXGyFSN6sx5"
+    "P6DsX/TtPyJxSM6yVcVRaQvWk/+IT/o6yj0KcezRKzKI3hF7ELBbg5f0ckx4SzLHhNdUE2R4Txh9vgwl"
+    "AAQQAAIIAAEEgAACQAABIIAAEEAACCAABBAAAgjACn4BmM29w/o7Xr8AAAAASUVORK5CYII="
+)
+
+_WS_SMOKE_IMAGE_PROMPT = "In one short sentence, say the shape and the color you see in the image."
+
+
 @app.post("/api/inworld/ws-smoke-test")
 async def inworld_ws_smoke_test(request: Request) -> JSONResponse:
     """Backend-only direct Inworld Realtime WebSocket audio smoke test.
 
     This does not use LiveKit or WebRTC. It answers whether Inworld emits usable
     Luna audio as ``response.output_audio.delta`` events for the bridge config.
+
+    Body (optional JSON): ``{"mode": "image"}`` switches to the image smoke
+    test — the prompt item carries an ``input_image`` content part (red circle
+    on white) and the reply transcript shows whether the model actually saw it.
+    ``{"model": "..."}`` overrides the LLM for the run.
     """
     result: dict[str, Any] = {
+        "mode": "text",
+        "model": None,
         "connected": False,
         "session_updated": False,
         "response_created": False,
@@ -1763,6 +1789,7 @@ async def inworld_ws_smoke_test(request: Request) -> JSONResponse:
         "saw_audio_transcript": False,
         "saw_text_done": False,
         "saw_response_done": False,
+        "response_transcript": "",
         "errors": [],
         "first_events": [],
         "last_events": [],
@@ -1781,10 +1808,21 @@ async def inworld_ws_smoke_test(request: Request) -> JSONResponse:
 
     from inworld_realtime_bridge import (
         build_conversation_item_create,
+        build_image_conversation_item_create,
         build_response_create,
         build_session_update,
         load_inworld_realtime_settings,
     )
+
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    image_mode = str(body.get("mode") or "").strip().lower() == "image"
+    model_override = str(body.get("model") or "").strip()
+    result["mode"] = "image" if image_mode else "text"
 
     def bool_str(value: bool) -> str:
         return str(value).lower()
@@ -1805,11 +1843,17 @@ async def inworld_ws_smoke_test(request: Request) -> JSONResponse:
 
     print("inworld_ws_smoke_started=true", flush=True)
 
+    prompt_text = _WS_SMOKE_IMAGE_PROMPT if image_mode else "Say hello in one short sentence."
+
     try:
-        settings = load_inworld_realtime_settings(instructions="Say hello in one short sentence.")
+        settings = load_inworld_realtime_settings(instructions=prompt_text)
+        # Image mode keeps the env-configured model (vision-capable
+        # openai/gpt-4o-mini by default): the text mode's groq/gpt-oss-120b
+        # override is a text-only model that can never see the image.
+        smoke_model = model_override or ("" if image_mode else "groq/openai/gpt-oss-120b") or settings.model
         settings = replace(
             settings,
-            model="groq/openai/gpt-oss-120b",
+            model=smoke_model,
             stt_model="assemblyai/u3-rt-pro",
             tts_model="inworld-tts-2",
             voice="Luna",
@@ -1820,6 +1864,7 @@ async def inworld_ws_smoke_test(request: Request) -> JSONResponse:
             tts_segmenter_strategy="full_turn",
             tts_steering_handling="emit_once",
         )
+        result["model"] = settings.model
     except Exception as exc:  # noqa: BLE001
         result["errors"].append(repr(exc))
         print(f"inworld_ws_smoke_exception error={exc!r}", flush=True)
@@ -1828,10 +1873,12 @@ async def inworld_ws_smoke_test(request: Request) -> JSONResponse:
     session_update_sent = False
     prompt_sent = False
     response_create_sent = False
-    deadline = time.monotonic() + 15.0
+    transcript_deltas: list[str] = []
+    # Vision inference is slower than the text hello: give image runs longer.
+    deadline = time.monotonic() + (25.0 if image_mode else 15.0)
 
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30 if image_mode else 20)) as session:
             async with session.ws_connect(
                 settings.connection_url,
                 headers=settings.auth_headers,
@@ -1864,11 +1911,18 @@ async def inworld_ws_smoke_test(request: Request) -> JSONResponse:
                         if event_type == "session.updated":
                             result["session_updated"] = True
                             if not prompt_sent:
-                                await ws.send_json(build_conversation_item_create("Say hello in one short sentence."))
+                                if image_mode:
+                                    await ws.send_json(
+                                        build_image_conversation_item_create(
+                                            _WS_SMOKE_TEST_IMAGE_DATA_URL, prompt_text
+                                        )
+                                    )
+                                else:
+                                    await ws.send_json(build_conversation_item_create(prompt_text))
                                 prompt_sent = True
 
                         if event_type == "conversation.item.done" and prompt_sent and not response_create_sent:
-                            await ws.send_json(build_response_create("Say hello in one short sentence."))
+                            await ws.send_json(build_response_create(prompt_text))
                             response_create_sent = True
                             result["response_created"] = True
                             print("inworld_ws_smoke_response_create_sent=true", flush=True)
@@ -1883,13 +1937,23 @@ async def inworld_ws_smoke_test(request: Request) -> JSONResponse:
                             print(f"inworld_ws_smoke_audio_delta chars={chars}", flush=True)
                         elif event_type == "response.output_audio.done":
                             result["saw_audio_done"] = True
-                        elif event_type in {
-                            "response.output_audio_transcript.delta",
-                            "response.output_audio_transcript.done",
-                        }:
+                        elif event_type == "response.output_audio_transcript.delta":
                             result["saw_audio_transcript"] = True
+                            delta = payload.get("delta")
+                            if isinstance(delta, str):
+                                transcript_deltas.append(delta)
+                        elif event_type == "response.output_audio_transcript.done":
+                            result["saw_audio_transcript"] = True
+                            transcript = payload.get("transcript")
+                            if isinstance(transcript, str) and transcript.strip():
+                                # The done event carries the authoritative full
+                                # transcript; prefer it over accumulated deltas.
+                                transcript_deltas = [transcript]
                         elif event_type in {"response.output_text.done", "response.text.done"}:
                             result["saw_text_done"] = True
+                            text = payload.get("text")
+                            if isinstance(text, str) and text.strip() and not transcript_deltas:
+                                transcript_deltas = [text]
                         elif event_type == "response.done":
                             result["saw_response_done"] = True
                             break
@@ -1905,12 +1969,16 @@ async def inworld_ws_smoke_test(request: Request) -> JSONResponse:
         result["errors"].append(repr(exc))
         print(f"inworld_ws_smoke_exception error={exc!r}", flush=True)
 
+    result["response_transcript"] = "".join(transcript_deltas).strip()
+
     print(
         "inworld_ws_smoke_summary "
+        f"mode={result['mode']} "
         f"audio_delta_count={result['audio_delta_count']} "
         f"audio_delta_total_chars={result['audio_delta_total_chars']} "
         f"saw_audio_done={bool_str(bool(result['saw_audio_done']))} "
-        f"saw_response_done={bool_str(bool(result['saw_response_done']))}",
+        f"saw_response_done={bool_str(bool(result['saw_response_done']))} "
+        f"response_transcript={result['response_transcript']!r}",
         flush=True,
     )
     return JSONResponse(result)
