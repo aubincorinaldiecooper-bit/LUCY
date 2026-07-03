@@ -50,9 +50,11 @@ def load_vision_context_config() -> VisionContextConfig:
     return VisionContextConfig(
         enabled=(os.getenv("VISION_CONTEXT_ENABLED") or "").strip().lower() == "true",
         # Any OpenRouter model id works — swap freely for cost/quality without a
-        # code change. Defaults to the model the WS smoke test already confirmed
-        # works for image input.
-        model=(os.getenv("VISION_MODEL") or "openai/gpt-4o-mini").strip(),
+        # code change. Defaults to a Gemini flash-class model: image inputs
+        # count as only a few hundred tokens there, versus gpt-4o-mini whose
+        # per-image token multiplier makes frequent snapshots cost roughly
+        # gpt-4o prices. Same model family the repo already uses for LLM_MODEL.
+        model=(os.getenv("VISION_MODEL") or "google/gemini-2.5-flash-lite").strip(),
         api_key=(os.getenv("OPENROUTER_API_KEY") or "").strip(),
         min_interval_seconds=float(os.getenv("VISION_CONTEXT_MIN_INTERVAL_SECONDS", "12") or "12"),
         frame_sample_interval_seconds=float(os.getenv("VISION_FRAME_SAMPLE_INTERVAL_SECONDS", "2") or "2"),

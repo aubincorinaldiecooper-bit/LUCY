@@ -56,7 +56,9 @@ class LoadConfigTests(unittest.TestCase):
         env = {"VISION_CONTEXT_ENABLED": "true", "OPENROUTER_API_KEY": "k"}
         with mock.patch.dict("os.environ", env, clear=True):
             cfg = vc.load_vision_context_config()
-        self.assertEqual(cfg.model, "openai/gpt-4o-mini")
+        # Default is a Gemini flash-class model for image-token cost; see
+        # load_vision_context_config.
+        self.assertEqual(cfg.model, "google/gemini-2.5-flash-lite")
         self.assertEqual(cfg.min_interval_seconds, 12.0)
         self.assertEqual(cfg.max_frame_dimension, 512)
 
