@@ -299,10 +299,16 @@ def _run_bridge_scenario(*events, calibration_enabled=True, memory_layer=None):
             _settings(),
             dataset_writer=_FakeWriter(),
             calibration_enabled=calibration_enabled,
-            memory_layer=memory_layer,
         )
         bridge._ws = _FakeWs()
         bridge._session_ready.set()
+        # Memory now resolves lazily via a background task (see
+        # BridgeMemoryResolutionTests below for that behavior); these
+        # scenarios drive events directly without going through
+        # session.created, so simulate "already resolved" here.
+        if memory_layer is not None:
+            bridge._memory_layer = memory_layer
+            bridge._memory_resolved.set()
         for event in events:
             await bridge._handle_inworld_message(event)
         return bridge
@@ -502,6 +508,134 @@ class BridgeMemoryIntegrationTests(unittest.TestCase):
         }
         bridge = _run_bridge_scenario(answer, calibration_enabled=False, memory_layer=None)  # must not raise
         self.assertIsNone(bridge._memory_layer)
+
+
+# ---------------------------------------------------------------------------
+# Lazy memory resolution: constructing/starting the bridge must never block
+# on Postgres preload, or a fast talker's opening words get dropped while
+# nothing is listening to their mic track yet. Memory resolves exactly once,
+# the first time session.created triggers the first session.update.
+# ---------------------------------------------------------------------------
+
+
+def _fake_room():
+    return types.SimpleNamespace(
+        local_participant=types.SimpleNamespace(publish_track=lambda *a, **k: asyncio.sleep(0)),
+        remote_participants={},
+        on=lambda *a, **k: None,
+        off=lambda *a, **k: None,
+    )
+
+
+class BridgeMemoryResolutionTests(unittest.TestCase):
+    def test_construction_does_not_resolve_memory(self):
+        async def scenario():
+            async def resolve():
+                return _FakeMemoryLayer(), "what we remember"
+
+            task = asyncio.ensure_future(resolve())
+            bridge = irb.InworldRealtimeLiveKitBridge(_fake_room(), _settings(), memory_task=task)
+            bridge._ws = _FakeWs()
+            # Nothing has awaited the task yet — bridge construction (and
+            # everything track-subscription-critical inside it) is instant.
+            self.assertIsNone(bridge._memory_layer)
+            self.assertFalse(bridge._memory_resolved.is_set())
+            await bridge.aclose()
+
+        asyncio.run(scenario())
+
+    def test_session_created_resolves_memory_and_bakes_note_into_instructions(self):
+        async def scenario():
+            mem = _FakeMemoryLayer()
+
+            async def resolve():
+                return mem, "what we remember about them"
+
+            task = asyncio.ensure_future(resolve())
+            bridge = irb.InworldRealtimeLiveKitBridge(_fake_room(), _settings(), memory_task=task)
+            bridge._ws = _FakeWs()
+            await bridge._handle_inworld_message({"type": "session.created"})
+            self.assertIs(bridge._memory_layer, mem)
+            self.assertIn("what we remember about them", bridge.settings.instructions)
+            sent = bridge._ws.sent[0]
+            self.assertIn("what we remember about them", sent["session"]["instructions"])
+            await bridge.aclose()
+
+        asyncio.run(scenario())
+
+    def test_no_preload_note_leaves_instructions_unchanged(self):
+        async def scenario():
+            async def resolve():
+                return None, None
+
+            task = asyncio.ensure_future(resolve())
+            bridge = irb.InworldRealtimeLiveKitBridge(_fake_room(), _settings(), memory_task=task)
+            bridge._ws = _FakeWs()
+            base_instructions = bridge.settings.instructions
+            await bridge._handle_inworld_message({"type": "session.created"})
+            self.assertEqual(bridge.settings.instructions, base_instructions)
+            await bridge.aclose()
+
+        asyncio.run(scenario())
+
+    def test_ensure_memory_resolved_only_awaits_task_once(self):
+        async def scenario():
+            calls = {"n": 0}
+
+            async def resolve():
+                calls["n"] += 1
+                return None, None
+
+            task = asyncio.ensure_future(resolve())
+            bridge = irb.InworldRealtimeLiveKitBridge(_fake_room(), _settings(), memory_task=task)
+            bridge._ws = _FakeWs()
+            await bridge._ensure_memory_resolved()
+            await bridge._ensure_memory_resolved()
+            await bridge._ensure_memory_resolved()
+            self.assertEqual(calls["n"], 1)
+            await bridge.aclose()
+
+        asyncio.run(scenario())
+
+    def test_aclose_before_resolution_cancels_task_cleanly(self):
+        async def scenario():
+            async def hanging():
+                await asyncio.sleep(30)
+                return None, None
+
+            task = asyncio.ensure_future(hanging())
+            bridge = irb.InworldRealtimeLiveKitBridge(_fake_room(), _settings(), memory_task=task)
+            bridge._ws = _FakeWs()
+            await bridge.aclose()  # must not hang or raise
+            self.assertTrue(task.cancelled())
+            self.assertIsNone(bridge._memory_layer)
+
+        asyncio.run(scenario())
+
+    def test_memory_task_exception_degrades_gracefully(self):
+        async def scenario():
+            async def boom():
+                raise RuntimeError("db exploded")
+
+            task = asyncio.ensure_future(boom())
+            bridge = irb.InworldRealtimeLiveKitBridge(_fake_room(), _settings(), memory_task=task)
+            bridge._ws = _FakeWs()
+            await bridge._handle_inworld_message({"type": "session.created"})  # must not raise
+            self.assertIsNone(bridge._memory_layer)
+            self.assertEqual(len(bridge._ws.sent), 1)  # session.update still sent
+            await bridge.aclose()
+
+        asyncio.run(scenario())
+
+    def test_no_memory_task_is_safe(self):
+        async def scenario():
+            bridge = irb.InworldRealtimeLiveKitBridge(_fake_room(), _settings())
+            bridge._ws = _FakeWs()
+            await bridge._handle_inworld_message({"type": "session.created"})  # must not raise
+            self.assertEqual(len(bridge._ws.sent), 1)
+            await bridge.aclose()
+
+        asyncio.run(scenario())
 
 
 if __name__ == "__main__":
