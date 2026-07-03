@@ -242,6 +242,19 @@ class BuilderTests(unittest.TestCase):
         self.assertTrue(update["session"]["instructions"].startswith("Be concise."))
         self.assertIn("energy low", update["session"]["instructions"])
 
+    def test_image_conversation_item_carries_image_and_text_parts(self):
+        item = irb.build_image_conversation_item_create(
+            "data:image/png;base64,AAAA", "What do you see?"
+        )
+        self.assertEqual(item["type"], "conversation.item.create")
+        self.assertEqual(item["item"]["type"], "message")
+        self.assertEqual(item["item"]["role"], "user")
+        content = item["item"]["content"]
+        self.assertEqual(
+            content[0], {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}
+        )
+        self.assertEqual(content[1], {"type": "input_text", "text": "What do you see?"})
+
 
 if __name__ == "__main__":
     unittest.main()

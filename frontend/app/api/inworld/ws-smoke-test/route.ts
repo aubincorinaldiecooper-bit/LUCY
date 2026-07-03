@@ -8,10 +8,14 @@ function getApiBase() {
   return process.env.BACKEND_API_URL || process.env.NEXT_PUBLIC_API_URL || DEFAULT_API_BASE;
 }
 
-export async function POST() {
+export async function POST(request: Request) {
   const apiBase = getApiBase();
   const upstreamUrl = new URL("/api/inworld/ws-smoke-test", apiBase).toString();
   const token = process.env.INWORLD_WS_SMOKE_TOKEN || "";
+
+  // Forward the JSON body (e.g. {"mode": "image"}) so the dev page can select
+  // smoke-test variants; an empty body keeps the default text test.
+  const body = await request.text().catch(() => "");
 
   console.log(`[inworld-ws-smoke-test-bff] POST → ${upstreamUrl}`);
 
@@ -21,7 +25,9 @@ export async function POST() {
       headers: {
         Accept: "application/json",
         Authorization: `Bearer ${token}`,
+        ...(body ? { "Content-Type": "application/json" } : {}),
       },
+      ...(body ? { body } : {}),
       cache: "no-store",
     });
 
