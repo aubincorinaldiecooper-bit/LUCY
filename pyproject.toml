@@ -20,6 +20,10 @@ dependencies = [
   # SDK (httpx/pydantic, no ML libs). OpenAI embeddings use the already-present
   # openai SDK, so no extra dep there.
   "cohere>=5",
+  # Downscale + JPEG-encode sampled camera frames for vision_context.py. Pure
+  # C-extension imaging library, no ML/GPU weight — unlike the memory extra
+  # below, safe to keep in the default image.
+  "pillow>=10",
 ]
 
 [project.optional-dependencies]

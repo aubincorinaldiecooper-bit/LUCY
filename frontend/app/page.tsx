@@ -19,7 +19,7 @@ function HomePage() {
     setHadCall(true);
   }, []);
 
-  const { state, connect, disconnect, toggleMute, isMuted } = useVoiceClient({
+  const { state, connect, disconnect, toggleMute, isMuted, toggleCamera, isCameraOn } = useVoiceClient({
     onServerDisconnect: handleServerDisconnect,
   });
 
@@ -84,6 +84,8 @@ function HomePage() {
             onToggleMute={() => void toggleMute()}
             onEnd={() => void handleEndCall()}
             onLeaveHome={() => void handleLeaveSession()}
+            isCameraOn={isCameraOn}
+            onToggleCamera={() => void toggleCamera()}
           />
         ) : null}
         {view === "ended" ? <EndSessionPage key="ended" onReturnHome={handleReturnHome} /> : null}

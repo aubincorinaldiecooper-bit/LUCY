@@ -122,6 +122,10 @@ export function useVoiceClient(options?: { onServerDisconnect?: () => void }) {
 
   const [isMuted, setIsMuted] = useState(false);
 
+  // Camera is strictly per-session opt-in: it always starts OFF and is reset
+  // to OFF on every disconnect — it must never carry over into the next call.
+  const [isCameraOn, setIsCameraOn] = useState(false);
+
   const roomRef = useRef<Room | null>(null);
 
   const connectAttemptRef = useRef(0);
@@ -403,6 +407,8 @@ export function useVoiceClient(options?: { onServerDisconnect?: () => void }) {
 
       setIsMuted(false);
 
+      setIsCameraOn(false);
+
       return;
 
     }
@@ -416,6 +422,8 @@ export function useVoiceClient(options?: { onServerDisconnect?: () => void }) {
     setState("idle");
 
     setIsMuted(false);
+
+    setIsCameraOn(false);
 
   }, [clearRemoteAudioElements]);
 
@@ -467,6 +475,8 @@ export function useVoiceClient(options?: { onServerDisconnect?: () => void }) {
         roomRef.current = null;
 
         setState("idle");
+
+        setIsCameraOn(false);
 
         // Server/agent ended the room (e.g. session time limit) rather than the
 
@@ -800,6 +810,41 @@ export function useVoiceClient(options?: { onServerDisconnect?: () => void }) {
   }, [isMuted]);
 
 
+  // Publishes/unpublishes the camera track over the existing LiveKit room. The
+
+  // agent-side bridge samples it for vision context only when the backend's
+
+  // VISION_CONTEXT_ENABLED flag is on; with it off a published track is ignored.
+
+  const toggleCamera = useCallback(async () => {
+
+    const room = roomRef.current;
+
+    if (!room) return;
+
+    const next = !isCameraOn;
+
+    try {
+
+      await room.localParticipant.setCameraEnabled(next);
+
+      setIsCameraOn(next);
+
+    } catch (err) {
+
+      // Permission denied / no camera: stay off rather than showing a lying
+
+      // "camera on" state.
+
+      console.warn("Failed to toggle camera", err);
+
+      setIsCameraOn(false);
+
+    }
+
+  }, [isCameraOn]);
+
+
   useEffect(() => () => {
 
     clearRemoteAudioElements();
@@ -809,7 +854,7 @@ export function useVoiceClient(options?: { onServerDisconnect?: () => void }) {
   }, [clearRemoteAudioElements, disconnect]);
 
 
-  return { state, connect, disconnect, toggleMute, isMuted };
+  return { state, connect, disconnect, toggleMute, isMuted, toggleCamera, isCameraOn };
 
 }
 
