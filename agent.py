@@ -4259,28 +4259,6 @@ def _metadata_keys(value: Any) -> list[str]:
     return []
 
 
-def _metadata_debug_entries_from_context(ctx: JobContext) -> list[tuple[str, Any]]:
-    entries: list[tuple[str, Any]] = []
-    for attr_name in ("job", "room"):
-        obj = _safe_attr(ctx, attr_name)
-        metadata = _safe_attr(obj, "metadata")
-        entries.append((f"{attr_name}.metadata", metadata))
-
-    job = _safe_attr(ctx, "job")
-    for attr_name in ("participant", "participant_info"):
-        participant = _safe_attr(job, attr_name)
-        metadata = _safe_attr(participant, "metadata")
-        entries.append((f"job.{attr_name}.metadata", metadata))
-
-    room = _safe_attr(ctx, "room")
-    remote_participants = _safe_attr(room, "remote_participants")
-    if isinstance(remote_participants, dict):
-        for participant_id, participant in remote_participants.items():
-            metadata = _safe_attr(participant, "metadata")
-            entries.append((f"room.remote_participants.{participant_id}.metadata", metadata))
-    return entries
-
-
 def _chat_ctx_items(chat_ctx: object) -> list[object]:
     """Return a safe, concrete message list from LiveKit chat context shapes."""
     if chat_ctx is None:
@@ -5044,32 +5022,6 @@ def _search_policy_for_intent(intent: str | None, clarification_suggested: bool)
     return True, "llm_tool_call"
 
 
-def _metadata_candidates_from_context(ctx: JobContext) -> list[Any]:
-    candidates: list[Any] = []
-    for attr_name in ("job", "room"):
-        obj = _safe_attr(ctx, attr_name)
-        metadata = _safe_attr(obj, "metadata")
-        if metadata:
-            candidates.append(metadata)
-
-    job = _safe_attr(ctx, "job")
-    for attr_name in ("participant", "participant_info"):  # wrapper versions differ
-        participant = _safe_attr(job, attr_name)
-        metadata = _safe_attr(participant, "metadata")
-        if metadata:
-            candidates.append(metadata)
-
-    room = _safe_attr(ctx, "room")
-    remote_participants = _safe_attr(room, "remote_participants")
-    if isinstance(remote_participants, dict):
-        for participant in remote_participants.values():
-            metadata = _safe_attr(participant, "metadata")
-            if metadata:
-                candidates.append(metadata)
-
-    return candidates
-
-
 class LucyAgent(Agent):
     def __init__(
         self,
@@ -5241,23 +5193,32 @@ def _metadata_keys(value: Any) -> list[str]:
 
 
 def _metadata_debug_entries_from_context(ctx: JobContext) -> list[tuple[str, Any]]:
+    """Every job/room/participant metadata source, labeled, for startup logging.
+
+    Uses plain ``getattr`` rather than ``_safe_attr``: ``_safe_attr`` is a
+    logging helper that ``str()``-converts whatever it fetches, so chaining it
+    (``_safe_attr(_safe_attr(ctx, "job"), "metadata")``) calls ``getattr`` on
+    the *stringified* job object, which always fails and silently falls back
+    to the "n/a" default. That previously meant every entry here — and every
+    identity resolved from it via identity_from_metadata() — was fed the
+    literal string "n/a" instead of real metadata.
+    """
     entries: list[tuple[str, Any]] = []
-    for attr_name in ("job", "room"):
-        obj = _safe_attr(ctx, attr_name)
-        metadata = _safe_attr(obj, "metadata")
+    job = getattr(ctx, "job", None)
+    room = getattr(ctx, "room", None)
+    for attr_name, obj in (("job", job), ("room", room)):
+        metadata = getattr(obj, "metadata", None)
         entries.append((f"{attr_name}.metadata", metadata))
 
-    job = _safe_attr(ctx, "job")
     for attr_name in ("participant", "participant_info"):
-        participant = _safe_attr(job, attr_name)
-        metadata = _safe_attr(participant, "metadata")
+        participant = getattr(job, attr_name, None)
+        metadata = getattr(participant, "metadata", None)
         entries.append((f"job.{attr_name}.metadata", metadata))
 
-    room = _safe_attr(ctx, "room")
-    remote_participants = _safe_attr(room, "remote_participants")
+    remote_participants = getattr(room, "remote_participants", None)
     if isinstance(remote_participants, dict):
         for participant_id, participant in remote_participants.items():
-            metadata = _safe_attr(participant, "metadata")
+            metadata = getattr(participant, "metadata", None)
             entries.append((f"room.remote_participants.{participant_id}.metadata", metadata))
     return entries
 
@@ -5764,32 +5725,6 @@ def _search_policy_for_intent(intent: str | None, clarification_suggested: bool)
     if SEARCH_REQUIRE_EXPLICIT_INTENT:
         return False, "blocked_no_explicit_search_intent"
     return True, "llm_tool_call"
-
-
-def _metadata_candidates_from_context(ctx: JobContext) -> list[Any]:
-    candidates: list[Any] = []
-    for attr_name in ("job", "room"):
-        obj = _safe_attr(ctx, attr_name)
-        metadata = _safe_attr(obj, "metadata")
-        if metadata:
-            candidates.append(metadata)
-
-    job = _safe_attr(ctx, "job")
-    for attr_name in ("participant", "participant_info"):  # wrapper versions differ
-        participant = _safe_attr(job, attr_name)
-        metadata = _safe_attr(participant, "metadata")
-        if metadata:
-            candidates.append(metadata)
-
-    room = _safe_attr(ctx, "room")
-    remote_participants = _safe_attr(room, "remote_participants")
-    if isinstance(remote_participants, dict):
-        for participant in remote_participants.values():
-            metadata = _safe_attr(participant, "metadata")
-            if metadata:
-                candidates.append(metadata)
-
-    return candidates
 
 
 class LucyAgent(Agent):
@@ -7574,7 +7509,7 @@ def _realtime_metadata_candidates(ctx: JobContext) -> list[Any]:
     return candidates
 
 
-def _realtime_room_name(ctx: JobContext) -> str | None:
+def _room_name_from_context(ctx: JobContext) -> str | None:
     room = getattr(ctx, "room", None)
     name = getattr(room, "name", None)
     return name if isinstance(name, str) and name.strip() else None
@@ -7598,7 +7533,7 @@ async def _build_memory_layer_for_realtime(ctx: JobContext) -> tuple[MemoryLayer
         return None, None
     try:
         metadata_candidates = _realtime_metadata_candidates(ctx)
-        room_name = _realtime_room_name(ctx)
+        room_name = _room_name_from_context(ctx)
         memory_identity = identity_from_metadata(metadata_candidates, fallback_guest_id=room_name)
         memory_layer_instance = MemoryLayer(memory_identity)
         try:
@@ -8160,7 +8095,7 @@ async def entrypoint(ctx: JobContext):
     )
 
     global _active_memory_layer, _inworld_voice_profile_shadow, _calibration_session_id, _active_agent_session
-    _calibration_session_id = str(_safe_attr(_safe_attr(ctx, "room"), "name") or "unknown")
+    _calibration_session_id = _room_name_from_context(ctx) or "unknown"
     logger.info(
         "tts_runtime_selection hume_active=%s tts_provider=%s",
         TTS_PROVIDER == "hume",
@@ -8179,7 +8114,7 @@ async def entrypoint(ctx: JobContext):
     memory_layer_instance: MemoryLayer | None = None
     memory_preload_note: str | None = None
     if memory_enabled():
-        room_name = _safe_attr(_safe_attr(ctx, "room"), "name") or None
+        room_name = _room_name_from_context(ctx)
         memory_identity = identity_from_metadata(metadata_candidates, fallback_guest_id=room_name)
         memory_layer_instance = MemoryLayer(memory_identity)
         try:
