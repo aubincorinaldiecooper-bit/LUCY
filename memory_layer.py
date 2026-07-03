@@ -501,7 +501,14 @@ class MemoryLayer:
         task.add_done_callback(_on_done)
 
     async def _remember(self, role: str, content: str, turn_id: int | None, modality: str, media_url: str | None) -> None:
-        compact = f"{'User said' if role == 'user' else 'Lucy replied'}: {content}"
+        # A structured note (currently only confirmed emotional-calibration
+        # patterns) must round-trip through preload() -> partition_emotional_patterns()
+        # with EMOTIONAL_PATTERN_PREFIX still at the very start, so it is stored
+        # verbatim rather than wrapped in "User said/Lucy replied".
+        if content.startswith(EMOTIONAL_PATTERN_PREFIX):
+            compact = content
+        else:
+            compact = f"{'User said' if role == 'user' else 'Lucy replied'}: {content}"
         try:
             await self._embed_and_store(compact, role, turn_id, modality, media_url)
         except Exception as exc:

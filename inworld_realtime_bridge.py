@@ -36,7 +36,7 @@ import json
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 from urllib.parse import urlencode
 
@@ -47,8 +47,10 @@ from emotional_dataset import (
     CalibrationTracker,
     EmotionalDatasetWriter,
     build_emotional_dataset_writer_from_env,
+    remember_confirmed_pattern,
 )
 from inworld_voice_profile import NormalizedVoiceProfile, normalize_from_message
+from memory_layer import MemoryLayer
 
 logger = logging.getLogger(__name__)
 
@@ -419,7 +421,6 @@ _LOG_ONLY_EVENT_TYPES = {
     "response.content_part.added",
     "response.content_part.done",
     "response.output_audio_transcript.delta",
-    "response.output_audio_transcript.done",
     "response.output_audio.done",
     "response.output_text.delta",
     "response.output_text.done",
@@ -447,6 +448,7 @@ class InworldRealtimeLiveKitBridge:
         *,
         dataset_writer: EmotionalDatasetWriter | None = None,
         calibration_enabled: bool = False,
+        memory_layer: MemoryLayer | None = None,
     ) -> None:
         self.room = room
         self.settings = settings
@@ -472,6 +474,11 @@ class InworldRealtimeLiveKitBridge:
             CalibrationTracker(session_id=settings.session_id) if calibration_enabled else None
         )
         self._active_calibration_question: str | None = None
+        # Long-term memory (preloaded/closed by the caller); None when
+        # MEMORY_ENABLED=false or identity resolution failed. A simple
+        # per-session counter stands in for the legacy pipeline's turn id.
+        self._memory_layer = memory_layer
+        self._turn_counter = 0
 
     async def run(self) -> None:
         started_at = time.monotonic()
@@ -658,7 +665,23 @@ class InworldRealtimeLiveKitBridge:
                 len(transcript),
             )
             if transcript:
+                self._turn_counter += 1
+                if self._memory_layer is not None:
+                    self._memory_layer.schedule_remember(
+                        role="user", content=transcript, turn_id=self._turn_counter
+                    )
                 await self._on_user_transcript(transcript)
+
+        elif msg_type == "response.output_audio_transcript.done":
+            transcript = str(payload.get("transcript") or "")
+            logger.info(
+                "inworld_assistant_transcript_done=true transcript_length=%s",
+                len(transcript),
+            )
+            if transcript and self._memory_layer is not None:
+                self._memory_layer.schedule_remember(
+                    role="assistant", content=transcript, turn_id=self._turn_counter
+                )
 
         elif msg_type == "response.done":
             logger.info(
@@ -780,11 +803,13 @@ class InworldRealtimeLiveKitBridge:
         if completed is not None:
             if self._dataset_writer is not None:
                 self._dataset_writer.record_calibration_moment(completed)
+            remember_confirmed_pattern(self._memory_layer, completed)
             logger.info(
-                "emotional_calibration_moment_stored=true session_id=%s user_answer_present=%s dataset_write=%s",
+                "emotional_calibration_moment_stored=true session_id=%s user_answer_present=%s dataset_write=%s memory_write=%s",
                 completed.get("session_id"),
                 bool(str(completed.get("user_answer") or "").strip()),
                 self._dataset_writer is not None,
+                self._memory_layer is not None and bool(completed.get("user_confirmed_or_corrected")),
             )
             if self._active_calibration_question is not None:
                 self._active_calibration_question = None
@@ -870,20 +895,33 @@ class InworldRealtimeLiveKitBridge:
         )
 
 
-async def run_inworld_realtime_bridge(room: rtc.Room, *, instructions: str | None = None) -> None:
+async def run_inworld_realtime_bridge(
+    room: rtc.Room,
+    *,
+    instructions: str | None = None,
+    memory_layer: MemoryLayer | None = None,
+    memory_preload_note: str | None = None,
+) -> None:
     settings = load_inworld_realtime_settings(instructions=instructions)
+    if memory_preload_note:
+        # Preload note is baked into the *initial* instructions (unlike the
+        # voice-context/calibration notes, which arrive later via a partial
+        # session.update) — it's stable for the session and known up front.
+        settings = replace(settings, instructions=f"{settings.instructions}\n\n{memory_preload_note}")
     dataset_writer = build_emotional_dataset_writer_from_env()
     calibration_enabled = _env_bool("EMOTIONAL_CALIBRATION_REALTIME_ENABLED", False)
     logger.info(
-        "emotional_dataset_wiring dataset_writer_active=%s calibration_enabled=%s",
+        "emotional_dataset_wiring dataset_writer_active=%s calibration_enabled=%s memory_layer_active=%s",
         dataset_writer is not None,
         calibration_enabled,
+        memory_layer is not None,
     )
     bridge = InworldRealtimeLiveKitBridge(
         room,
         settings,
         dataset_writer=dataset_writer,
         calibration_enabled=calibration_enabled,
+        memory_layer=memory_layer,
     )
     if dataset_writer is not None:
         dataset_writer.start()
@@ -892,3 +930,5 @@ async def run_inworld_realtime_bridge(room: rtc.Room, *, instructions: str | Non
     finally:
         if dataset_writer is not None:
             await dataset_writer.aclose()
+        if memory_layer is not None:
+            await memory_layer.aclose()

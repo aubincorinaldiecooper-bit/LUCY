@@ -32,6 +32,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from memory_layer import EMOTIONAL_PATTERN_PREFIX
+
 logger = logging.getLogger(__name__)
 
 MAX_QUEUE_ROWS = 200
@@ -263,6 +265,54 @@ def calibration_question_for(transcript: str, profile: Any) -> tuple[str | None,
     if profile.energy == "low":
         return "Does saying that out loud make it feel clearer, or heavier?", "low_energy_reflection"
     return None, "no_matching_calibration_prompt"
+
+
+def format_confirmed_pattern_content(pattern: str, user_answer: str) -> str:
+    """Build the durable-memory content string for a confirmed pattern.
+
+    Always starts with EMOTIONAL_PATTERN_PREFIX (required for
+    MemoryLayer.preload() -> partition_emotional_patterns() to file this under
+    "what we've learned" rather than general memory) and, when present,
+    includes the user's own words — that's the actual ground truth, not just
+    our internal energy/tension/certainty labels.
+    """
+    content = f"{EMOTIONAL_PATTERN_PREFIX}{pattern}"
+    user_answer = (user_answer or "").strip()
+    if user_answer:
+        content += f" — user said: {user_answer}"
+    return content
+
+
+def remember_confirmed_pattern(memory_layer: Any, moment: dict[str, Any]) -> None:
+    """Best-effort durable write of a user-confirmed emotional pattern.
+
+    No-ops for a missing memory layer, an unconfirmed/corrected-away moment, or
+    an empty inferred pattern. Shared by the legacy pipeline (agent.py) and the
+    Inworld Realtime bridge so a confirmed calibration moment informs future
+    sessions via the same MemoryLayer.preload() path either way. Never raises —
+    a memory write must not break the turn that triggered it.
+    """
+    if memory_layer is None or not moment.get("user_confirmed_or_corrected"):
+        return
+    pattern = str(moment.get("inferred_emotional_pattern") or "").strip()
+    if not pattern or pattern == "none":
+        return
+    turn_id_raw = moment.get("turn_id")
+    try:
+        turn_id = int(turn_id_raw) if turn_id_raw not in (None, "") else None
+    except (TypeError, ValueError):
+        turn_id = None
+    try:
+        memory_layer.schedule_remember(
+            role="emotional_calibration",
+            content=format_confirmed_pattern_content(pattern, str(moment.get("user_answer") or "")),
+            turn_id=turn_id,
+        )
+    except Exception as exc:  # noqa: BLE001 - memory write must never break the turn
+        logger.warning(
+            "emotional_calibration_pattern_remember_failed=true error_type=%s error=%s",
+            type(exc).__name__, exc,
+        )
 
 
 @dataclass
