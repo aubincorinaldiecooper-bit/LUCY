@@ -312,7 +312,7 @@ class VisionMemoryTests(unittest.TestCase):
             session._latest_video_frame_data_url = "data:image/jpeg;base64,AAAA"
             summary_iter = iter(summaries)
 
-            async def fake_describe(frame, config):
+            async def fake_describe(frame, config, on_usage=None):
                 return next(summary_iter)
 
             with mock.patch.object(irb, "describe_frame", fake_describe):

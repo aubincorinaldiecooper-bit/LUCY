@@ -20,8 +20,11 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
+from typing import Any, Callable
 
 import aiohttp
+
+from openrouter_metering import openrouter_usage_body
 
 logger = logging.getLogger(__name__)
 
@@ -69,11 +72,20 @@ def load_vision_context_config() -> VisionContextConfig:
     )
 
 
-async def describe_frame(image_data_url: str, config: VisionContextConfig) -> str | None:
+async def describe_frame(
+    image_data_url: str,
+    config: VisionContextConfig,
+    on_usage: Callable[[Any], None] | None = None,
+) -> str | None:
     """Return a short neutral description, or None on any failure/misconfig.
 
     Best-effort only — never raises. A vision-context miss must never affect
     the voice turn in progress.
+
+    ``on_usage`` (optional) is handed the raw OpenRouter response dict whenever
+    the call reaches the API, so a caller can meter spend. It is invoked even
+    when the content can't be parsed (money was still spent) and any exception
+    it raises is swallowed — metering never affects the vision result.
     """
     if not config.enabled or not image_data_url:
         return None
@@ -101,6 +113,9 @@ async def describe_frame(image_data_url: str, config: VisionContextConfig) -> st
         # A one-sentence answer needs very few tokens; keeps per-call cost low
         # regardless of which model is configured.
         "max_tokens": 60,
+        # Ask OpenRouter to return the charged cost in the response usage block
+        # so spend metering has real numbers, not just token counts.
+        **openrouter_usage_body(),
     }
 
     try:
@@ -120,6 +135,12 @@ async def describe_frame(image_data_url: str, config: VisionContextConfig) -> st
             "vision_context_call_exception=true error_type=%s error=%s", type(exc).__name__, exc
         )
         return None
+
+    if on_usage is not None:
+        try:
+            on_usage(data)
+        except Exception:  # noqa: BLE001 - metering must never affect the result
+            pass
 
     try:
         content = data["choices"][0]["message"]["content"]

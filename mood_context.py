@@ -27,8 +27,11 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
+from typing import Any, Callable
 
 import aiohttp
+
+from openrouter_metering import openrouter_usage_body
 
 logger = logging.getLogger(__name__)
 
@@ -85,12 +88,20 @@ def build_mood_user_message(transcript: str, vocal_summary: str | None) -> str:
 
 
 async def describe_mood(
-    transcript: str, vocal_summary: str | None, config: MoodContextConfig
+    transcript: str,
+    vocal_summary: str | None,
+    config: MoodContextConfig,
+    on_usage: Callable[[Any], None] | None = None,
 ) -> str | None:
     """Return a one-sentence human mood read, or None on failure/misconfig/neutral.
 
     Best-effort only — never raises. A mood-context miss must never affect the
     voice turn in progress.
+
+    ``on_usage`` (optional) is handed the raw OpenRouter response dict whenever
+    the call reaches the API, so a caller can meter spend. It is invoked even
+    when nothing usable comes back (money was still spent) and any exception it
+    raises is swallowed — metering never affects the mood result.
     """
     transcript = (transcript or "").strip()
     if not config.enabled or not transcript:
@@ -114,6 +125,9 @@ async def describe_mood(
         ],
         # One sentence — keeps per-call cost low regardless of model.
         "max_tokens": 80,
+        # Ask OpenRouter to return the charged cost in the response usage block
+        # so spend metering has real numbers, not just token counts.
+        **openrouter_usage_body(),
     }
 
     try:
@@ -133,6 +147,12 @@ async def describe_mood(
             "mood_context_call_exception=true error_type=%s error=%s", type(exc).__name__, exc
         )
         return None
+
+    if on_usage is not None:
+        try:
+            on_usage(data)
+        except Exception:  # noqa: BLE001 - metering must never affect the result
+            pass
 
     try:
         content = data["choices"][0]["message"]["content"]

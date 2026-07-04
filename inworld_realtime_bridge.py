@@ -63,6 +63,7 @@ from mood_context import (
     describe_mood,
     load_mood_context_config,
 )
+from openrouter_metering import SpendMeter
 from vision_context import (
     VisionContextConfig,
     build_vision_context_note,
@@ -824,6 +825,11 @@ class ArcheRealtimeSession:
         self.latest_mood_summary: str | None = None
         self._last_mood_context_sent_at = 0.0
         self._mood_call_in_flight = False
+        # OpenRouter spend metering: one persisted row per vision/mood call,
+        # attributed to the user (billing key) and session. Off unless
+        # OPENROUTER_METERING_ENABLED=true (and DATABASE_URL set); inert
+        # otherwise. user_ref is set lazily once memory identity resolves.
+        self._spend_meter = SpendMeter(session_id=settings.session_id)
 
     @property
     def vision_enabled(self) -> bool:
@@ -890,6 +896,13 @@ class ArcheRealtimeSession:
                     type(exc).__name__, exc,
                 )
                 self._memory_layer, self._memory_preload_note = None, None
+        # Attribute metered spend to the resolved billing key (durable per-user
+        # identity), if any. Guest/anonymous sessions stay user_ref=None and are
+        # metered by session_id alone. Read defensively: reading an identity
+        # must never crash memory resolution / the turn.
+        identity = getattr(self._memory_layer, "identity", None)
+        if identity is not None and getattr(identity, "present", False):
+            self._spend_meter.user_ref = identity.key
         self._memory_resolved.set()
 
     async def run(self) -> None:
@@ -970,6 +983,10 @@ class ArcheRealtimeSession:
                 await self._memory_layer.aclose()
             except Exception:
                 pass
+        try:
+            await self._spend_meter.aclose()
+        except Exception:
+            pass
         try:
             await self.transport.aclose()
         except Exception:
@@ -1294,7 +1311,13 @@ class ArcheRealtimeSession:
             frame = self._latest_video_frame_data_url
             if frame is None:
                 return
-            summary = await describe_frame(frame, self._vision_config)
+            summary = await describe_frame(
+                frame,
+                self._vision_config,
+                on_usage=lambda data: self._spend_meter.record_from_response(
+                    "vision", self._vision_config.model, data
+                ),
+            )
             if not summary:
                 return
             self.latest_vision_summary = summary
@@ -1345,7 +1368,14 @@ class ArcheRealtimeSession:
 
     async def _run_mood_context_update(self, transcript: str, vocal_summary: str | None) -> None:
         try:
-            summary = await describe_mood(transcript, vocal_summary, self._mood_config)
+            summary = await describe_mood(
+                transcript,
+                vocal_summary,
+                self._mood_config,
+                on_usage=lambda data: self._spend_meter.record_from_response(
+                    "mood", self._mood_config.model, data
+                ),
+            )
             if not summary:
                 return
             self.latest_mood_summary = summary

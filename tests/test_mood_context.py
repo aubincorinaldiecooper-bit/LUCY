@@ -170,6 +170,30 @@ class DescribeMoodTests(unittest.TestCase):
         self.assertIn("x" * 100, sent)
         self.assertNotIn("x" * 200, sent)
 
+    def test_request_asks_openrouter_for_cost_accounting(self):
+        session = _FakeSession(response=_reply("A read."))
+        with _patch_aiohttp(session):
+            asyncio.run(mc.describe_mood("hi", "energy low", _config()))
+        self.assertEqual(session.last_request["json"]["usage"], {"include": True})
+
+    def test_on_usage_receives_raw_response_for_metering(self):
+        body = {"choices": [{"message": {"content": "A read."}}], "usage": {"cost": 0.002}}
+        session = _FakeSession(response=_FakeResponse(200, json_body=body))
+        seen = []
+        with _patch_aiohttp(session):
+            asyncio.run(mc.describe_mood("hi", "energy low", _config(), on_usage=seen.append))
+        self.assertEqual(seen, [body])
+
+    def test_on_usage_exception_never_breaks_the_result(self):
+        session = _FakeSession(response=_reply("A read."))
+
+        def boom(_data):
+            raise RuntimeError("metering blew up")
+
+        with _patch_aiohttp(session):
+            result = asyncio.run(mc.describe_mood("hi", "energy low", _config(), on_usage=boom))
+        self.assertEqual(result, "A read.")
+
 
 class BuildNoteTests(unittest.TestCase):
     def test_note_carries_summary_and_forbids_you_sound(self):
