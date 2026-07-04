@@ -37,6 +37,8 @@ import re
 import time
 from typing import Any
 
+from dataclasses import replace as _dc_replace
+
 from inworld_realtime_bridge import (
     ArcheRealtimeSession,
     ArcheTransport,
@@ -50,6 +52,7 @@ from memory_layer import (
     memory_enabled,
     partition_emotional_patterns,
 )
+from vision_context import load_vision_context_config
 
 logger = logging.getLogger(__name__)
 
@@ -245,6 +248,13 @@ async def handle_realtime_api_websocket(websocket: Any) -> None:
         transport,
         dataset_writer=dataset_writer,
         memory_task=memory_task,
+        # Force-enable vision for API sessions: a client explicitly sending an
+        # input_image IS the opt-in, so the realtime speech+vision API must not
+        # depend on VISION_CONTEXT_ENABLED (which gates the product's *ambient*
+        # camera capture — a different consent model). All other vision knobs
+        # (model, rate limit, frame size, VISION_MEMORY_ENABLED) still come from
+        # env, so cost bounds and memory-persistence choice are unchanged.
+        vision_config=_dc_replace(load_vision_context_config(), enabled=True),
     )
     if dataset_writer is not None:
         dataset_writer.start()

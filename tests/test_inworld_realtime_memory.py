@@ -106,7 +106,6 @@ class BuildMemoryLayerForRealtimeTests(unittest.IsolatedAsyncioTestCase):
             return []
 
         orig_preload = MemoryLayer.preload
-        orig_timeout = asyncio.wait_for
         MemoryLayer.preload = hanging_preload
         try:
             # Patch wait_for's effective timeout by monkeypatching asyncio.wait_for

@@ -9,7 +9,6 @@ import time
 import hashlib
 import re
 import contextvars
-import struct
 import wave
 import io
 import subprocess
@@ -22,7 +21,7 @@ import aiohttp
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from livekit.agents import Agent, AgentSession, InterruptionOptions, JobContext, StopResponse, TurnHandlingOptions, WorkerOptions, cli, function_tool, room_io, tts
+from livekit.agents import Agent, AgentSession, InterruptionOptions, JobContext, StopResponse, TurnHandlingOptions, WorkerOptions, cli, function_tool, room_io
 try:  # livekit-agents >= 1.6.1 exposes the audio end-of-turn detector here
     from livekit.agents import inference as _lk_inference
 except Exception:  # pragma: no cover - older SDKs
@@ -60,7 +59,7 @@ from interaction_state import (
     classify_turn_kind,
 )
 from memory_layer import (
-    EMOTIONAL_PATTERN_PREFIX,
+    EMOTIONAL_PATTERN_PREFIX,  # noqa: F401 - re-exported for calibration tests + callers
     MemoryLayer,
     emotional_pattern_preload_note,
     identity_from_metadata,
@@ -75,9 +74,7 @@ from runtime_context import (
     runtime_context_from_metadata,
 )
 from transcript_context import (
-    ADDITIVE_FAMILY,
     ContextDecision,
-    ContextResolution,
     TranscriptContext,
     build_context_decision,
     call_transcript_context_llm,
@@ -91,7 +88,6 @@ from transcript_context import (
     require_context_resolution_for_tool_authority,
     resolve_transcript_context,
     tool_revalidation_additive_min_dependency,
-    tool_revalidation_context_classifier_max_wait_ms,
     transcript_context_debug,
     transcript_context_layer_enabled,
     transcript_context_llm_enabled,
@@ -3617,6 +3613,9 @@ def _run_db_migrations_on_startup() -> None:
 
 
 def _resolve_ai_coustics_model(model_name: str):
+    # Lazy plugin import: the legacy cascaded path pays this cost only when
+    # actually selected (VOICE_ENGINE unset), never on module import.
+    from livekit.plugins import ai_coustics
     normalized = (model_name or "").strip().upper()
     model_map = {
         "QUAIL_VF_S": ai_coustics.EnhancerModel.QUAIL_VF_S,
@@ -3683,6 +3682,9 @@ def build_audio_turn_detector() -> tuple[object, dict]:
 
 
 def build_room_options() -> room_io.RoomOptions | None:
+    # Lazy plugin import: the legacy cascaded path pays this cost only when
+    # actually selected (VOICE_ENGINE unset), never on module import.
+    from livekit.plugins import ai_coustics
     # Inbound audio enhancement is applied at the room audio_input stage, i.e.
     # BEFORE STT / VAD / turn detection. AI_COUSTICS_ENABLED remains the master
     # switch; LIVEKIT_AUDIO_ENHANCEMENT_* are the canonical config names.
@@ -3943,6 +3945,9 @@ async def _render_greeting_wav_bytes(started_at: float) -> bytes | None:
 
 
 def _build_single_tts(provider: str):
+    # Lazy plugin import: the legacy cascaded path pays this cost only when
+    # actually selected (VOICE_ENGINE unset), never on module import.
+    from livekit.plugins import deepgram, hume
     """Build a single TTS plugin instance for one provider name (no fallback)."""
     global _last_hume_model_version, _last_hume_description_applied, _last_hume_voice_present, _last_hume_voice_kind, _last_hume_instant_mode, _last_hume_speed, _last_hume_trailing_silence, _last_hume_style_context_applied, _last_hume_tts_build_started_at, _last_hume_tts_build_completed_at, _last_hume_tts_debug_http
     if provider == "deepgram":
@@ -4305,16 +4310,6 @@ def _recent_turn_previews_from_chat_ctx(chat_ctx: object, limit: int = 5) -> lis
         previews.append(f"{role}: {_redact_sensitive_text(text)[:240]}")
     return previews
 
-
-@dataclass(frozen=True)
-class TurnPolicyResult:
-    decision: str
-    classification: str
-    confidence: float
-    reason: str
-    should_start_generation: bool
-    should_merge_held_fragment: bool
-    should_clear_held_fragment: bool
 
 
 def _recent_user_messages_from_chat_ctx(chat_ctx: object, exclude_text: str = "", limit: int = 3) -> list[str]:
@@ -5022,156 +5017,6 @@ def _search_policy_for_intent(intent: str | None, clarification_suggested: bool)
     return True, "llm_tool_call"
 
 
-class LucyAgent(Agent):
-    def __init__(
-        self,
-        runtime_context: RuntimeContext | None = None,
-        memory_layer: MemoryLayer | None = None,
-        memory_preload_note: str | None = None,
-    ) -> None:
-        self.runtime_context = runtime_context
-        self.memory_layer = memory_layer
-        instruction_parts = [SYSTEM_PROMPT, RUNTIME_CAPABILITY_CONTRACT]
-        if runtime_context is not None:
-            instruction_parts.append(runtime_context.system_message)
-        if memory_preload_note:
-            instruction_parts.append(memory_preload_note)
-        instructions = "\n\n".join(part for part in instruction_parts if part)
-        super().__init__(instructions=instructions)
-
-    @function_tool(name="internet_search", description=SEARCH_TOOL_DESCRIPTION)
-    async def internet_search_tool(self, query: str, max_results: int = 5) -> str:
-        """Search the internet with Exa for current or external information."""
-        provider = search_provider()
-        disabled_reason = search_disabled_reason()
-        runtime_context = self.runtime_context
-        turn_id = _current_turn_id
-        search_allowed = _current_turn_search_allowed
-        search_allowed_reason = _current_turn_search_allowed_reason
-        current_date = runtime_context.current_date if runtime_context else None
-        current_datetime_iso = runtime_context.current_datetime_iso if runtime_context else None
-        session_timezone = runtime_context.session_timezone if runtime_context else None
-        _, freshness_applied = build_effective_search_query(query, current_date=current_date)
-        try:
-            requested_max_results = max(1, int(max_results or search_max_results()))
-        except Exception:
-            requested_max_results = search_max_results()
-        capped_max_results = min(requested_max_results, search_max_results())
-        logger.info(
-            "search_tool_called turn_id=%s search_turn_id=%s search_provider=%s search_query_original=%s search_current_date=%s search_current_datetime_iso=%s search_timezone=%s search_freshness_applied=%s search_disabled_reason=%s search_pre_ack_spoken=%s requested_max_results=%s capped_max_results=%s search_allowed_for_turn=%s search_allowed_reason=%s detected_intent=%s",
-            turn_id,
-            turn_id,
-            provider,
-            _redact_sensitive_text(query),
-            current_date or "unknown",
-            current_datetime_iso or "unknown",
-            session_timezone or "unknown",
-            freshness_applied,
-            disabled_reason or "none",
-            False,
-            max_results,
-            capped_max_results,
-            search_allowed,
-            search_allowed_reason,
-            _current_turn_transcript_intent,
-        )
-        if not search_allowed:
-            output = "I need one more detail before searching. What exactly should I look up?"
-            logger.warning(
-                "search_blocked_by_turn_policy turn_id=%s search_allowed_for_turn=%s search_allowed_reason=%s detected_intent=%s search_query_original=%s",
-                turn_id,
-                search_allowed,
-                search_allowed_reason,
-                _current_turn_transcript_intent,
-                _redact_sensitive_text(query),
-            )
-            return output
-        if disabled_reason is not None:
-            logger.warning(
-                "search_disabled_reason=%s search_provider=%s search_query_original=%s search_current_date=%s search_current_datetime_iso=%s search_timezone=%s search_freshness_applied=%s search_specific_failure_response_used=%s",
-                disabled_reason,
-                provider,
-                _redact_sensitive_text(query),
-                current_date or "unknown",
-                current_datetime_iso or "unknown",
-                session_timezone or "unknown",
-                freshness_applied,
-                True,
-            )
-            output = f"{SEARCH_DISABLED_MESSAGE} Say: {search_failure_response()}"
-            _mark_search_wait_completed(failed=True, output=output, result_handoff_spoken=False, turn_id=turn_id)
-            return output
-
-        _mark_search_wait_started(pre_ack_spoken=False, turn_id=turn_id, query=query)
-        logger.info(
-            "search_wait_started turn_id=%s search_turn_id=%s search_in_progress=%s search_started_at=%s search_pre_ack_spoken=%s search_query_original=%s search_allowed_for_turn=%s search_allowed_reason=%s",
-            turn_id,
-            _search_turn_id,
-            _search_in_progress,
-            _search_started_at,
-            _search_pre_ack_spoken,
-            _redact_sensitive_text(query),
-            search_allowed,
-            search_allowed_reason,
-        )
-        results = await internet_search(
-            query=query,
-            max_results=capped_max_results,
-            current_date=current_date,
-            current_datetime_iso=current_datetime_iso,
-            session_timezone=session_timezone,
-        )
-        if not results:
-            output = f"{SEARCH_DISABLED_MESSAGE} Say: {search_failure_response()}"
-            completion_applied = _mark_search_wait_completed(failed=True, output=output, result_handoff_spoken=False, turn_id=turn_id)
-            if not completion_applied:
-                return "Search result ignored because a newer user turn started. Do not speak this stale result."
-            logger.info(
-                "search_result_count=0 turn_id=%s search_turn_id=%s search_provider=exa search_query_original=%s search_current_date=%s search_current_datetime_iso=%s search_timezone=%s search_freshness_applied=%s search_result_handoff_spoken=%s search_wait_completed search_in_progress=%s search_failed=%s search_specific_failure_response_used=%s search_latency_seconds=%.3f",
-                turn_id,
-                _search_turn_id,
-                _redact_sensitive_text(query),
-                current_date or "unknown",
-                current_datetime_iso or "unknown",
-                session_timezone or "unknown",
-                freshness_applied,
-                False,
-                _search_in_progress,
-                _search_failed,
-                True,
-                _search_wait_elapsed_seconds(),
-            )
-        else:
-            output = format_search_results_for_voice(results, current_date=current_date, freshness_applied=freshness_applied)
-            search_elapsed = _search_wait_elapsed_seconds()
-            if search_elapsed < SEARCH_BRIDGE_MIN_DELAY_SECONDS:
-                output = output.replace(
-                    "If you did not already say a lookup bridge before the tool call, say:",
-                    "Search returned quickly; do not say a separate lookup bridge. Start with the result handoff instead of:",
-                    1,
-                )
-            completion_applied = _mark_search_wait_completed(failed=False, output=output, result_handoff_spoken=False, turn_id=turn_id)
-            if not completion_applied:
-                return "Search result ignored because a newer user turn started. Do not speak this stale result."
-            logger.info(
-                "search_result_count=%s turn_id=%s search_turn_id=%s search_provider=exa search_query_original=%s search_current_date=%s search_current_datetime_iso=%s search_timezone=%s search_freshness_applied=%s search_result_dates=%s search_result_handoff_spoken=%s search_wait_completed search_in_progress=%s search_failed=%s search_specific_failure_response_used=%s search_latency_seconds=%.3f search_bridge_min_delay_seconds=%.3f",
-                len(results),
-                turn_id,
-                _search_turn_id,
-                _redact_sensitive_text(query),
-                current_date or "unknown",
-                current_datetime_iso or "unknown",
-                session_timezone or "unknown",
-                freshness_applied,
-                ",".join(result.published_date for result in results if result.published_date) or "none",
-                False,
-                _search_in_progress,
-                _search_failed,
-                False,
-                _search_wait_elapsed_seconds(),
-                SEARCH_BRIDGE_MIN_DELAY_SECONDS,
-            )
-        return _search_result_authority_gate(output, turn_id)
 
 def _safe_metadata_preview(value: Any) -> str:
     if value is None:
@@ -6536,7 +6381,6 @@ class LucyAgent(Agent):
                     )
                     fallback_text = "One second — I’m catching up."
                 context_aware_text = _context_aware_fallback_text(reason, _current_context_dependency)
-                fallback_context_aware = context_aware_text is not None
                 if context_aware_text is not None:
                     fallback_text = context_aware_text
                     requires_repeat = False
@@ -7405,6 +7249,9 @@ class LucyAgent(Agent):
 
 
 def build_vad():
+    # Lazy plugin import: the legacy cascaded path pays this cost only when
+    # actually selected (VOICE_ENGINE unset), never on module import.
+    from livekit.plugins import ai_coustics, silero
     global _silero_initialized
     if VAD_PROVIDER == "ai_coustics":
         logger.info("Using ai-coustics VAD provider")
@@ -7420,6 +7267,9 @@ def build_vad():
 
 
 def build_stt():
+    # Lazy plugin import: the legacy cascaded path pays this cost only when
+    # actually selected (VOICE_ENGINE unset), never on module import.
+    from livekit.plugins import deepgram, mistralai
     if STT_PROVIDER == "deepgram_flux":
         logger.info("Using Deepgram Flux STT provider")
         return deepgram.STTv2(
@@ -7897,7 +7747,7 @@ async def entrypoint(ctx: JobContext):
         await _run_inworld_realtime_voice_engine(ctx)
         return
     # Import legacy plugins only when not using Inworld Realtime
-    from livekit.plugins import ai_coustics, deepgram, hume, mistralai, openai
+    from livekit.plugins import mistralai, openai
 
     _log_livekit_tts_source_inspection()
     openrouter_model = os.getenv("OPENROUTER_MODEL", OPENROUTER_DEFAULT_MODEL)
