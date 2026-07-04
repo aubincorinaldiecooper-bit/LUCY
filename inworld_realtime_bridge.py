@@ -57,6 +57,12 @@ from emotional_dataset import (
 )
 from inworld_voice_profile import NormalizedVoiceProfile, normalize_from_message
 from memory_layer import MemoryLayer
+from mood_context import (
+    MoodContextConfig,
+    build_mood_context_note,
+    describe_mood,
+    load_mood_context_config,
+)
 from vision_context import (
     VisionContextConfig,
     build_vision_context_note,
@@ -375,6 +381,7 @@ def build_instructions_session_update(
     voice_context_summary: str | None = None,
     calibration_question: str | None = None,
     vision_summary: str | None = None,
+    mood_summary: str | None = None,
 ) -> dict[str, Any]:
     """Partial session.update refreshing only the instructions.
 
@@ -390,6 +397,8 @@ def build_instructions_session_update(
         instructions = f"{instructions}\n\n{build_calibration_note(calibration_question)}"
     if vision_summary:
         instructions = f"{instructions}\n\n{build_vision_context_note(vision_summary)}"
+    if mood_summary:
+        instructions = f"{instructions}\n\n{build_mood_context_note(mood_summary)}"
     return {
         "type": "session.update",
         "session": {
@@ -805,6 +814,14 @@ class ArcheRealtimeSession:
         self._latest_video_frame_data_url: str | None = None
         self._vision_call_in_flight = False
         self._last_vision_summary_remembered: str | None = None
+        # Mood context: off unless MOOD_CONTEXT_ENABLED=true. On each completed
+        # user transcript it fuses the words + the current vocal dials into one
+        # human-style read (mood_context.describe_mood) and folds it into the
+        # session instructions. Never a conversation item; rate-limited.
+        self._mood_config: MoodContextConfig = load_mood_context_config()
+        self.latest_mood_summary: str | None = None
+        self._last_mood_context_sent_at = 0.0
+        self._mood_call_in_flight = False
 
     @property
     def vision_enabled(self) -> bool:
@@ -1032,6 +1049,9 @@ class ArcheRealtimeSession:
                         role="user", content=transcript, turn_id=self._turn_counter
                     )
                 await self._on_user_transcript(transcript)
+                # Fuse these words with the current vocal dials into a human
+                # mood read (background, rate-limited). No-op unless enabled.
+                await self._maybe_send_mood_context_update(transcript)
 
         elif msg_type == "response.output_audio_transcript.done":
             transcript = str(payload.get("transcript") or "")
@@ -1195,6 +1215,7 @@ class ArcheRealtimeSession:
             voice_context_summary=summary,
             calibration_question=self._active_calibration_question,
             vision_summary=self.latest_vision_summary,
+            mood_summary=self.latest_mood_summary,
         )
 
     async def _send_instructions_update(self, reason: str) -> bool:
@@ -1288,6 +1309,45 @@ class ArcheRealtimeSession:
             logger.info("inworld_vision_context_update_sent=true summary_length=%s", len(summary))
         finally:
             self._vision_call_in_flight = False
+
+    async def _maybe_send_mood_context_update(self, transcript: str) -> None:
+        """Kick a background mood-fusion call for a completed user turn.
+
+        Fire-and-forget and rate-limited: the OpenRouter round trip must never
+        block the receive loop. The result folds into instructions via the same
+        session.update path as voice/vision context — never a conversation item.
+        No-ops entirely unless MOOD_CONTEXT_ENABLED=true.
+        """
+        transcript = (transcript or "").strip()
+        if not self._mood_config.enabled or self._mood_call_in_flight or not transcript:
+            return
+        now = time.monotonic()
+        if now - self._last_mood_context_sent_at < self._mood_config.min_interval_seconds:
+            return
+        self._last_mood_context_sent_at = now
+        self._mood_call_in_flight = True
+        # Pair the words with the freshest vocal read, if it's recent enough to
+        # still describe this turn (same freshness bound calibration uses).
+        vocal_summary = None
+        if (
+            self.latest_voice_profile is not None
+            and time.monotonic() - self.latest_voice_profile_at <= PROFILE_FRESHNESS_SECONDS
+        ):
+            vocal_summary = self.latest_voice_profile.planner_summary()
+        task = asyncio.create_task(self._run_mood_context_update(transcript, vocal_summary))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _run_mood_context_update(self, transcript: str, vocal_summary: str | None) -> None:
+        try:
+            summary = await describe_mood(transcript, vocal_summary, self._mood_config)
+            if not summary:
+                return
+            self.latest_mood_summary = summary
+            await self._send_instructions_update(reason="mood_context")
+            logger.info("inworld_mood_context_update_sent=true summary_length=%s", len(summary))
+        finally:
+            self._mood_call_in_flight = False
 
     async def _send_session_update(self) -> None:
         if self._ws is None:
