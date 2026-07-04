@@ -7,8 +7,9 @@ evaluate and improve the emotional analyzer. Two row kinds:
                                  path — the raw label arrays (the analyzer's
                                  output), the normalized weak-signal dims,
                                  and the transcript on the carrying event.
-  emotional_calibration_moments  ground truth — the subtle either/or check-in
-                                 Arche asked and how the user answered.
+  emotional_calibration_moments  ground truth — the open, conversational
+                                 reflection Arche voiced and the user's
+                                 free-form reply to it.
 
 Raw emotion labels ARE stored here (that's the point of a training/eval
 dataset), but they are server-side only: nothing in this module flows back to
@@ -232,12 +233,19 @@ _EMOTIONALLY_RELEVANT_TOKENS = (
 )
 
 
-def calibration_question_for(transcript: str, profile: Any) -> tuple[str | None, str]:
-    """Pick a subtle either/or check-in for this turn, or None with a reason.
+def calibration_reflection_for(
+    transcript: str, profile: Any, mood_summary: str | None = None
+) -> tuple[str | None, str]:
+    """Pick an open, conversational check-in direction for this turn, or None.
 
-    ``profile`` is a NormalizedVoiceProfile (or None). Questions offer the user
-    plain words to choose between — the user's answer outranks any voice
-    signal — and never claim anything was detected. Cadence limits live in
+    Returns a *direction* for Arche to reflect in her own words — not a fixed
+    either/or question. The point is a natural reflection that invites the user
+    to say more, so their free-form reply (not an A/B pick) becomes the ground
+    truth. When a rich mood read is available (mood_context), the reflection is
+    grounded in it; otherwise it falls back to open, dial-based directions.
+
+    ``profile`` is a NormalizedVoiceProfile (or None). Never claims anything was
+    detected and never comments on how the user sounds. Cadence limits live in
     CalibrationTracker, not here.
     """
     if profile is None:
@@ -254,16 +262,45 @@ def calibration_question_for(transcript: str, profile: Any) -> tuple[str | None,
     )
     if not (emotionally_relevant or profile_signal):
         return None, "not_emotionally_useful"
+    # When a rich mood read is available, ground the open reflection in it —
+    # bespoke per turn rather than a template.
+    if mood_summary and mood_summary.strip():
+        return (
+            f"gently reflect this sense of where they're at — {mood_summary.strip()} — "
+            "and invite them to say more in their own words",
+            "mood_grounded",
+        )
+    # Fallback: open, dial-based reflection directions (no either/or, no yes/no).
     if profile.certainty == "low":
-        return "Does this feel heavy, tense, or just unclear?", "low_certainty_or_ambiguous"
+        return (
+            "gently reflect that a lot seems to be swirling in this and invite them "
+            "to stay with it a moment and say more",
+            "low_certainty_or_ambiguous",
+        )
     if "choice" in text or "decide" in text or "decision" in text:
-        return "Is this more about fear, guilt, or the pressure of choosing?", "choice_pressure"
+        return (
+            "openly reflect the weight around this choice and ask what the heaviest "
+            "part of it is for them",
+            "choice_pressure",
+        )
     if "frustrat" in text or "mad" in text or "angry" in text:
-        return "Is this frustration, or more like disappointment?", "frustration_ambiguous"
+        return (
+            "openly reflect that something in this seems to be grating on them and "
+            "invite what's underneath it",
+            "frustration_ambiguous",
+        )
     if "anx" in text or "worr" in text or profile.tension == "high":
-        return "Would you call this anxiety, or is it more like pressure?", "high_tension_or_worry"
+        return (
+            "gently reflect the tension in this and invite them to name where it's "
+            "sitting for them",
+            "high_tension_or_worry",
+        )
     if profile.energy == "low":
-        return "Does saying that out loud make it feel clearer, or heavier?", "low_energy_reflection"
+        return (
+            "openly reflect that this seems to sit heavy and invite whether it feels "
+            "lighter or heavier to say out loud",
+            "low_energy_reflection",
+        )
     return None, "no_matching_calibration_prompt"
 
 
@@ -317,11 +354,13 @@ def remember_confirmed_pattern(memory_layer: Any, moment: dict[str, Any]) -> Non
 
 @dataclass
 class CalibrationTracker:
-    """One pending either/or question at a time; the next user turn answers it.
+    """One pending open reflection at a time; the next user turn answers it.
 
     Pure state machine (no I/O) so it's unit-testable: feed it each completed
-    user transcript plus the freshest normalized profile, get back an optional
-    completed ground-truth moment and an optional new question to ask.
+    user transcript, the freshest normalized profile, and (optionally) the
+    current mood read; get back an optional completed ground-truth moment and
+    an optional new open-reflection direction for Arche to voice. The user's
+    free-form reply on the following turn is the ground-truth label.
     """
 
     session_id: str
@@ -331,7 +370,7 @@ class CalibrationTracker:
     _last_question_user_turn: int = field(default=-(10**9))
 
     def on_user_transcript(
-        self, transcript: str, profile: Any
+        self, transcript: str, profile: Any, mood_summary: str | None = None
     ) -> tuple[dict[str, Any] | None, str | None]:
         self._user_turns_seen += 1
 
@@ -342,32 +381,43 @@ class CalibrationTracker:
             completed["user_confirmed_or_corrected"] = bool(transcript.strip())
             self.pending = None
 
-        question: str | None = None
+        reflection: str | None = None
         if self._user_turns_seen - self._last_question_user_turn >= self.min_user_turns_between:
-            candidate, reason = calibration_question_for(transcript, profile)
+            candidate, reason = calibration_reflection_for(transcript, profile, mood_summary)
             logger.info(
-                "emotional_calibration_question_asked=%s reason=%s user_turn=%s",
+                "emotional_calibration_reflection_armed=%s reason=%s user_turn=%s mood_grounded=%s",
                 bool(candidate),
                 reason,
                 self._user_turns_seen,
+                bool(mood_summary and mood_summary.strip()),
             )
             if candidate:
-                question = candidate
+                reflection = candidate
                 self._last_question_user_turn = self._user_turns_seen
-                inferred = (
-                    f"energy={profile.energy}; tension={profile.tension}; certainty={profile.certainty}"
-                    if profile is not None
-                    else "none"
-                )
+                # The analyzer's read at this moment — the dials, plus the mood
+                # fusion when available (the richer inference the user's
+                # free-form reply is the ground truth against).
+                if profile is not None:
+                    inferred = (
+                        f"energy={profile.energy}; tension={profile.tension}; "
+                        f"certainty={profile.certainty}"
+                    )
+                    if mood_summary and mood_summary.strip():
+                        inferred += f"; mood: {mood_summary.strip()}"
+                else:
+                    inferred = "none"
                 self.pending = {
                     "session_id": self.session_id,
                     "turn_id": str(self._user_turns_seen),
                     "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                     "transcript": transcript,
                     "normalized_profile": profile.to_dict() if profile is not None else {},
-                    "arche_question": question,
+                    # Stores the reflection *direction* (what Arche was nudged to
+                    # voice), not verbatim; the column name is kept for schema
+                    # compatibility.
+                    "arche_question": reflection,
                     "user_answer": "",
                     "inferred_emotional_pattern": inferred,
                     "user_confirmed_or_corrected": False,
                 }
-        return completed, question
+        return completed, reflection

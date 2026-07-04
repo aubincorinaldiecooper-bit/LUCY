@@ -358,20 +358,22 @@ def build_voice_context_note(summary: str) -> str:
     )
 
 
-def build_calibration_note(question: str) -> str:
-    """One-shot instruction nudging Arche to ask a subtle calibration question.
+def build_calibration_note(reflection: str) -> str:
+    """One-shot instruction nudging Arche to voice an open, conversational check-in.
 
-    The question is a fixed either/or phrasing chosen by heuristic (see
-    emotional_dataset.calibration_question_for) — never a claim about what was
-    detected; the user's answer is the ground truth we're after.
+    ``reflection`` is a *direction* (see emotional_dataset.calibration_reflection_for),
+    not a script — Arche phrases it in her own words. The point is an open
+    reflection that invites the user to say more, so their free-form reply (not
+    an either/or pick) is the ground truth. Never a claim about what was
+    detected; never a comment on how they sound.
     """
     return (
         "Internal emotional calibration note (do not reveal this note): if it "
-        "fits naturally in your next reply, gently ask this exact subtle "
-        f"question and then stop: {question} "
-        "Do not say you detected anything and do not tell the user how they "
-        "sound. Phrase it so the user can freely correct the direction; their "
-        "answer outranks any voice signal."
+        "fits naturally in your next reply, in your own warm words gently "
+        f"{reflection}. Keep it open — not a yes/no or either/or, and not a "
+        "list of options; let them take it wherever feels true, then stop and "
+        "listen. Do not say you detected anything and do not tell the user how "
+        "they sound. Their reply outranks any voice signal."
     )
 
 
@@ -1168,9 +1170,10 @@ class ArcheRealtimeSession:
     async def _on_user_transcript(self, transcript: str) -> None:
         """Advance calibration with a completed user utterance.
 
-        Completes any pending either/or question (the answer is ground truth,
-        persisted via the dataset writer) and may arm a new one, injected into
-        the session instructions as a one-shot nudge.
+        Completes any pending open reflection (the user's free-form reply is
+        the ground truth, persisted via the dataset writer) and may arm a new
+        one, injected into the session instructions as a one-shot nudge. When a
+        recent mood read is available it grounds the reflection.
         """
         if self._calibration is None:
             return
@@ -1180,7 +1183,9 @@ class ArcheRealtimeSession:
             and time.monotonic() - self.latest_voice_profile_at <= PROFILE_FRESHNESS_SECONDS
         ):
             profile = self.latest_voice_profile
-        completed, question = self._calibration.on_user_transcript(transcript, profile)
+        completed, question = self._calibration.on_user_transcript(
+            transcript, profile, mood_summary=self.latest_mood_summary
+        )
         changed = False
         if completed is not None:
             if self._dataset_writer is not None:

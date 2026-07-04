@@ -3,10 +3,10 @@
 Pins the product rules:
   - profile captures and calibration moments are persisted through a bounded,
     best-effort background writer (never blocks, never raises into the bridge),
-  - calibration asks at most one subtle either/or question at a time, cadence
-    limited, only when emotionally useful, and the user's next utterance
-    completes the moment,
-  - the bridge injects the question as a one-shot instructions note and clears
+  - calibration voices at most one open, conversational reflection at a time,
+    cadence limited, only when emotionally useful, and the user's next free-form
+    utterance completes the moment as the ground-truth label,
+  - the bridge injects the reflection as a one-shot instructions note and clears
     it after the answer,
   - raw *detected* labels still never appear in anything sent to Inworld.
 """
@@ -152,55 +152,81 @@ def _profile(**overrides):
     return NormalizedVoiceProfile(**kwargs)
 
 
-class CalibrationQuestionTests(unittest.TestCase):
-    def test_no_profile_no_question(self):
-        question, reason = ed.calibration_question_for("i feel really worried about it", None)
-        self.assertIsNone(question)
+class CalibrationReflectionTests(unittest.TestCase):
+    def test_no_profile_no_reflection(self):
+        reflection, reason = ed.calibration_reflection_for("i feel really worried about it", None)
+        self.assertIsNone(reflection)
         self.assertEqual(reason, "no_voice_profile_context")
 
     def test_short_transcript_skipped(self):
-        question, reason = ed.calibration_question_for("i am fine", _profile())
-        self.assertIsNone(question)
+        reflection, reason = ed.calibration_reflection_for("i am fine", _profile())
+        self.assertIsNone(reflection)
         self.assertEqual(reason, "transcript_too_short")
 
     def test_neutral_and_irrelevant_skipped(self):
-        question, reason = ed.calibration_question_for(
+        reflection, reason = ed.calibration_reflection_for(
             "the weather is quite nice today", _profile(energy="medium", tension="medium")
         )
-        self.assertIsNone(question)
+        self.assertIsNone(reflection)
         self.assertEqual(reason, "not_emotionally_useful")
 
-    def test_low_certainty_question(self):
-        question, reason = ed.calibration_question_for(
+    def test_low_certainty_open_reflection(self):
+        reflection, reason = ed.calibration_reflection_for(
             "i do not really know how to say this", _profile(certainty="low")
         )
         self.assertEqual(reason, "low_certainty_or_ambiguous")
-        self.assertIn("heavy, tense, or just unclear", question)
+        # Open direction (invites more), not an either/or question.
+        self.assertIn("say more", reflection)
+        self.assertNotIn("?", reflection)
 
-    def test_high_tension_question(self):
-        question, reason = ed.calibration_question_for(
+    def test_high_tension_open_reflection(self):
+        reflection, reason = ed.calibration_reflection_for(
             "there is just so much going on right now", _profile(tension="high")
         )
         self.assertEqual(reason, "high_tension_or_worry")
-        self.assertIn("anxiety", question)
+        self.assertIn("tension", reflection)
+        self.assertNotIn("?", reflection)
+
+    def test_mood_read_grounds_the_reflection(self):
+        reflection, reason = ed.calibration_reflection_for(
+            "i feel really worried about all of this",
+            _profile(tension="high"),
+            mood_summary="says she's fine but sounds like she's holding back",
+        )
+        self.assertEqual(reason, "mood_grounded")
+        self.assertIn("holding back", reflection)
+        self.assertIn("say more", reflection)
 
 
 class CalibrationTrackerTests(unittest.TestCase):
     def test_arms_then_completes_with_next_turn(self):
         tracker = ed.CalibrationTracker(session_id="room-1")
-        completed, question = tracker.on_user_transcript(
+        completed, reflection = tracker.on_user_transcript(
             "i feel really worried about all of this", _profile(tension="high")
         )
         self.assertIsNone(completed)
-        self.assertIsNotNone(question)
-        completed, question2 = tracker.on_user_transcript("more like pressure honestly", _profile())
-        self.assertIsNone(question2)  # cadence blocks an immediate second question
+        self.assertIsNotNone(reflection)
+        completed, reflection2 = tracker.on_user_transcript("more like pressure honestly", _profile())
+        self.assertIsNone(reflection2)  # cadence blocks an immediate second reflection
+        # The user's free-form reply is the ground truth.
         self.assertEqual(completed["user_answer"], "more like pressure honestly")
         self.assertTrue(completed["user_confirmed_or_corrected"])
         self.assertEqual(completed["session_id"], "room-1")
         self.assertIn("tension=high", completed["inferred_emotional_pattern"])
 
-    def test_cadence_allows_question_after_min_turns(self):
+    def test_mood_read_enriches_inferred_pattern(self):
+        tracker = ed.CalibrationTracker(session_id="r")
+        tracker.on_user_transcript(
+            "i feel really worried about all of this",
+            _profile(tension="high"),
+            mood_summary="downplaying it, sounds worn out",
+        )
+        # The armed moment records the analyzer read INCLUDING the mood fusion.
+        self.assertIsNotNone(tracker.pending)
+        self.assertIn("tension=high", tracker.pending["inferred_emotional_pattern"])
+        self.assertIn("mood: downplaying it, sounds worn out", tracker.pending["inferred_emotional_pattern"])
+
+    def test_cadence_allows_reflection_after_min_turns(self):
         tracker = ed.CalibrationTracker(session_id="r")
         emotional = "i feel really worried about all of this"
         _, q1 = tracker.on_user_transcript(emotional, _profile(tension="high"))
