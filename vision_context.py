@@ -44,11 +44,17 @@ class VisionContextConfig:
     frame_sample_interval_seconds: float
     max_frame_dimension: int
     request_timeout_seconds: float
+    # Persist described scenes to long-term memory (deduped on exact summary)
+    # so Arche can recall objects across sessions. Default off — remembering
+    # what a camera saw is a heavier privacy commitment than remembering what
+    # was said, so it's a deliberate flag flip.
+    remember_enabled: bool = False
 
 
 def load_vision_context_config() -> VisionContextConfig:
     return VisionContextConfig(
         enabled=(os.getenv("VISION_CONTEXT_ENABLED") or "").strip().lower() == "true",
+        remember_enabled=(os.getenv("VISION_MEMORY_ENABLED") or "").strip().lower() == "true",
         # Any OpenRouter model id works — swap freely for cost/quality without a
         # code change. Defaults to a Gemini flash-class model: image inputs
         # count as only a few hundred tokens there, versus gpt-4o-mini whose
