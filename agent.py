@@ -176,7 +176,6 @@ async def _build_memory_layer_for_realtime(ctx: JobContext) -> tuple[MemoryLayer
             len(emotional_patterns),
             bool(memory_preload_note),
         )
-        asyncio.create_task(memory_layer_instance.rebuild_index_if_empty())
         _active_memory_layer = memory_layer_instance
         return memory_layer_instance, memory_preload_note
     except Exception as exc:  # noqa: BLE001 - memory setup must never block voice startup

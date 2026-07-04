@@ -1,17 +1,16 @@
-"""Long-term memory layer: Postgres as durable truth, SimpleMem (Omni) as retrieval index.
+"""Long-term memory layer: Postgres durable store with optional pgvector recall.
 
 Design (intent: voice-first, latency-protected):
-- Every remembered item is written to the existing ``memory_units`` schema in Postgres
+- Every remembered item is written to the ``memory_units`` schema in Postgres
   (guest/account scoping, TTLs, soft deletes). Postgres is the source of truth.
-- SimpleMem maintains a per-user multimodal index (text now; audio/image/video later via
-  the same Omni backend) under SIMPLEMEM_INDEX_DIR. The index is a rebuildable cache:
-  if the directory is empty (fresh container), it is re-ingested from Postgres.
-- Retrieval never blocks the turn pipeline beyond MEMORY_RETRIEVAL_TIMEOUT_MS; on
-  timeout or error it returns no memories and the turn proceeds without them.
+- Session-start preload is recency-based (most recent memories first). When
+  MEMORY_VECTOR_ENABLED=true and a pgvector-enabled Postgres is present,
+  ``retrieve(query)`` does semantic (embedding) recall instead.
+- Retrieval never blocks the turn pipeline beyond its timeout; on timeout or
+  error it returns no memories and the turn proceeds without them.
 - Writes are fire-and-forget background tasks; failures are logged, never raised.
 
-The whole layer is disabled unless MEMORY_ENABLED=true, and degrades to Postgres-only
-recency preload when the simplemem package is not installed.
+The whole layer is disabled unless MEMORY_ENABLED=true.
 """
 
 import asyncio
@@ -35,17 +34,12 @@ from typing import Any, Callable
 logger = logging.getLogger(__name__)
 
 GUEST_MEMORY_TTL_HOURS = 24
-INDEX_REBUILD_MAX_ROWS = 500
 DEFAULT_MEMORY_EMBEDDING_MODEL = "text-embedding-3-small"
 DEFAULT_MEMORY_EMBEDDING_DIMENSIONS = 1536
 
 
 class _SemanticUnavailable(Exception):
     """Internal: semantic recall can't run (no embedding) -> fall back to recency."""
-
-# Set once the "simplemem not installed" warning has been logged, so it isn't
-# repeated for every per-session MemoryLayer instance.
-_SIMPLEMEM_UNAVAILABLE_LOGGED = False
 
 
 def memory_enabled() -> bool:
@@ -87,10 +81,6 @@ def memory_preload_limit() -> int:
         return max(1, int(os.getenv("MEMORY_PRELOAD_LIMIT", "10")))
     except Exception:
         return 10
-
-
-def simplemem_index_dir() -> str:
-    return os.getenv("SIMPLEMEM_INDEX_DIR", "/data/simplemem")
 
 
 @dataclass(slots=True)
@@ -157,29 +147,6 @@ def embed_text(text: str) -> list[float]:
     return [float(v) for v in response.data[0].embedding]
 
 
-def _normalize_retrieved_items(raw: Any) -> list[str]:
-    items: list[str] = []
-    if raw is None:
-        return items
-    if isinstance(raw, str):
-        return [raw] if raw.strip() else []
-    if isinstance(raw, dict):
-        raw = raw.get("results") or raw.get("items") or raw.get("memories") or []
-    if not isinstance(raw, (list, tuple)):
-        return items
-    for entry in raw:
-        if isinstance(entry, str):
-            text = entry
-        elif isinstance(entry, dict):
-            text = entry.get("summary") or entry.get("content") or entry.get("text") or ""
-        else:
-            text = str(getattr(entry, "summary", "") or getattr(entry, "content", "") or "")
-        text = str(text).strip()
-        if text:
-            items.append(text)
-    return items
-
-
 class MemoryLayer:
     """Per-session memory facade. All public methods are safe to call when degraded."""
 
@@ -189,10 +156,8 @@ class MemoryLayer:
         session_id: str | None = None,
         companion_id: str | None = None,
         db_url: str | None = None,
-        index_dir: str | None = None,
         retrieval_timeout_ms: int | None = None,
         preload_limit: int | None = None,
-        simplemem_factory: Callable[[str], Any] | None = None,
         db_reader: Callable[[str, tuple], list[tuple]] | None = None,
         db_writer: Callable[[str, tuple], None] | None = None,
         embedder: Callable[[str], list[float]] | None = None,
@@ -205,10 +170,8 @@ class MemoryLayer:
         self.session_id = session_id
         self.companion_id = companion_id
         self._db_url = db_url if db_url is not None else os.getenv("DATABASE_URL")
-        self._index_dir = index_dir or simplemem_index_dir()
         self._retrieval_timeout_ms = retrieval_timeout_ms or memory_retrieval_timeout_ms()
         self._preload_limit = preload_limit or memory_preload_limit()
-        self._simplemem_factory = simplemem_factory or _default_simplemem_factory
         self._db_reader = db_reader or self._psycopg_reader
         self._db_writer = db_writer or self._psycopg_writer
         try:
@@ -240,8 +203,6 @@ class MemoryLayer:
             self._embedding_model = DEFAULT_MEMORY_EMBEDDING_MODEL
             self._embedding_dimensions = DEFAULT_MEMORY_EMBEDDING_DIMENSIONS
         self._vector_status = "not_checked" if self._vector_enabled else "disabled"
-        self._simplemem: Any = None
-        self._simplemem_status = "not_initialized"
         self._background_tasks: set[asyncio.Task] = set()
 
     # ---------- backends ----------
@@ -262,20 +223,6 @@ class MemoryLayer:
                 cur.execute(sql, params)
             conn.commit()
 
-
-    def _openai_embed_text(self, text: str) -> list[float]:
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise RuntimeError("OPENAI_API_KEY missing for MEMORY_VECTOR_ENABLED")
-        from openai import OpenAI
-
-        client = OpenAI(api_key=api_key)
-        response = client.embeddings.create(
-            model=self._embedding_model,
-            input=text,
-            dimensions=self._embedding_dimensions,
-        )
-        return [float(v) for v in response.data[0].embedding]
 
     @staticmethod
     def _vector_literal(values: list[float]) -> str:
@@ -313,31 +260,6 @@ class MemoryLayer:
 
     async def _embed_text(self, text: str) -> list[float]:
         return await asyncio.to_thread(self._embedder, text)
-
-    def _get_simplemem(self) -> Any:
-        if self._simplemem is not None or self._simplemem_status in {"unavailable", "error"}:
-            return self._simplemem
-        try:
-            user_dir = os.path.join(self._index_dir, self.identity.key)
-            self._simplemem = self._simplemem_factory(user_dir)
-            self._simplemem_status = "ready"
-            logger.info("memory_simplemem_initialized=true index_dir=%s memory_scope=%s", user_dir, self.identity.scope)
-        except ImportError:
-            self._simplemem_status = "unavailable"
-            # Log once per process: a fresh MemoryLayer is created per session, so
-            # without this the same "not installed" warning repeats every session.
-            global _SIMPLEMEM_UNAVAILABLE_LOGGED
-            if not _SIMPLEMEM_UNAVAILABLE_LOGGED:
-                _SIMPLEMEM_UNAVAILABLE_LOGGED = True
-                logger.warning(
-                    "memory_simplemem_unavailable=true reason=package_not_installed "
-                    "install_hint=pip_install_simplemem note=logged_once_per_process "
-                    "(retrieval falls back to Postgres recency preload)"
-                )
-        except Exception as exc:
-            self._simplemem_status = "error"
-            logger.warning("memory_simplemem_init_failed=true error_type=%s error=%s", type(exc).__name__, exc)
-        return self._simplemem
 
     # ---------- read path ----------
 
@@ -393,7 +315,13 @@ class MemoryLayer:
             f"Known from earlier conversations:\n{lines}"
         )
     async def retrieve(self, query: str, top_k: int = 5) -> list[str]:
-        """Semantic retrieval, hard-bounded by the retrieval timeout. Never raises."""
+        """Semantic (pgvector) retrieval, hard-bounded by the timeout. Never raises.
+
+        Returns [] when semantic recall is disabled/unavailable or on
+        timeout/error — the caller proceeds without recalled memories. (The
+        session-start read path is preload(), which is recency-based and does
+        not depend on this.)
+        """
         query = (query or "").strip()
         if not query:
             return []
@@ -403,15 +331,15 @@ class MemoryLayer:
                 self._retrieve_pgvector_if_available(query, top_k),
                 timeout=self._semantic_timeout_ms / 1000,
             )
-            if items is not None:
+            if items:
                 logger.info(
                     "memory_retrieval status=ok backend=pgvector memory_count=%s duration_seconds=%.3f timeout_ms=%s",
                     len(items),
                     time.monotonic() - started_at,
                     self._semantic_timeout_ms,
                 )
-                if items:
-                    return items
+                return items
+            return []
         except asyncio.TimeoutError:
             logger.warning(
                 "memory_retrieval status=timeout backend=pgvector timeout_ms=%s duration_seconds=%.3f",
@@ -421,32 +349,6 @@ class MemoryLayer:
             return []
         except Exception as exc:
             logger.warning("memory_retrieval status=error backend=pgvector error_type=%s error=%s", type(exc).__name__, exc)
-
-        backend = self._get_simplemem()
-        if backend is None:
-            return []
-        try:
-            raw = await asyncio.wait_for(
-                asyncio.to_thread(backend.query, query, top_k),
-                timeout=self._retrieval_timeout_ms / 1000,
-            )
-            items = _normalize_retrieved_items(raw)
-            logger.info(
-                "memory_retrieval status=ok backend=simplemem memory_count=%s duration_seconds=%.3f timeout_ms=%s",
-                len(items),
-                time.monotonic() - started_at,
-                self._retrieval_timeout_ms,
-            )
-            return items
-        except asyncio.TimeoutError:
-            logger.warning(
-                "memory_retrieval status=timeout backend=simplemem timeout_ms=%s duration_seconds=%.3f",
-                self._retrieval_timeout_ms,
-                time.monotonic() - started_at,
-            )
-            return []
-        except Exception as exc:
-            logger.warning("memory_retrieval status=error backend=simplemem error_type=%s error=%s", type(exc).__name__, exc)
             return []
 
     async def _retrieve_pgvector_if_available(self, query: str, top_k: int) -> list[str] | None:
@@ -475,7 +377,7 @@ class MemoryLayer:
     # ---------- write path ----------
 
     def schedule_remember(self, role: str, content: str, turn_id: int | None = None, modality: str = "text", media_url: str | None = None) -> None:
-        """Fire-and-forget write to Postgres + SimpleMem. Safe to call from event handlers."""
+        """Fire-and-forget write to Postgres (durable row + optional pgvector embedding). Safe to call from event handlers."""
         content = (content or "").strip()
         if not content or not self.identity.present:
             return
@@ -524,90 +426,6 @@ class MemoryLayer:
             )
 
     async def _embed_and_store(self, compact: str, role: str, turn_id: int | None, modality: str, media_url: str | None) -> None:
-        """Store durable memory with optional embedding, degrading to text-only writes.
-
-        Never raises: semantic/embedding/pgvector failures fall back to a durable
-        text insert inside _write_postgres_memory, and a total write failure is
-        logged (recency recall remains the safe fallback). Kept on MemoryLayer with
-        this exact signature because _remember() calls it positionally."""
-        try:
-            await self._write_postgres_memory(compact, role, turn_id, modality, media_url)
-        except Exception as exc:
-            logger.warning(
-                "memory_embed_and_store status=error role=%s turn_id=%s modality=%s fallback=recency error_type=%s error=%s",
-                role, turn_id, modality, type(exc).__name__, exc,
-            )
-            # Fallback to simplemem if Postgres fails
-            backend = self._get_simplemem()
-            if backend is not None:
-                try:
-                    tags = [f"user:{self.identity.key}", f"role:{role}"]
-                    if modality == "audio" and media_url:
-                        await asyncio.to_thread(backend.add_audio, media_url, tags)
-                    else:
-                        await asyncio.to_thread(backend.add_text, compact, tags)
-                except Exception as exc2:
-                    logger.warning(
-                        "memory_write status=error target=simplemem role=%s turn_id=%s error_type=%s error=%s",
-                        role, turn_id, type(exc2).__name__, exc2,
-                    )
-
-    async def _write_postgres_memory(self, compact: str, role: str, turn_id: int | None, modality: str, media_url: str | None) -> None:
-        metadata = json.dumps({"role": role, "turn_id": turn_id})
-        base_params = (
-            self.identity.scope,
-            self.identity.clerk_user_id,
-            self.identity.guest_id,
-            self.companion_id,
-            compact,
-            _content_hash(compact),
-            self.identity.scope == "account",
-            self.identity.scope,
-            GUEST_MEMORY_TTL_HOURS,
-            modality,
-            media_url,
-            metadata,
-        )
-        if not self._db_url:
-            return
-        if self._pgvector_available():
-            try:
-                embedding = await self._embed_text(compact)
-                await asyncio.to_thread(
-                    self._db_writer,
-                    """
-                    INSERT INTO memory_units
-                      (memory_scope, clerk_user_id, guest_id, companion_id, content, content_hash,
-                       is_persistent, ttl_expires_at, modality, media_url, metadata,
-                       embedding, embedding_model, embedding_created_at)
-                    VALUES
-                      (%s, %s, %s, %s, %s, %s, %s,
-                       CASE WHEN %s = 'guest' THEN now() + make_interval(hours => %s) ELSE NULL END,
-                       %s, %s, %s::jsonb, %s::vector, %s, now())
-                    """,
-                    (*base_params, self._vector_literal(embedding), self._embedding_model),
-                )
-                logger.info("memory_write status=ok target=postgres backend=pgvector")
-                return
-            except Exception as exc:
-                self._vector_status = "error"
-                logger.warning("memory_write_pgvector_failed=true fallback=postgres_text error_type=%s error=%s", type(exc).__name__, exc)
-        await asyncio.to_thread(
-            self._db_writer,
-            """
-            INSERT INTO memory_units
-              (memory_scope, clerk_user_id, guest_id, companion_id, content, content_hash,
-               is_persistent, ttl_expires_at, modality, media_url, metadata)
-            VALUES
-              (%s, %s, %s, %s, %s, %s, %s,
-               CASE WHEN %s = 'guest' THEN now() + make_interval(hours => %s) ELSE NULL END,
-               %s, %s, %s::jsonb)
-            """,
-            base_params,
-        )
-
-
-    async def _embed_and_store(self, compact: str, role: str, turn_id: int | None, modality: str, media_url: str | None) -> None:
         """Store durable memory with optional embedding, degrading to text-only writes. Never raises for semantic failures."""
         try:
             await self._write_postgres_memory(compact, role, turn_id, modality, media_url)
@@ -665,100 +483,6 @@ class MemoryLayer:
             """,
             base_params,
         )
-
-
-    async def _embed_and_store(self, compact: str, role: str, turn_id: int | None, modality: str, media_url: str | None) -> None:
-        """Store durable memory with optional embedding, degrading to text-only writes. Never raises for semantic failures."""
-        try:
-            await self._write_postgres_memory(compact, role, turn_id, modality, media_url)
-        except Exception:
-            raise
-
-    async def _write_postgres_memory(self, compact: str, role: str, turn_id: int | None, modality: str, media_url: str | None) -> None:
-        metadata = json.dumps({"role": role, "turn_id": turn_id})
-        base_params = (
-            self.identity.scope,
-            self.identity.clerk_user_id,
-            self.identity.guest_id,
-            self.companion_id,
-            compact,
-            _content_hash(compact),
-            self.identity.scope == "account",
-            self.identity.scope,
-            GUEST_MEMORY_TTL_HOURS,
-            modality,
-            media_url,
-            metadata,
-        )
-        if self._pgvector_available():
-            try:
-                embedding = await self._embed_text(compact)
-                await asyncio.to_thread(
-                    self._db_writer,
-                    """
-                    INSERT INTO memory_units
-                      (memory_scope, clerk_user_id, guest_id, companion_id, content, content_hash,
-                       is_persistent, ttl_expires_at, modality, media_url, metadata,
-                       embedding, embedding_model, embedding_created_at)
-                    VALUES
-                      (%s, %s, %s, %s, %s, %s, %s,
-                       CASE WHEN %s = 'guest' THEN now() + make_interval(hours => %s) ELSE NULL END,
-                       %s, %s, %s::jsonb, %s::vector, %s, now())
-                    """,
-                    (*base_params, self._vector_literal(embedding), self._embedding_model),
-                )
-                logger.info("memory_write status=ok target=postgres backend=pgvector")
-                return
-            except Exception as exc:
-                self._vector_status = "error"
-                logger.warning("memory_write_pgvector_failed=true fallback=postgres_text error_type=%s error=%s", type(exc).__name__, exc)
-        await asyncio.to_thread(
-            self._db_writer,
-            """
-            INSERT INTO memory_units
-              (memory_scope, clerk_user_id, guest_id, companion_id, content, content_hash,
-               is_persistent, ttl_expires_at, modality, media_url, metadata)
-            VALUES
-              (%s, %s, %s, %s, %s, %s, %s,
-               CASE WHEN %s = 'guest' THEN now() + make_interval(hours => %s) ELSE NULL END,
-               %s, %s, %s::jsonb)
-            """,
-            base_params,
-        )
-
-    async def rebuild_index_if_empty(self) -> None:
-        """Re-ingest recent Postgres memories when the container has a fresh/empty index."""
-        backend = self._get_simplemem()
-        if backend is None or not self._db_url or not self.identity.present:
-            return
-        user_dir = os.path.join(self._index_dir, self.identity.key)
-        try:
-            already_populated = any(os.scandir(user_dir)) if os.path.isdir(user_dir) else False
-        except Exception:
-            already_populated = False
-        if already_populated:
-            return
-        try:
-            rows = await asyncio.to_thread(
-                self._db_reader,
-                """
-                SELECT content FROM memory_units
-                WHERE deleted_at IS NULL
-                  AND (ttl_expires_at IS NULL OR ttl_expires_at > now())
-                  AND ((clerk_user_id IS NOT NULL AND clerk_user_id = %s)
-                       OR (guest_id IS NOT NULL AND guest_id = %s))
-                ORDER BY created_at DESC
-                LIMIT %s
-                """,
-                (self.identity.clerk_user_id, self.identity.guest_id, INDEX_REBUILD_MAX_ROWS),
-            )
-            for row in rows:
-                content = str(row[0]).strip()
-                if content:
-                    await asyncio.to_thread(backend.add_text, content, [f"user:{self.identity.key}", "source:rebuild"])
-            logger.info("memory_index_rebuilt=true row_count=%s", len(rows))
-        except Exception as exc:
-            logger.warning("memory_index_rebuild status=error error_type=%s error=%s", type(exc).__name__, exc)
 
     async def aclose(self) -> None:
         if self._background_tasks:
@@ -766,35 +490,13 @@ class MemoryLayer:
                 await asyncio.wait_for(asyncio.gather(*list(self._background_tasks), return_exceptions=True), timeout=5)
             except Exception:
                 pass
-        backend = self._simplemem
-        if backend is not None:
-            for method_name in ("finalize", "close"):
-                method = getattr(backend, method_name, None)
-                if callable(method):
-                    try:
-                        await asyncio.to_thread(method)
-                    except Exception as exc:
-                        logger.warning("memory_close status=error method=%s error_type=%s error=%s", method_name, type(exc).__name__, exc)
-
-
-def _default_simplemem_factory(index_dir: str) -> Any:
-    os.makedirs(index_dir, exist_ok=True)
-    from simplemem import SimpleMem
-
-    # Storage-path kwarg naming differs across simplemem releases; fall back gracefully.
-    for kwargs in ({"data_dir": index_dir}, {"db_path": index_dir}, {}):
-        try:
-            return SimpleMem(**kwargs)
-        except TypeError:
-            continue
-    return SimpleMem()
 
 
 # --- Emotional calibration patterns in durable per-user memory ---
 # Confirmed calibration moments are stored as ordinary memory_units with this
-# prefix so they ride the existing per-user Postgres + SimpleMem store and the
-# session-start preload, while staying separable into a dedicated "what we've
-# learned about how this person processes feelings" note.
+# prefix so they ride the existing per-user Postgres store and the session-start
+# preload, while staying separable into a dedicated "what we've learned about
+# how this person processes feelings" note.
 EMOTIONAL_PATTERN_PREFIX = "Emotional pattern (confirmed): "
 
 
