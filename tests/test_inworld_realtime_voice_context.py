@@ -257,6 +257,12 @@ class BuilderTests(unittest.TestCase):
         )
         self.assertEqual(content[1], {"type": "input_text", "text": "What do you see?"})
 
+    def test_handshake_failure_reason_maps_billing_and_auth_statuses(self):
+        self.assertEqual(irb.inworld_handshake_failure_reason(402), "payment_required")
+        self.assertEqual(irb.inworld_handshake_failure_reason(401), "unauthorized")
+        self.assertEqual(irb.inworld_handshake_failure_reason(403), "forbidden")
+        self.assertEqual(irb.inworld_handshake_failure_reason(500), "handshake_rejected")
+
     def test_session_update_builder_includes_vision_note(self):
         update = irb.build_instructions_session_update(
             _settings(), vision_summary="a desk with a laptop"
