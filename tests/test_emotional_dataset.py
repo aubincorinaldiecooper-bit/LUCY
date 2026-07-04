@@ -12,7 +12,6 @@ Pins the product rules:
 """
 
 import asyncio
-import time
 import types
 import unittest
 

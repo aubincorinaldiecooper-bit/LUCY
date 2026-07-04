@@ -188,7 +188,6 @@ class ResolutionTests(unittest.TestCase):
         self.assertEqual(res.classifier_path, "deterministic")
 
     def test_tool_path_reports_timeout_source_and_path(self):
-        import os
         with patch.object(tc, "transcript_context_llm_enabled", lambda: False), patch.object(
             tc, "detect_transcript_context", lambda t: _ctx(confidence=0.92)
         ), patch.dict("os.environ", {"TOOL_REVALIDATION_CONTEXT_CLASSIFIER_MAX_WAIT_MS": "1300"}, clear=False):
@@ -198,7 +197,6 @@ class ResolutionTests(unittest.TestCase):
         self.assertEqual(res.timeout_source, "tool_env")
 
     def test_normal_path_reports_timeout_source_and_path(self):
-        import os
         with patch.object(tc, "transcript_context_llm_enabled", lambda: False), patch.object(
             tc, "detect_transcript_context", lambda t: _ctx(confidence=0.92)
         ), patch.dict("os.environ", {"NORMAL_CONTEXT_CLASSIFIER_MAX_WAIT_MS": "480"}, clear=False):

@@ -2,8 +2,7 @@ import unittest
 from unittest.mock import patch
 
 import agent
-import transcript_context as tc
-from transcript_context import ContextDecision, build_context_decision
+from transcript_context import build_context_decision
 
 
 def _decide(text, *, base_intent="unknown", classification="COMPLETE_THOUGHT", ambiguity=False, clarification=False, prior=None):

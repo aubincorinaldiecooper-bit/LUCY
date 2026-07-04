@@ -23,12 +23,14 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from memory_embeddings import (
-    embed_text,
-    semantic_retrieval_enabled,
-    semantic_timeout_ms,
-    to_pgvector_literal,
-)
+# NOTE: memory_embeddings (pluggable Cohere/OpenAI embeddings, commit bb011c5)
+# is NOT wired in here anymore — a later rewrite of this module reverted to the
+# local OpenAI-only embed_text below, and the leftover import of embed_text /
+# semantic_retrieval_enabled / semantic_timeout_ms was fully shadowed by the
+# local definitions (so MEMORY_SEMANTIC_RETRIEVAL_ENABLED and the Cohere
+# provider currently have no effect on this layer; MEMORY_VECTOR_ENABLED is the
+# live knob). Removing the dead import preserves runtime behavior exactly;
+# re-integrating memory_embeddings is a separate, deliberate fix.
 
 logger = logging.getLogger(__name__)
 

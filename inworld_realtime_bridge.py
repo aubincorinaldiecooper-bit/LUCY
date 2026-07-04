@@ -737,10 +737,16 @@ class ArcheRealtimeSession:
         dataset_writer: EmotionalDatasetWriter | None = None,
         calibration_enabled: bool = False,
         memory_task: "asyncio.Task[tuple[MemoryLayer | None, str | None]] | None" = None,
+        vision_config: VisionContextConfig | None = None,
     ) -> None:
         self.settings = settings
         self.transport = transport
         transport.bind(self)
+        # Vision gating is transport-specific: the product camera path stays
+        # behind VISION_CONTEXT_ENABLED (ambient capture needs a deliberate
+        # flag), while API sessions inject a forced-enabled config — a client
+        # explicitly sending input_image IS the opt-in (see arche_api).
+        self._vision_config_override = vision_config
         self._tasks: set[asyncio.Task[Any]] = set()
         self._closed = asyncio.Event()
         self._ws: aiohttp.ClientWebSocketResponse | None = None
@@ -778,7 +784,11 @@ class ArcheRealtimeSession:
         # a camera track (if the user publishes one) is sampled at a fixed
         # cadence and described via vision_context.describe_frame(). See
         # vision_context.py for the model-agnostic OpenRouter call.
-        self._vision_config: VisionContextConfig = load_vision_context_config()
+        self._vision_config: VisionContextConfig = (
+            self._vision_config_override
+            if self._vision_config_override is not None
+            else load_vision_context_config()
+        )
         self.latest_vision_summary: str | None = None
         self._last_vision_context_sent_at = 0.0
         self._latest_video_frame_data_url: str | None = None

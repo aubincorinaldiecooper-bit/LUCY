@@ -4,7 +4,6 @@ from unittest.mock import patch
 import agent
 import interaction_state as ist
 from interaction_state import (
-    ASSISTANT_THINKING,
     LISTENING,
     USER_SPEAKING,
     InteractionStateMachine,

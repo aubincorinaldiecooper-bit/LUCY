@@ -13,7 +13,6 @@ Pins the product rules:
 
 import asyncio
 import base64
-import types
 import unittest
 from unittest import mock
 
@@ -342,6 +341,89 @@ class VisionMemoryTests(unittest.TestCase):
     def test_disabled_flag_never_remembers(self):
         remembered = self._run_update(remember_enabled=False, summaries=["a red mug"])
         self.assertEqual(remembered, [])
+
+
+class VisionConfigInjectionTests(unittest.TestCase):
+    """API sessions force-enable vision regardless of VISION_CONTEXT_ENABLED;
+    the product (LiveKit) path stays env-gated."""
+
+    def test_api_session_uses_injected_forced_enabled_vision_config(self):
+        from vision_context import VisionContextConfig
+
+        forced = VisionContextConfig(
+            enabled=True,
+            model="m",
+            api_key="k",
+            min_interval_seconds=12.0,
+            frame_sample_interval_seconds=2.0,
+            max_frame_dimension=512,
+            request_timeout_seconds=6.0,
+        )
+
+        async def scenario():
+            transport = _RecordingTransport()
+            # Env vision disabled (the default) must NOT win when an explicit
+            # config is injected — this is the codex P2 fix.
+            with mock.patch.dict("os.environ", {"VISION_CONTEXT_ENABLED": "false"}, clear=False):
+                return irb.ArcheRealtimeSession(_settings(), transport, vision_config=forced)
+
+        session = asyncio.run(scenario())
+        self.assertTrue(session.vision_enabled)
+        self.assertIs(session.vision_config, forced)
+
+    def test_livekit_path_still_env_gated_when_no_override(self):
+        async def scenario():
+            transport = _RecordingTransport()
+            with mock.patch.dict("os.environ", {"VISION_CONTEXT_ENABLED": "false"}, clear=False):
+                # No vision_config passed -> falls back to env (disabled).
+                return irb.ArcheRealtimeSession(_settings(), transport)
+
+        session = asyncio.run(scenario())
+        self.assertFalse(session.vision_enabled)
+
+    def test_api_handler_injects_enabled_config(self):
+        """The realtime API handler must construct the session with a
+        force-enabled vision config so input_image is never silently ignored."""
+        captured = {}
+
+        real_session_cls = arche_api.ArcheRealtimeSession
+
+        def _capture(*args, **kwargs):
+            captured["vision_config"] = kwargs.get("vision_config")
+            # Build a real session so downstream .run()/.aclose() are valid,
+            # then immediately signal close so the handler returns fast.
+            sess = real_session_cls(*args, **kwargs)
+            return sess
+
+        ws = _FakeWebSocket()
+        ws.headers = {"authorization": "Bearer right"}
+        ws.query_params = {}
+
+        async def scenario():
+            env = {
+                "ARCHE_API_ENABLED": "true",
+                "ARCHE_API_KEYS": "right",
+                "INWORLD_API_KEY": "k",
+                "VISION_CONTEXT_ENABLED": "false",
+            }
+            with mock.patch.dict("os.environ", env, clear=False):
+                with mock.patch.object(arche_api, "ArcheRealtimeSession", _capture):
+                    # receive_json raises immediately -> client loop ends ->
+                    # handler tears down without needing a real Inworld socket.
+                    async def _boom():
+                        raise RuntimeError("client gone")
+
+                    ws.receive_json = _boom
+
+                    async def _noop_run(self):
+                        return
+
+                    with mock.patch.object(real_session_cls, "run", _noop_run):
+                        await arche_api.handle_realtime_api_websocket(ws)
+
+        asyncio.run(scenario())
+        self.assertIsNotNone(captured.get("vision_config"))
+        self.assertTrue(captured["vision_config"].enabled)
 
 
 if __name__ == "__main__":
