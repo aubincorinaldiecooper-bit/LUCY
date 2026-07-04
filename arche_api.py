@@ -52,6 +52,7 @@ from memory_layer import (
     memory_enabled,
     partition_emotional_patterns,
 )
+from system_prompt import SYSTEM_PROMPT
 from vision_context import load_vision_context_config
 
 logger = logging.getLogger(__name__)
@@ -225,8 +226,12 @@ async def handle_realtime_api_websocket(websocket: Any) -> None:
     user_ref = sanitize_user_ref(websocket.query_params.get("user_ref"))
 
     try:
+        # Default to the SAME persona the product uses (single source of
+        # truth in system_prompt.py) — without this, API clients silently got
+        # a generic placeholder persona instead of Arche. ARCHE_API_INSTRUCTIONS
+        # remains an explicit override for a client who wants a different one.
         settings = load_inworld_realtime_settings(
-            instructions=(os.getenv("ARCHE_API_INSTRUCTIONS") or "").strip() or None
+            instructions=(os.getenv("ARCHE_API_INSTRUCTIONS") or "").strip() or SYSTEM_PROMPT
         )
     except Exception as exc:  # noqa: BLE001 - misconfigured server (e.g. no Inworld key)
         logger.error("arche_api_settings_error=true error_type=%s error=%s", type(exc).__name__, exc)

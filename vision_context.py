@@ -1,9 +1,9 @@
 """Best-effort camera-frame description, fed into Arche's session instructions.
 
-Model-agnostic and cost-controlled by design: routed through OpenRouter (already
-used elsewhere in this codebase for the Hume CLM path), so the vision model is a
-single env var (``VISION_MODEL``) fully independent of ``INWORLD_REALTIME_MODEL``
-(the conversation LLM) — swap providers/models for cost without touching code.
+Model-agnostic and cost-controlled by design: routed through OpenRouter, so the
+vision model is a single env var (``VISION_MODEL``) fully independent of
+``INWORLD_REALTIME_MODEL`` (the conversation LLM) — swap providers/models for
+cost without touching code.
 
 Off by default (``VISION_CONTEXT_ENABLED`` unset/false): the bridge never
 subscribes to a camera track at all in that case, so this module makes no calls

@@ -426,5 +426,50 @@ class VisionConfigInjectionTests(unittest.TestCase):
         self.assertTrue(captured["vision_config"].enabled)
 
 
+class ApiInstructionsDefaultTests(unittest.TestCase):
+    """API sessions default to Arche's real persona (system_prompt.SYSTEM_PROMPT),
+    not a disconnected placeholder; ARCHE_API_INSTRUCTIONS overrides it."""
+
+    def _run_with_env(self, extra_env):
+        captured = {}
+        real_session_cls = arche_api.ArcheRealtimeSession
+
+        def _capture(settings, *args, **kwargs):
+            captured["instructions"] = settings.instructions
+            return real_session_cls(settings, *args, **kwargs)
+
+        ws = _FakeWebSocket()
+        ws.headers = {"authorization": "Bearer right"}
+        ws.query_params = {}
+
+        async def scenario():
+            env = {"ARCHE_API_ENABLED": "true", "ARCHE_API_KEYS": "right", "INWORLD_API_KEY": "k"}
+            env.update(extra_env)
+            with mock.patch.dict("os.environ", env, clear=False):
+                with mock.patch.object(arche_api, "ArcheRealtimeSession", _capture):
+                    async def _boom():
+                        raise RuntimeError("client gone")
+
+                    ws.receive_json = _boom
+
+                    async def _noop_run(self):
+                        return
+
+                    with mock.patch.object(real_session_cls, "run", _noop_run):
+                        await arche_api.handle_realtime_api_websocket(ws)
+
+        asyncio.run(scenario())
+        return captured.get("instructions")
+
+    def test_defaults_to_real_arche_persona_not_placeholder(self):
+        instructions = self._run_with_env({})
+        self.assertEqual(instructions, arche_api.SYSTEM_PROMPT)
+        self.assertNotIn("concise, warm voice assistant", instructions)
+
+    def test_arche_api_instructions_overrides_default_persona(self):
+        instructions = self._run_with_env({"ARCHE_API_INSTRUCTIONS": "You are a pirate."})
+        self.assertEqual(instructions, "You are a pirate.")
+
+
 if __name__ == "__main__":
     unittest.main()
