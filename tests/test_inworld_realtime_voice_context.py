@@ -282,6 +282,15 @@ class BuilderTests(unittest.TestCase):
         self.assertIn("energy low", instructions)
         self.assertIn("a desk with a laptop", instructions)
 
+    def test_session_update_builder_includes_mood_note(self):
+        update = irb.build_instructions_session_update(
+            _settings(), mood_summary="downplaying it, sounds worn out"
+        )
+        instructions = update["session"]["instructions"]
+        self.assertTrue(instructions.startswith("Be concise."))
+        self.assertIn("downplaying it, sounds worn out", instructions)
+        self.assertIn("never", instructions.lower())
+
 
 def _vision_config(**overrides):
     kwargs = dict(
@@ -448,6 +457,134 @@ class EncodeVideoFrameTests(unittest.TestCase):
                 raise RuntimeError("no buffer")
 
         self.assertIsNone(irb._encode_video_frame_jpeg(Broken(), max_dimension=512))
+
+
+def _mood_config(**overrides):
+    from mood_context import MoodContextConfig
+
+    kwargs = dict(
+        enabled=True,
+        model="m",
+        api_key="k",
+        min_interval_seconds=8.0,
+        request_timeout_seconds=5.0,
+        max_transcript_chars=600,
+    )
+    kwargs.update(overrides)
+    return MoodContextConfig(**kwargs)
+
+
+def _user_transcript_event(text="I'm okay I guess"):
+    return {
+        "type": "conversation.item.input_audio_transcription.completed",
+        "transcript": text,
+    }
+
+
+class MoodContextBridgeTests(unittest.TestCase):
+    """completed user transcript → background mood fusion → instructions update."""
+
+    def _drain_tasks(self, bridge):
+        async def drain():
+            pending = [t for t in bridge._tasks if not t.done()]
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+        return drain()
+
+    def _scenario(self, *, config, describe=None, events=None, between=None):
+        events = events or (_user_transcript_event(),)
+
+        async def run():
+            bridge = _make_bridge()
+            bridge._session_ready.set()
+            bridge._mood_config = config
+            fake_describe = describe or mock.AsyncMock(
+                return_value="says she's okay but sounds like she's holding back"
+            )
+            with mock.patch.object(irb, "describe_mood", fake_describe):
+                for i, event in enumerate(events):
+                    if between is not None and i > 0:
+                        between(bridge)
+                    await bridge._handle_inworld_message(event)
+                    await self._drain_tasks(bridge)
+            return bridge, fake_describe
+
+        return asyncio.run(run())
+
+    def test_disabled_config_never_calls_describe(self):
+        bridge, fake_describe = self._scenario(config=_mood_config(enabled=False))
+        fake_describe.assert_not_awaited()
+        self.assertEqual(bridge._ws.sent, [])
+
+    def test_completed_transcript_sends_mood_instructions_update(self):
+        bridge, fake_describe = self._scenario(config=_mood_config())
+        fake_describe.assert_awaited_once()
+        self.assertEqual(
+            bridge.latest_mood_summary, "says she's okay but sounds like she's holding back"
+        )
+        self.assertEqual(len(bridge._ws.sent), 1)
+        update = bridge._ws.sent[0]
+        self.assertEqual(update["type"], "session.update")
+        self.assertIn("holding back", update["session"]["instructions"])
+
+    def test_none_read_sends_nothing(self):
+        bridge, _ = self._scenario(
+            config=_mood_config(), describe=mock.AsyncMock(return_value=None)
+        )
+        self.assertIsNone(bridge.latest_mood_summary)
+        self.assertEqual(bridge._ws.sent, [])
+
+    def test_second_transcript_within_interval_is_throttled(self):
+        bridge, fake_describe = self._scenario(
+            config=_mood_config(),
+            events=(_user_transcript_event("a"), _user_transcript_event("b")),
+        )
+        fake_describe.assert_awaited_once()
+        self.assertEqual(len(bridge._ws.sent), 1)
+
+    def test_second_transcript_after_interval_sends_again(self):
+        def age_last_send(bridge):
+            bridge._last_mood_context_sent_at = (
+                time.monotonic() - bridge._mood_config.min_interval_seconds - 1
+            )
+
+        reads = iter(["first read", "second read"])
+
+        async def next_read(*args, **kwargs):
+            return next(reads)
+
+        bridge, _ = self._scenario(
+            config=_mood_config(),
+            describe=mock.AsyncMock(side_effect=next_read),
+            events=(_user_transcript_event("a"), _user_transcript_event("b")),
+            between=age_last_send,
+        )
+        self.assertEqual(len(bridge._ws.sent), 2)
+        self.assertIn("second read", bridge._ws.sent[1]["session"]["instructions"])
+
+    def test_vocal_dials_paired_with_words_when_fresh(self):
+        captured = {}
+
+        async def capture(transcript, vocal_summary, config):
+            captured["transcript"] = transcript
+            captured["vocal_summary"] = vocal_summary
+            return None
+
+        async def run():
+            bridge = _make_bridge()
+            bridge._session_ready.set()
+            bridge._mood_config = _mood_config()
+            bridge.latest_voice_profile = NormalizedVoiceProfile(energy="low", tension="high")
+            bridge.latest_voice_profile_at = time.monotonic()  # fresh
+            with mock.patch.object(irb, "describe_mood", capture):
+                await bridge._handle_inworld_message(_user_transcript_event("I'm fine"))
+                await self._drain_tasks(bridge)
+
+        asyncio.run(run())
+        self.assertEqual(captured["transcript"], "I'm fine")
+        self.assertIn("energy low", captured["vocal_summary"])
+        self.assertIn("tension high", captured["vocal_summary"])
 
 
 if __name__ == "__main__":
