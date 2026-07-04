@@ -299,6 +299,19 @@ class MemoryLayerWriteTests(unittest.IsolatedAsyncioTestCase):
         params = written[0][1]
         self.assertIn("Lucy replied: Good luck!", params)
 
+    async def test_remember_observation_role_uses_noticed_phrasing(self):
+        """Vision-context scene descriptions are Arche's own noticing, not a
+        user or assistant line — the preload note should read naturally."""
+        layer, written = make_layer()
+        layer.schedule_remember(role="observation", content="a red mug on a desk", turn_id=2)
+        await asyncio.gather(*list(layer._background_tasks))
+        params = written[0][1]
+        self.assertIn("Arche noticed: a red mug on a desk", params)
+        for p in params:
+            if isinstance(p, str):
+                self.assertNotIn("Lucy replied:", p)
+                self.assertNotIn("User said:", p)
+
     async def test_embed_and_store_semantic_failure_falls_back_to_text_write(self):
         written = []
 

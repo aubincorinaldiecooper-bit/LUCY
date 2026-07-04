@@ -507,6 +507,10 @@ class MemoryLayer:
         # verbatim rather than wrapped in "User said/Lucy replied".
         if content.startswith(EMOTIONAL_PATTERN_PREFIX):
             compact = content
+        elif role == "observation":
+            # Vision-context scene descriptions (see inworld_realtime_bridge):
+            # phrased as Arche's own noticing so the preload note reads naturally.
+            compact = f"Arche noticed: {content}"
         else:
             compact = f"{'User said' if role == 'user' else 'Lucy replied'}: {content}"
         try:

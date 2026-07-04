@@ -385,23 +385,23 @@ class VisionContextBridgeTests(unittest.TestCase):
             # Default env: disabled. A video track must be ignored entirely.
             bridge._vision_config = _vision_config(enabled=False)
             track = types.SimpleNamespace(kind=irb.rtc.TrackKind.KIND_VIDEO)
-            bridge._maybe_start_video_sampler(track)
+            bridge.transport._maybe_start_video_sampler(track)
             return bridge
 
         bridge = asyncio.run(run())
-        self.assertFalse(bridge._video_sampler_started)
-        self.assertEqual(len(bridge._tasks), 0)
+        self.assertFalse(bridge.transport._video_sampler_started)
+        self.assertEqual(len(bridge.transport._tasks), 0)
 
     def test_audio_track_never_starts_video_sampler(self):
         async def run():
             bridge = _make_bridge()
             bridge._vision_config = _vision_config()
             track = types.SimpleNamespace(kind=irb.rtc.TrackKind.KIND_AUDIO)
-            bridge._maybe_start_video_sampler(track)
+            bridge.transport._maybe_start_video_sampler(track)
             return bridge
 
         bridge = asyncio.run(run())
-        self.assertFalse(bridge._video_sampler_started)
+        self.assertFalse(bridge.transport._video_sampler_started)
 
 
 class _FakeVideoFrame:

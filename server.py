@@ -29,7 +29,7 @@ import aiohttp
 
 from dotenv import load_dotenv
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, WebSocket
 
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -1982,3 +1982,58 @@ async def inworld_ws_smoke_test(request: Request) -> JSONResponse:
         flush=True,
     )
     return JSONResponse(result)
+
+
+# --- Public Arche API (speech + vision) ---------------------------------------
+# Off by default (ARCHE_API_ENABLED). See arche_api.py for the protocol.
+
+
+@app.websocket("/api/v1/realtime")
+async def arche_realtime_api(websocket: WebSocket) -> None:
+    from arche_api import handle_realtime_api_websocket
+
+    await handle_realtime_api_websocket(websocket)
+
+
+@app.post("/api/v1/vision/describe")
+async def arche_vision_describe(request: Request) -> JSONResponse:
+    """One-shot image description — the standalone visual API.
+
+    Same auth as the realtime API. The model is the env-configured VISION_MODEL
+    unless the request overrides it; the call goes through OpenRouter with the
+    same cost bounds as in-session vision (one sentence, max_tokens capped).
+    """
+    from arche_api import api_enabled, api_key_from_scope, api_key_valid
+    from vision_context import describe_frame, load_vision_context_config
+
+    if not api_enabled():
+        return JSONResponse({"error": "api_disabled"}, status_code=404)
+    if not api_key_valid(api_key_from_scope(request.headers, request.query_params)):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    image = body.get("image")
+    if not isinstance(image, str) or not image.startswith("data:image/"):
+        return JSONResponse(
+            {"error": "invalid_image", "detail": "expected a data:image/... data URL"},
+            status_code=400,
+        )
+
+    from dataclasses import replace as dc_replace
+
+    config = load_vision_context_config()
+    model_override = str(body.get("model") or "").strip()
+    config = dc_replace(
+        config,
+        enabled=True,  # endpoint access is the opt-in; VISION_CONTEXT_ENABLED gates in-session use
+        model=model_override or config.model,
+    )
+    description = await describe_frame(image, config)
+    if not description:
+        return JSONResponse({"error": "vision_call_failed"}, status_code=502)
+    return JSONResponse({"description": description, "model": config.model})

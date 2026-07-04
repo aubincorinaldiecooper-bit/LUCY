@@ -1,19 +1,23 @@
-"""LiveKit ⇄ Inworld Realtime speech-to-speech bridge.
+"""Arche realtime session core + LiveKit ⇄ Inworld speech-to-speech bridge.
 
 This path is selected with VOICE_ENGINE=inworld_realtime and keeps LiveKit as
 Arche's browser media transport while Inworld owns STT, TTS, and semantic VAD /
 turn detection. The legacy cascaded LiveKit AgentSession remains available by
 leaving VOICE_ENGINE unset.
 
-Architecture:
+Architecture (OpenAI-style: one engine, pluggable transports):
 
-  LiveKit mic/audio input
-    -> _forward_livekit_audio
-    -> Inworld WebSocket (input_audio_buffer.append)
-  Inworld WebSocket
-    -> _receive_inworld
-    -> decode response.output_audio.delta (base64 PCM16 @ 24 kHz mono)
-    -> write PCM frames to LiveKit AudioSource
+  ArcheTransport (seam)
+    - LiveKitTransport: browser product — mic/camera tracks in, published
+      audio track out (this module)
+    - WebSocketApiTransport: public API — OpenAI Realtime-shaped JSON events
+      over a WebSocket (arche_api.py)
+  ArcheRealtimeSession (core, transport-agnostic)
+    transport -> handle_input_pcm -> Inworld WS (input_audio_buffer.append)
+    Inworld WS -> _receive_inworld
+      -> decode response.output_audio.delta (base64 PCM16 @ 24 kHz mono)
+      -> transport.write_output_pcm
+      -> scrubbed event relay via transport.emit_event (API sessions only)
 
 With turn_detection.create_response=true Inworld auto-creates a response when
 the user stops speaking, so the bridge never sends response.create itself; the
@@ -497,26 +501,253 @@ VOICE_CONTEXT_MIN_INTERVAL_SECONDS = 3.0
 PROFILE_FRESHNESS_SECONDS = 30.0
 
 
-class InworldRealtimeLiveKitBridge:
+# Server events relayed to API clients (arche_api.py). LiveKit sessions ignore
+# these (media-plane only). Everything NOT listed stays server-side, and
+# voiceProfile nodes are scrubbed even from listed events — raw emotion labels
+# never leave the server.
+_CLIENT_RELAY_EVENT_TYPES = {
+    "session.created",
+    "session.updated",
+    "input_audio_buffer.speech_started",
+    "input_audio_buffer.speech_stopped",
+    "conversation.item.input_audio_transcription.completed",
+    "response.created",
+    "response.done",
+    "response.output_audio_transcript.delta",
+    "response.output_audio_transcript.done",
+    "response.output_audio.done",
+    "output_audio_buffer.started",
+    "output_audio_buffer.stopped",
+    "output_audio_buffer.cleared",
+    "error",
+}
+
+_VOICE_PROFILE_SCRUB_KEYS = {"voiceProfile", "voice_profile"}
+
+
+def scrub_event_for_client(payload: Any) -> Any:
+    """Deep-copy an event with every voiceProfile node removed.
+
+    The privacy rule for raw emotion labels (they never leave the server; see
+    inworld_voice_profile) must hold for API clients exactly as it does for the
+    model and the end user.
+    """
+    if isinstance(payload, dict):
+        return {
+            key: scrub_event_for_client(value)
+            for key, value in payload.items()
+            if key not in _VOICE_PROFILE_SCRUB_KEYS
+        }
+    if isinstance(payload, list):
+        return [scrub_event_for_client(item) for item in payload]
+    return payload
+
+
+class ArcheTransport:
+    """Media/event seam between the Arche session core and the outside world.
+
+    The core (ArcheRealtimeSession) is transport-agnostic: it speaks Inworld on
+    one side and this interface on the other. LiveKitTransport carries the
+    browser product; arche_api.WebSocketApiTransport carries the public API.
+    Adapters push caller audio into session.handle_input_pcm() / camera frames
+    into session.set_video_frame(), and receive Arche's audio + a scrubbed
+    event stream back through this interface.
+    """
+
+    def bind(self, session: "ArcheRealtimeSession") -> None:
+        raise NotImplementedError
+
+    async def start(self) -> None:
+        """Begin delivering input media; called once before the Inworld connect."""
+        raise NotImplementedError
+
+    async def write_output_pcm(self, pcm: bytes) -> int:
+        """Deliver Arche's speech (PCM16 @ 24 kHz mono); returns units written."""
+        raise NotImplementedError
+
+    async def emit_event(self, payload: dict[str, Any]) -> None:
+        """Deliver a scrubbed, whitelisted server event to the client."""
+        raise NotImplementedError
+
+    async def aclose(self) -> None:
+        raise NotImplementedError
+
+
+class LiveKitTransport(ArcheTransport):
+    """LiveKit room adapter: mic/camera tracks in, published audio track out."""
+
+    def __init__(self, room: rtc.Room) -> None:
+        self.room = room
+        self._session: "ArcheRealtimeSession | None" = None
+        self._output_source = rtc.AudioSource(INWORLD_OUTPUT_SAMPLE_RATE, INWORLD_CHANNELS)
+        self._published = False
+        self._video_sampler_started = False
+        self._listening = False
+        self._tasks: set[asyncio.Task[Any]] = set()
+
+    def bind(self, session: "ArcheRealtimeSession") -> None:
+        self._session = session
+
+    async def start(self) -> None:
+        await self._publish_output_track()
+        self._subscribe_existing_tracks()
+        self.room.on("track_subscribed", self._on_track_subscribed)
+        self._listening = True
+
+    async def _publish_output_track(self) -> None:
+        if self._published:
+            return
+        track = rtc.LocalAudioTrack.create_audio_track("arche-inworld-realtime", self._output_source)
+        options = rtc.TrackPublishOptions()
+        options.source = rtc.TrackSource.SOURCE_MICROPHONE
+        await self.room.local_participant.publish_track(track, options)
+        self._published = True
+        logger.info("inworld_realtime_audio_published_to_livekit=true track_name=arche-inworld-realtime")
+
+    def _subscribe_existing_tracks(self) -> None:
+        for participant in self.room.remote_participants.values():
+            for publication in getattr(participant, "track_publications", {}).values():
+                track = getattr(publication, "track", None)
+                if track is not None:
+                    self._maybe_start_audio_forwarder(track)
+                    self._maybe_start_video_sampler(track)
+
+    def _on_track_subscribed(self, track, publication=None, participant=None) -> None:
+        self._maybe_start_audio_forwarder(track)
+        self._maybe_start_video_sampler(track)
+
+    def _maybe_start_audio_forwarder(self, track: Any) -> None:
+        if getattr(track, "kind", None) != rtc.TrackKind.KIND_AUDIO:
+            return
+        task = asyncio.create_task(self._forward_livekit_audio(track))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    def _maybe_start_video_sampler(self, track: Any) -> None:
+        # Gated on the feature flag, not just track kind: with vision context
+        # disabled (the default) we never touch a published camera track at
+        # all, so there is zero CPU/behavior change unless deliberately
+        # enabled.
+        session = self._session
+        if session is None or not session.vision_enabled:
+            return
+        if getattr(track, "kind", None) != rtc.TrackKind.KIND_VIDEO:
+            return
+        if self._video_sampler_started:
+            return
+        self._video_sampler_started = True
+        task = asyncio.create_task(self._sample_video_track(track))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _sample_video_track(self, track: Any) -> None:
+        """Hold the most recent camera frame as a downscaled JPEG data URL.
+
+        Sampled at a fixed cadence (frame_sample_interval_seconds), not every
+        incoming frame — encoding every frame would burn CPU for no benefit,
+        since a frame is used at most once per min_interval_seconds anyway.
+        """
+        session = self._session
+        if session is None:
+            return
+        stream = rtc.VideoStream(track)
+        last_sampled_at = 0.0
+        try:
+            async for event in stream:
+                now = time.monotonic()
+                if now - last_sampled_at < session.vision_config.frame_sample_interval_seconds:
+                    continue
+                frame = getattr(event, "frame", None)
+                if frame is None:
+                    continue
+                encoded = _encode_video_frame_jpeg(
+                    frame, max_dimension=session.vision_config.max_frame_dimension
+                )
+                if encoded is not None:
+                    session.set_video_frame(encoded)
+                    last_sampled_at = now
+        finally:
+            await stream.aclose()
+
+    async def _forward_livekit_audio(self, track: Any) -> None:
+        session = self._session
+        if session is None:
+            return
+        stream = rtc.AudioStream(track, sample_rate=INWORLD_INPUT_SAMPLE_RATE, num_channels=INWORLD_CHANNELS, frame_size_ms=INWORLD_FRAME_MS)
+        try:
+            async for event in stream:
+                frame = getattr(event, "frame", None)
+                pcm = _frame_bytes(frame)
+                if not pcm:
+                    continue
+                await session.handle_input_pcm(pcm)
+        finally:
+            await stream.aclose()
+
+    async def write_output_pcm(self, pcm: bytes) -> int:
+        if not self._published:
+            try:
+                await self._publish_output_track()
+            except Exception as exc:  # noqa: BLE001 - don't let publish error kill audio
+                logger.warning("inworld_publish_failed error_type=%s error=%s", type(exc).__name__, exc)
+        frame_count = 0
+        for frame in _iter_pcm_frames(pcm):
+            await self._output_source.capture_frame(frame)
+            frame_count += 1
+        return frame_count
+
+    async def emit_event(self, payload: dict[str, Any]) -> None:
+        # Media-plane transport: the browser gets audio via the published
+        # track; events stay server-side.
+        return
+
+    async def aclose(self) -> None:
+        if self._listening:
+            try:
+                self.room.off("track_subscribed", self._on_track_subscribed)
+            except Exception:  # noqa: BLE001
+                pass
+            self._listening = False
+        for task in list(self._tasks):
+            if not task.done():
+                task.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+            self._tasks.clear()
+        try:
+            await self._output_source.aclose()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+class ArcheRealtimeSession:
+    """Transport-agnostic Arche session core.
+
+    Owns the Inworld Realtime connection plus all product logic (memory,
+    emotional context, vision, calibration, instructions). Caller media
+    arrives via handle_input_pcm()/set_video_frame(); Arche's speech and a
+    scrubbed event stream leave via the bound ArcheTransport.
+    """
+
     def __init__(
         self,
-        room: rtc.Room,
         settings: InworldRealtimeSettings,
+        transport: ArcheTransport,
         *,
         dataset_writer: EmotionalDatasetWriter | None = None,
         calibration_enabled: bool = False,
         memory_task: "asyncio.Task[tuple[MemoryLayer | None, str | None]] | None" = None,
     ) -> None:
-        self.room = room
         self.settings = settings
+        self.transport = transport
+        transport.bind(self)
         self._tasks: set[asyncio.Task[Any]] = set()
         self._closed = asyncio.Event()
         self._ws: aiohttp.ClientWebSocketResponse | None = None
-        self._output_source = rtc.AudioSource(INWORLD_OUTPUT_SAMPLE_RATE, INWORLD_CHANNELS)
-        self._published = False
         self._session_ready = asyncio.Event()
         self._audio_frames_written = 0
         self._mic_frames_forwarded = 0
+        self._dropped_before_session_ready = 0
         # Latest normalized voice profile captured from Realtime events (weak
         # emotional context; raw labels never leave inworld_voice_profile).
         self.latest_voice_profile: NormalizedVoiceProfile | None = None
@@ -551,8 +782,54 @@ class InworldRealtimeLiveKitBridge:
         self.latest_vision_summary: str | None = None
         self._last_vision_context_sent_at = 0.0
         self._latest_video_frame_data_url: str | None = None
-        self._video_sampler_started = False
         self._vision_call_in_flight = False
+        self._last_vision_summary_remembered: str | None = None
+
+    @property
+    def vision_enabled(self) -> bool:
+        return self._vision_config.enabled
+
+    @property
+    def vision_config(self) -> VisionContextConfig:
+        return self._vision_config
+
+    async def handle_input_pcm(self, pcm: bytes) -> None:
+        """Feed one chunk of caller audio (PCM16 @ 24 kHz mono) toward Inworld.
+
+        Called by the transport for every input chunk. Audio is dropped until
+        the Inworld session is fully configured (session.updated received):
+        before that the server doesn't yet know what model/voice/VAD to apply.
+        """
+        if not pcm:
+            return
+        ws = self._ws
+        if ws is None or not self._session_ready.is_set():
+            self._dropped_before_session_ready += 1
+            if self._dropped_before_session_ready == 1 or self._dropped_before_session_ready % 50 == 0:
+                logger.info(
+                    "inworld_mic_audio_dropped_before_session_ready=true count=%s",
+                    self._dropped_before_session_ready,
+                )
+            return
+        try:
+            await ws.send_json(build_audio_append_message(pcm))
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "inworld_mic_audio_send_error=true error_type=%s error=%s",
+                type(exc).__name__, exc,
+            )
+            return
+        self._mic_frames_forwarded += 1
+
+    def set_video_frame(self, data_url: str) -> None:
+        """Hold the most recent camera frame (as an image data URL) for vision.
+
+        Called by the LiveKit video sampler and by API clients' input_image
+        events. Only ever read at speech-start (rate-limited), so setting it
+        frequently costs nothing.
+        """
+        if isinstance(data_url, str) and data_url.startswith("data:image/"):
+            self._latest_video_frame_data_url = data_url
 
     async def _ensure_memory_resolved(self) -> None:
         """Await the background memory-resolution task exactly once.
@@ -585,7 +862,7 @@ class InworldRealtimeLiveKitBridge:
             self.settings.turn_detection_type,
             self.settings.voice_profile_enabled,
         )
-        await self._publish_output_track()
+        await self.transport.start()
         try:
             timeout = aiohttp.ClientTimeout(total=None, sock_connect=20, sock_read=None)
             async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -595,9 +872,6 @@ class InworldRealtimeLiveKitBridge:
 
                     receiver = asyncio.create_task(self._receive_inworld(ws))
                     self._tasks.add(receiver)
-
-                    self._subscribe_existing_audio_tracks()
-                    self.room.on("track_subscribed", self._on_track_subscribed)
 
                     try:
                         await asyncio.wait_for(self._closed.wait(), timeout=self.settings.timeout_seconds)
@@ -609,7 +883,6 @@ class InworldRealtimeLiveKitBridge:
                             self._mic_frames_forwarded,
                         )
                     finally:
-                        self.room.off("track_subscribed", self._on_track_subscribed)
                         await ws.close()
                         await self.aclose()
         except Exception as exc:
@@ -647,120 +920,9 @@ class InworldRealtimeLiveKitBridge:
             except Exception:
                 pass
         try:
-            await self._output_source.aclose()
+            await self.transport.aclose()
         except Exception:
             pass
-
-    async def _publish_output_track(self) -> None:
-        if self._published:
-            return
-        track = rtc.LocalAudioTrack.create_audio_track("arche-inworld-realtime", self._output_source)
-        options = rtc.TrackPublishOptions()
-        options.source = rtc.TrackSource.SOURCE_MICROPHONE
-        await self.room.local_participant.publish_track(track, options)
-        self._published = True
-        logger.info("inworld_realtime_audio_published_to_livekit=true track_name=arche-inworld-realtime")
-
-    def _subscribe_existing_audio_tracks(self) -> None:
-        for participant in self.room.remote_participants.values():
-            for publication in getattr(participant, "track_publications", {}).values():
-                track = getattr(publication, "track", None)
-                if track is not None:
-                    self._maybe_start_audio_forwarder(track)
-                    self._maybe_start_video_sampler(track)
-
-    def _on_track_subscribed(self, track, publication=None, participant=None) -> None:
-        self._maybe_start_audio_forwarder(track)
-        self._maybe_start_video_sampler(track)
-
-    def _maybe_start_audio_forwarder(self, track: Any) -> None:
-        if getattr(track, "kind", None) != rtc.TrackKind.KIND_AUDIO:
-            return
-        task = asyncio.create_task(self._forward_livekit_audio(track))
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
-
-    def _maybe_start_video_sampler(self, track: Any) -> None:
-        # Gated on the feature flag, not just track kind: with vision context
-        # disabled (the default) we never touch a published camera track at
-        # all, so there is zero CPU/behavior change unless deliberately
-        # enabled.
-        if not self._vision_config.enabled:
-            return
-        if getattr(track, "kind", None) != rtc.TrackKind.KIND_VIDEO:
-            return
-        if self._video_sampler_started:
-            return
-        self._video_sampler_started = True
-        task = asyncio.create_task(self._sample_video_track(track))
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
-
-    async def _sample_video_track(self, track: Any) -> None:
-        """Hold the most recent camera frame as a downscaled JPEG data URL.
-
-        Sampled at a fixed cadence (frame_sample_interval_seconds), not every
-        incoming frame — encoding every frame would burn CPU for no benefit,
-        since a frame is used at most once per min_interval_seconds anyway.
-        """
-        stream = rtc.VideoStream(track)
-        last_sampled_at = 0.0
-        try:
-            async for event in stream:
-                now = time.monotonic()
-                if now - last_sampled_at < self._vision_config.frame_sample_interval_seconds:
-                    continue
-                frame = getattr(event, "frame", None)
-                if frame is None:
-                    continue
-                encoded = _encode_video_frame_jpeg(
-                    frame, max_dimension=self._vision_config.max_frame_dimension
-                )
-                if encoded is not None:
-                    self._latest_video_frame_data_url = encoded
-                    last_sampled_at = now
-        finally:
-            await stream.aclose()
-
-    async def _forward_livekit_audio(self, track: Any) -> None:
-        ws = self._ws
-        if ws is None:
-            return
-        stream = rtc.AudioStream(track, sample_rate=INWORLD_INPUT_SAMPLE_RATE, num_channels=INWORLD_CHANNELS, frame_size_ms=INWORLD_FRAME_MS)
-        dropped_before_session_ready = 0
-        try:
-            async for event in stream:
-                # Do NOT send mic audio to Inworld until the session is fully
-                # configured (session.updated received): before that the server
-                # doesn't yet know what model/voice/VAD to apply.
-                if not self._session_ready.is_set():
-                    dropped_before_session_ready += 1
-                    if dropped_before_session_ready == 1 or dropped_before_session_ready % 50 == 0:
-                        logger.info(
-                            "inworld_mic_audio_dropped_before_session_ready=true count=%s",
-                            dropped_before_session_ready,
-                        )
-                    continue
-                frame = getattr(event, "frame", None)
-                pcm = _frame_bytes(frame)
-                if not pcm:
-                    continue
-                try:
-                    await ws.send_json(build_audio_append_message(pcm))
-                except Exception as exc:  # noqa: BLE001
-                    logger.error(
-                        "inworld_mic_audio_send_error=true error_type=%s error=%s",
-                        type(exc).__name__, exc,
-                    )
-                    return
-                self._mic_frames_forwarded += 1
-        finally:
-            if dropped_before_session_ready > 0:
-                logger.info(
-                    "inworld_mic_audio_dropped_before_session_ready_final=true total_dropped=%s",
-                    dropped_before_session_ready,
-                )
-            await stream.aclose()
 
     async def _receive_inworld(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         logger.info("inworld_receive_loop_started=true")
@@ -794,6 +956,18 @@ class InworldRealtimeLiveKitBridge:
 
     async def _handle_inworld_message(self, payload: dict[str, Any]) -> None:
         msg_type = str(payload.get("type") or "")
+
+        # API clients get a scrubbed subset of the event stream (transcripts,
+        # lifecycle, VAD). No-op for LiveKit sessions. Audio reaches clients
+        # via transport.write_output_pcm, not here.
+        if msg_type in _CLIENT_RELAY_EVENT_TYPES:
+            try:
+                await self.transport.emit_event(scrub_event_for_client(payload))
+            except Exception as exc:  # noqa: BLE001 - a client hiccup must not break the session
+                logger.warning(
+                    "client_event_relay_failed=true type=%s error_type=%s error=%s",
+                    msg_type, type(exc).__name__, exc,
+                )
 
         # Audio deltas are the hot path (large, frequent, never carry profile
         # metadata); every other event is scanned for voiceProfile context.
@@ -868,7 +1042,7 @@ class InworldRealtimeLiveKitBridge:
             logger.info("inworld_unknown_server_event=true type=%s", msg_type or "unknown")
 
     async def _write_audio_delta(self, payload: dict[str, Any]) -> None:
-        """Decode a response.output_audio.delta and push PCM to the LiveKit source.
+        """Decode a response.output_audio.delta and hand PCM to the transport.
 
         The base64 PCM lives in the top-level ``delta`` field (confirmed against
         production logs). Tiny/odd/invalid strings — e.g. the all-zero padding
@@ -879,25 +1053,18 @@ class InworldRealtimeLiveKitBridge:
             logger.info("inworld_audio_delta_skipped=true reason=no_decodable_pcm")
             return
 
-        if not self._published:
-            try:
-                await self._publish_output_track()
-            except Exception as exc:  # noqa: BLE001 - don't let publish error kill audio
-                logger.warning("inworld_publish_failed error_type=%s error=%s", type(exc).__name__, exc)
-
-        frame_count = 0
         try:
-            for frame in _iter_pcm_frames(pcm):
-                await self._output_source.capture_frame(frame)
-                frame_count += 1
+            frame_count = await self.transport.write_output_pcm(pcm)
         except Exception as exc:  # noqa: BLE001
             logger.error(
-                "inworld_audio_write_error=true error_type=%s error=%s frame_count=%s",
-                type(exc).__name__, exc, frame_count,
+                "inworld_audio_write_error=true error_type=%s error=%s",
+                type(exc).__name__, exc,
             )
             return
 
         self._audio_frames_written += frame_count
+        # Log key predates the transport seam (dashboards grep for it); for API
+        # sessions "livekit" here just means "the transport".
         logger.info(
             "inworld_audio_written_to_livekit=true frames=%s pcm_bytes=%s total_frames=%s",
             frame_count,
@@ -1073,6 +1240,18 @@ class InworldRealtimeLiveKitBridge:
             if not summary:
                 return
             self.latest_vision_summary = summary
+            # Optionally persist what was seen (VISION_MEMORY_ENABLED) so Arche
+            # can recall objects across sessions. Deduped on the exact summary:
+            # a static scene produces one memory, not one per speech turn.
+            if (
+                self._vision_config.remember_enabled
+                and self._memory_layer is not None
+                and summary != self._last_vision_summary_remembered
+            ):
+                self._memory_layer.schedule_remember(
+                    role="observation", content=summary, turn_id=self._turn_counter
+                )
+                self._last_vision_summary_remembered = summary
             await self._send_instructions_update(reason="vision_context")
             logger.info("inworld_vision_context_update_sent=true summary_length=%s", len(summary))
         finally:
@@ -1105,6 +1284,32 @@ class InworldRealtimeLiveKitBridge:
             self.settings.voice_profile_enabled,
             bool(self._memory_preload_note),
         )
+
+
+class InworldRealtimeLiveKitBridge(ArcheRealtimeSession):
+    """Back-compat constructor: LiveKit room in, same session core.
+
+    Kept so agent.py and the test suite construct the LiveKit-transported
+    session exactly as before the transport seam existed.
+    """
+
+    def __init__(
+        self,
+        room: rtc.Room,
+        settings: InworldRealtimeSettings,
+        *,
+        dataset_writer: EmotionalDatasetWriter | None = None,
+        calibration_enabled: bool = False,
+        memory_task: "asyncio.Task[tuple[MemoryLayer | None, str | None]] | None" = None,
+    ) -> None:
+        super().__init__(
+            settings,
+            LiveKitTransport(room),
+            dataset_writer=dataset_writer,
+            calibration_enabled=calibration_enabled,
+            memory_task=memory_task,
+        )
+        self.room = room
 
 
 async def run_inworld_realtime_bridge(
