@@ -4,17 +4,18 @@ version = "0.1.0"
 description = "LUCY voice server"
 requires-python = ">=3.11"
 dependencies = [
-  "livekit-agents[mistralai,openai,silero,turn-detector,deepgram,hume]>=1.6.1,<1.7",
+  # Core worker framework only — VOICE_ENGINE=inworld_realtime is the sole
+  # engine, so no STT/TTS/VAD/turn-detector plugin extras are needed; Inworld
+  # owns all of that over its own WebSocket.
+  "livekit-agents>=1.6.1,<1.7",
   "python-dotenv",
-  "tavily-python",
   "fastapi",
   "uvicorn",
   "livekit-api",
-  "livekit-plugins-ai-coustics>=0.2.15",
   "psycopg[binary]",
-  # Used directly by the Inworld Realtime bridge, the Inworld voice-profile
-  # shadow, and the Hume TTS path. Declared explicitly so a clean install/CI has
-  # it rather than relying on it arriving transitively.
+  # Used directly by the Inworld Realtime bridge and the Inworld voice-profile
+  # normalization layer. Declared explicitly so a clean install/CI has it
+  # rather than relying on it arriving transitively.
   "aiohttp>=3.9",
   # Default embeddings provider for semantic memory recall (pgvector). Lightweight
   # SDK (httpx/pydantic, no ML libs). OpenAI embeddings use the already-present

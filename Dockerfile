@@ -17,10 +17,10 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev
 RUN uv cache clean 2>/dev/null; rm -rf /root/.cache /tmp/* /var/cache/apt/archives/*.deb
 
-RUN python -c "from livekit.plugins import deepgram, hume, mistralai, openai, silero; from livekit.agents import AgentSession; print('✅ Build imports OK')" || exit 1
+RUN python -c "from livekit.agents import Agent, AgentSession, JobContext, WorkerOptions, cli; print('✅ Build imports OK')" || exit 1
 
 COPY . .
-RUN python agent.py download-files
+RUN python -m livekit.agents download-files
 
 EXPOSE 8080
 CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8080"]
