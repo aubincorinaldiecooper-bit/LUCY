@@ -173,7 +173,10 @@ RUNTIME_CAPABILITY_CONTRACT = """Runtime capability contract:
 
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT)
 if "SYSTEM_PROMPT" in os.environ:
-    logger.warning("SYSTEM_PROMPT env override detected; code-level prompt edits may not affect production unless Railway SYSTEM_PROMPT is updated; mirror the runtime capability contract in Railway SYSTEM_PROMPT for consistency")
+    # Informational deployment note, not an error: runs at module import so it
+    # re-fires per prewarmed process/job. Kept at info so it doesn't flood the
+    # error stream (warnings surface as "error" severity in Railway/stderr).
+    logger.info("SYSTEM_PROMPT env override detected; code-level prompt edits may not affect production unless Railway SYSTEM_PROMPT is updated; mirror the runtime capability contract in Railway SYSTEM_PROMPT for consistency")
 
 TTS_PROVIDER = os.getenv("TTS_PROVIDER", "hume").strip().lower()
 STT_PROVIDER = os.getenv("STT_PROVIDER", "mistral").strip().lower()
@@ -404,10 +407,6 @@ def _mark_search_wait_completed(failed: bool, output: str, result_handoff_spoken
 
 def _search_turn_matches_current() -> bool:
     return _search_turn_id == _current_turn_id
-
-
-def _search_active_for_current_turn() -> bool:
-    return _search_in_progress and _search_turn_matches_current()
 
 
 def _search_specific_response_for_current_turn() -> bool:
@@ -3317,27 +3316,6 @@ TURN_HOLD_FRAGMENT_REPLY_DEADLINE_SECONDS = float(os.getenv("TURN_HOLD_FRAGMENT_
 TURN_HOLD_FRAGMENT_MERGE_WINDOW_SECONDS = float(os.getenv("TURN_HOLD_FRAGMENT_MERGE_WINDOW_SECONDS", os.getenv("TURN_FRAGMENT_TTL_SECONDS", "7")) or "7")
 
 
-def _pcm16_to_audio_frames(pcm_data: bytes, sample_rate: int, channels: int) -> list[rtc.AudioFrame]:
-    bytes_per_sample = 2
-    frame_samples_per_channel = max(1, int(sample_rate * 0.02))
-    frame_bytes = frame_samples_per_channel * channels * bytes_per_sample
-    frames: list[rtc.AudioFrame] = []
-    cursor = 0
-    while cursor < len(pcm_data):
-        chunk = pcm_data[cursor : cursor + frame_bytes]
-        cursor += frame_bytes
-        if len(chunk) < frame_bytes:
-            chunk = chunk + (b"\x00" * (frame_bytes - len(chunk)))
-        frame = rtc.AudioFrame(
-            data=chunk,
-            sample_rate=sample_rate,
-            num_channels=channels,
-            samples_per_channel=frame_samples_per_channel,
-        )
-        frames.append(frame)
-    return frames
-
-
 def _iter_post_speech_silence_frames(reference: "rtc.AudioFrame", hold_ms: int):
     """Yield ~20ms silent frames matching the reference frame's format, totaling hold_ms."""
     sample_rate = int(getattr(reference, "sample_rate", 0) or 24000)
@@ -3514,68 +3492,6 @@ def _log_livekit_tts_source_inspection() -> None:
     logger.info("LiveKit Hume TTS class source excerpt (max_8000): %s", hume_src)
     logger.info("LiveKit Hume TTS.synthesize signature=%s source_excerpt(max_4000): %s", hume_synthesize_sig, hume_synthesize_src)
     logger.info("LiveKit Hume TTS.stream signature=%s source_excerpt(max_4000): %s", hume_stream_sig, hume_stream_src)
-
-
-def _log_memory_identity_readiness() -> None:
-    """One-line startup readiness check so the Railway config is verifiable at a
-    glance: whether long-term memory, per-user identity, and the SimpleMem index
-    are actually active. Logs presence only (never secret values)."""
-    try:
-        import importlib.util
-        simplemem_installed = importlib.util.find_spec("simplemem") is not None
-    except Exception:  # noqa: BLE001 - readiness check must never raise
-        simplemem_installed = False
-    logger.info(
-        "memory_identity_readiness: memory_enabled=%s database_url_present=%s "
-        "session_identity_shared_secret_present=%s simplemem_installed=%s "
-        "simplemem_index_dir=%s memory_preload_limit=%s "
-        "note=%s",
-        memory_enabled(),
-        bool(os.getenv("DATABASE_URL")),
-        bool(os.getenv("SESSION_IDENTITY_SHARED_SECRET")),
-        simplemem_installed,
-        os.getenv("SIMPLEMEM_INDEX_DIR", "/data/simplemem"),
-        os.getenv("MEMORY_PRELOAD_LIMIT", "10"),
-        "set MEMORY_ENABLED=true and a shared SESSION_IDENTITY_SHARED_SECRET on both "
-        "frontend+backend for per-user cross-session memory; simplemem optional "
-        "(falls back to Postgres recency)",
-    )
-    # Semantic-memory / embedding readiness + the active fallback mode.
-    try:
-        from memory_layer import (
-            memory_embedding_dimensions,
-            memory_embedding_model,
-            memory_vector_enabled,
-        )
-        semantic_on = memory_vector_enabled()
-        embed_model = memory_embedding_model()
-        embed_dim = memory_embedding_dimensions()
-    except Exception:  # noqa: BLE001 - readiness check must never raise
-        semantic_on, embed_model, embed_dim = False, "unknown", 0
-    provider = (os.getenv("MEMORY_EMBEDDING_PROVIDER") or "openai").strip().lower()
-    key_present = bool(
-        (os.getenv("COHERE_API_KEY") if provider == "cohere" else os.getenv("OPENAI_API_KEY"))
-    )
-    if not memory_enabled():
-        fallback_mode = "disabled"
-    elif semantic_on and key_present:
-        fallback_mode = "semantic_pgvector"
-    elif simplemem_installed:
-        fallback_mode = "simplemem"
-    else:
-        fallback_mode = "recency_text"
-    logger.info(
-        "memory_semantic_readiness: semantic_memory_enabled=%s embedding_provider=%s "
-        "embedding_model=%s embedding_dim=%s embedding_key_present=%s "
-        "simplemem_active=%s memory_fallback_mode=%s",
-        semantic_on,
-        provider,
-        embed_model,
-        embed_dim,
-        key_present,
-        simplemem_installed,
-        fallback_mode,
-    )
 
 
 def _run_db_migrations_on_startup() -> None:

@@ -44,7 +44,9 @@ Safety:
 
 EMAIL_SYSTEM_PROMPT = os.getenv("EMAIL_SYSTEM_PROMPT", DEFAULT_EMAIL_SYSTEM_PROMPT)
 if "EMAIL_SYSTEM_PROMPT" in os.environ:
-    logger.warning(
+    # Informational deployment note (see agent.py SYSTEM_PROMPT) — info, not
+    # warning, so it doesn't surface as "error" severity on every process init.
+    logger.info(
         "EMAIL_SYSTEM_PROMPT env override detected; code-level email prompt edits may not affect production unless Railway EMAIL_SYSTEM_PROMPT is updated"
     )
 

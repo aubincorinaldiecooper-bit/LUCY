@@ -76,18 +76,6 @@ def transcript_context_llm_timeout_ms() -> int:
         return 350
 
 
-def _int_env_ms(name: str, default: int, *, fallback_env: str | None = None) -> int:
-    raw = os.getenv(name)
-    if raw is None and fallback_env is not None:
-        raw = os.getenv(fallback_env)
-    if raw is None:
-        return default
-    try:
-        return max(1, min(int(raw), 5000))
-    except Exception:
-        return default
-
-
 def _timeout_with_source(candidates: list[tuple[str, str]], default_ms: int) -> tuple[int, str]:
     """Resolve a classifier timeout by precedence, reporting which knob won.
 

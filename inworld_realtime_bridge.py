@@ -296,6 +296,17 @@ def build_audio_append_message(pcm: bytes) -> dict[str, str]:
     return {"type": "input_audio_buffer.append", "audio": base64.b64encode(pcm).decode("ascii")}
 
 
+def inworld_handshake_failure_reason(status: int) -> str:
+    """Map an Inworld WS-handshake HTTP status to an actionable reason.
+
+    402 is a billing rejection (the key is accepted but the account can't run
+    the Realtime API); 401/403 are credential/auth-scheme problems.
+    """
+    return {402: "payment_required", 401: "unauthorized", 403: "forbidden"}.get(
+        status, "handshake_rejected"
+    )
+
+
 _VOICE_PROFILE_KEYS = ("voiceProfile", "voice_profile")
 _VOICE_PROFILE_SCAN_MAX_DEPTH = 6
 
@@ -895,6 +906,17 @@ class ArcheRealtimeSession:
                     finally:
                         await ws.close()
                         await self.aclose()
+        except aiohttp.WSServerHandshakeError as exc:
+            # Inworld rejected the WebSocket handshake before any audio. The HTTP
+            # status is the actionable signal — surface it as its own greppable
+            # flag so an account/billing problem isn't buried in a generic error.
+            logger.error(
+                "inworld_realtime_handshake_failed=true inworld_http_status=%s reason=%s "
+                "audio_frames_written=%s (402=check Inworld account billing; "
+                "401/403=check INWORLD_API_KEY/INWORLD_AUTH_SCHEME)",
+                exc.status, inworld_handshake_failure_reason(exc.status), self._audio_frames_written,
+            )
+            await self.aclose()
         except Exception as exc:
             # Don't re-raise — a bridge fault must not take down the worker.
             logger.error(
