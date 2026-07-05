@@ -164,6 +164,40 @@ class DescribeFrameTests(unittest.TestCase):
             result = asyncio.run(vc.describe_frame("data:image/jpeg;base64,AAAA", cfg))
         self.assertIsNone(result)
 
+    def test_request_asks_openrouter_for_cost_accounting(self):
+        response = _FakeResponse(200, json_body={"choices": [{"message": {"content": "x"}}]})
+        session = _FakeSession(response=response)
+        cfg = _config()
+        with _patch_aiohttp(session):
+            asyncio.run(vc.describe_frame("data:image/jpeg;base64,AAAA", cfg))
+        self.assertEqual(session.last_request["json"]["usage"], {"include": True})
+
+    def test_on_usage_receives_raw_response_for_metering(self):
+        body = {"choices": [{"message": {"content": "x"}}], "usage": {"cost": 0.001}}
+        response = _FakeResponse(200, json_body=body)
+        session = _FakeSession(response=response)
+        cfg = _config()
+        seen = []
+        with _patch_aiohttp(session):
+            asyncio.run(
+                vc.describe_frame("data:image/jpeg;base64,AAAA", cfg, on_usage=seen.append)
+            )
+        self.assertEqual(seen, [body])
+
+    def test_on_usage_exception_never_breaks_the_result(self):
+        response = _FakeResponse(200, json_body={"choices": [{"message": {"content": "ok"}}]})
+        session = _FakeSession(response=response)
+        cfg = _config()
+
+        def boom(_data):
+            raise RuntimeError("metering blew up")
+
+        with _patch_aiohttp(session):
+            result = asyncio.run(
+                vc.describe_frame("data:image/jpeg;base64,AAAA", cfg, on_usage=boom)
+            )
+        self.assertEqual(result, "ok")
+
 
 class BuildVisionContextNoteTests(unittest.TestCase):
     def test_note_contains_summary_and_never_mention_guard(self):

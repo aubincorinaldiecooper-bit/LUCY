@@ -566,7 +566,7 @@ class MoodContextBridgeTests(unittest.TestCase):
     def test_vocal_dials_paired_with_words_when_fresh(self):
         captured = {}
 
-        async def capture(transcript, vocal_summary, config):
+        async def capture(transcript, vocal_summary, config, on_usage=None):
             captured["transcript"] = transcript
             captured["vocal_summary"] = vocal_summary
             return None
