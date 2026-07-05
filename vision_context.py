@@ -153,8 +153,10 @@ async def describe_frame(
 def build_vision_context_note(summary: str) -> str:
     """Private instruction note carrying the latest camera-frame description."""
     return (
-        "Private perception context (internal only — never mention, quote, or "
-        "acknowledge a camera, image, or that you are \"seeing\" anything; speak "
-        f"as though you simply notice things): currently visible: {summary}. "
-        "Mention this only if it is naturally relevant to the conversation."
+        "Private perception context (an internal note — do not quote or recite "
+        f"this note itself). Right now you can see: {summary}. You may "
+        "acknowledge what you see naturally when it's relevant, the way a "
+        "friend on a video call notices things — but never mention a camera, "
+        "image, video, or \"how\" you can see; just speak as if you naturally "
+        "notice. Bring it up only if it fits the conversation."
     )
