@@ -587,5 +587,120 @@ class MoodContextBridgeTests(unittest.TestCase):
         self.assertIn("tension high", captured["vocal_summary"])
 
 
+class TurnTakingGraceTests(unittest.TestCase):
+    """The tunable response grace window (INWORLD_RESPONSE_GRACE_MS).
+
+    Pins the product rules:
+      - off by default: Inworld keeps auto-responding, the bridge never drives
+        response.create,
+      - on: create_response is forced off and the bridge fires the reply itself
+        only after a quiet window,
+      - the user resuming inside the window cancels the reply,
+      - a reply already in flight is never double-fired.
+    """
+
+    @staticmethod
+    def _grace_bridge(grace_ms):
+        room = types.SimpleNamespace(
+            local_participant=types.SimpleNamespace(publish_track=lambda *a, **k: asyncio.sleep(0)),
+            remote_participants={},
+            on=lambda *a, **k: None,
+            off=lambda *a, **k: None,
+        )
+        bridge = irb.InworldRealtimeLiveKitBridge(room, _settings(response_grace_ms=grace_ms))
+        bridge._ws = _FakeWs()
+        bridge._session_ready.set()
+        return bridge
+
+    @staticmethod
+    def _response_creates(bridge):
+        return [m for m in bridge._ws.sent if m.get("type") == "response.create"]
+
+    def test_grace_off_keeps_inworld_auto_response(self):
+        td = irb.build_session_update(_settings())["session"]["audio"]["input"]["turn_detection"]
+        self.assertTrue(td["create_response"])
+
+    def test_grace_on_disables_inworld_auto_response(self):
+        td = irb.build_session_update(_settings(response_grace_ms=800))["session"]["audio"]["input"][
+            "turn_detection"
+        ]
+        self.assertFalse(td["create_response"])
+
+    def test_turn_end_fires_reply_after_quiet_window(self):
+        async def run():
+            bridge = self._grace_bridge(20)
+            await bridge._handle_inworld_message({"type": "input_audio_buffer.speech_stopped"})
+            await asyncio.sleep(0.1)
+            return bridge
+
+        bridge = asyncio.run(run())
+        self.assertEqual(len(self._response_creates(bridge)), 1)
+
+    def test_turn_suggestion_also_arms(self):
+        async def run():
+            bridge = self._grace_bridge(20)
+            await bridge._handle_inworld_message({"type": "input_audio_buffer.turn_suggestion"})
+            await asyncio.sleep(0.1)
+            return bridge
+
+        bridge = asyncio.run(run())
+        self.assertEqual(len(self._response_creates(bridge)), 1)
+
+    def test_user_resuming_cancels_the_reply(self):
+        async def run():
+            bridge = self._grace_bridge(60)
+            await bridge._handle_inworld_message({"type": "input_audio_buffer.speech_stopped"})
+            await asyncio.sleep(0.01)
+            await bridge._handle_inworld_message({"type": "input_audio_buffer.speech_started"})
+            await asyncio.sleep(0.12)
+            return bridge
+
+        bridge = asyncio.run(run())
+        self.assertEqual(self._response_creates(bridge), [])
+
+    def test_rearm_restarts_the_window_and_fires_once(self):
+        async def run():
+            bridge = self._grace_bridge(40)
+            await bridge._handle_inworld_message({"type": "input_audio_buffer.speech_stopped"})
+            await asyncio.sleep(0.02)
+            # A second turn-end signal resets the clock rather than queuing a 2nd reply.
+            await bridge._handle_inworld_message({"type": "input_audio_buffer.speech_stopped"})
+            await asyncio.sleep(0.14)
+            return bridge
+
+        bridge = asyncio.run(run())
+        self.assertEqual(len(self._response_creates(bridge)), 1)
+
+    def test_no_double_fire_when_a_response_is_in_flight(self):
+        async def run():
+            bridge = self._grace_bridge(20)
+            # A reply is already underway (Inworld emitted response.created).
+            await bridge._handle_inworld_message({"type": "response.created"})
+            await bridge._handle_inworld_message({"type": "input_audio_buffer.speech_stopped"})
+            await asyncio.sleep(0.1)
+            return bridge
+
+        bridge = asyncio.run(run())
+        self.assertEqual(self._response_creates(bridge), [])
+
+    def test_grace_disabled_bridge_never_drives_response(self):
+        async def run():
+            room = types.SimpleNamespace(
+                local_participant=types.SimpleNamespace(publish_track=lambda *a, **k: asyncio.sleep(0)),
+                remote_participants={},
+                on=lambda *a, **k: None,
+                off=lambda *a, **k: None,
+            )
+            bridge = irb.InworldRealtimeLiveKitBridge(room, _settings(response_grace_ms=0))
+            bridge._ws = _FakeWs()
+            bridge._session_ready.set()
+            await bridge._handle_inworld_message({"type": "input_audio_buffer.speech_stopped"})
+            await asyncio.sleep(0.05)
+            return bridge
+
+        bridge = asyncio.run(run())
+        self.assertEqual(self._response_creates(bridge), [])
+
+
 if __name__ == "__main__":
     unittest.main()

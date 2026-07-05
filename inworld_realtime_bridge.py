@@ -86,6 +86,16 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(float(raw.strip()))
+    except (TypeError, ValueError):
+        return default
+
+
 def inworld_realtime_session_timeout_seconds() -> float:
     try:
         return max(1.0, float(os.getenv("INWORLD_REALTIME_SESSION_TIMEOUT_SECONDS", "1800")))
@@ -122,6 +132,22 @@ class InworldRealtimeSettings:
     # Below this top-emotion confidence a captured voice profile collapses to
     # neutral (weak signal must never force a tone change).
     emotion_confidence_floor: float = 0.5
+    # Extra quiet window (ms) the bridge waits after Inworld signals the user's
+    # turn ended before it triggers Arche's reply, cancelling if the user
+    # resumes. 0 = off (Inworld auto-responds as before). >0 flips
+    # create_response off so the bridge owns response timing. See
+    # ArcheRealtimeSession._arm_response_grace.
+    response_grace_ms: int = 0
+
+    @property
+    def grace_enabled(self) -> bool:
+        return self.response_grace_ms > 0
+
+    @property
+    def effective_create_response(self) -> bool:
+        # With a grace window the bridge drives response.create itself, so
+        # Inworld must NOT auto-create a response on its own turn-end call.
+        return self.turn_detection_create_response and not self.grace_enabled
 
     @property
     def connection_url(self) -> str:
@@ -179,6 +205,7 @@ def load_inworld_realtime_settings(*, instructions: str | None = None) -> Inworl
         tts_segmenter_strategy=(os.getenv("INWORLD_TTS_SEGMENTER_STRATEGY") or "full_turn").strip(),
         tts_steering_handling=(os.getenv("INWORLD_TTS_STEERING_HANDLING") or "emit_once").strip(),
         emotion_confidence_floor=float(os.getenv("INWORLD_EMOTION_CONFIDENCE_FLOOR", "0.5") or "0.5"),
+        response_grace_ms=_env_int("INWORLD_RESPONSE_GRACE_MS", 0),
     )
 
 
@@ -225,7 +252,10 @@ def build_session_update(settings: InworldRealtimeSettings) -> dict[str, Any]:
                     "turn_detection": {
                         "type": settings.turn_detection_type,
                         "eagerness": settings.turn_detection_eagerness,
-                        "create_response": settings.turn_detection_create_response,
+                        # When a grace window is configured the bridge drives
+                        # response timing itself (see _arm_response_grace), so
+                        # Inworld must not auto-create the response.
+                        "create_response": settings.effective_create_response,
                         "interrupt_response": settings.turn_detection_interrupt_response,
                     },
                 },
@@ -830,6 +860,13 @@ class ArcheRealtimeSession:
         # OPENROUTER_METERING_ENABLED=true (and DATABASE_URL set); inert
         # otherwise. user_ref is set lazily once memory identity resolves.
         self._spend_meter = SpendMeter(session_id=settings.session_id)
+        # Turn-taking grace window (INWORLD_RESPONSE_GRACE_MS). When enabled the
+        # bridge waits out a quiet window after Inworld's turn-end signal before
+        # triggering Arche's reply, cancelling if the user resumes — so a
+        # mid-thought pause no longer gets talked over. _grace_task holds the
+        # pending timer; _response_in_flight suppresses a double response.create.
+        self._grace_task: asyncio.Task[Any] | None = None
+        self._response_in_flight = False
 
     @property
     def vision_enabled(self) -> bool:
@@ -1024,6 +1061,11 @@ class ArcheRealtimeSession:
 
     async def _handle_inworld_message(self, payload: dict[str, Any]) -> None:
         msg_type = str(payload.get("type") or "")
+
+        # Bridge-driven response timing. No-op unless INWORLD_RESPONSE_GRACE_MS
+        # is set, in which case this arms/cancels the turn-taking grace window
+        # (runs alongside the normal event handling below, never replaces it).
+        self._handle_turn_taking(msg_type)
 
         # API clients get a scrubbed subset of the event stream (transcripts,
         # lifecycle, VAD). No-op for LiveKit sessions. Audio reaches clients
@@ -1398,6 +1440,80 @@ class ArcheRealtimeSession:
                 instructions=f"{self.settings.instructions}\n\n{self._memory_preload_note}",
             )
         await self._ws.send_json(build_session_update(self.settings))
+
+    # ---------- turn-taking grace window ----------
+
+    def _handle_turn_taking(self, msg_type: str) -> None:
+        """React to turn-lifecycle events when a grace window is configured.
+
+        No-op unless INWORLD_RESPONSE_GRACE_MS>0. In grace mode Inworld's own
+        auto-response is off (effective_create_response=False); the bridge
+        instead waits out a quiet window after a turn-end signal and triggers
+        the reply itself, so a natural mid-thought pause is no longer talked
+        over. Runs synchronously off the receive loop — only schedules/cancels
+        a timer task, never blocks.
+        """
+        if not self.settings.grace_enabled:
+            return
+        if msg_type == "input_audio_buffer.speech_started":
+            # User (re)started talking inside the window — hold the reply.
+            self._cancel_response_grace(reason="user_resumed")
+        elif msg_type in (
+            "input_audio_buffer.speech_stopped",
+            "input_audio_buffer.turn_suggestion",
+        ):
+            # Inworld thinks the user paused/finished — start (or restart) the
+            # quiet window. Restarting means the newest pause wins.
+            self._arm_response_grace(trigger=msg_type)
+        elif msg_type == "response.created":
+            # A reply is underway (ours or a barge-in); don't double-fire.
+            self._response_in_flight = True
+            self._cancel_response_grace(reason="response_started")
+        elif msg_type == "response.done":
+            self._response_in_flight = False
+
+    def _arm_response_grace(self, *, trigger: str) -> None:
+        self._cancel_response_grace(reason="rearm")
+        if self._response_in_flight:
+            return
+        task = asyncio.create_task(self._response_grace_timer(trigger))
+        self._grace_task = task
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    def _cancel_response_grace(self, *, reason: str) -> None:
+        task = self._grace_task
+        self._grace_task = None
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _response_grace_timer(self, trigger: str) -> None:
+        try:
+            await asyncio.sleep(self.settings.response_grace_ms / 1000)
+        except asyncio.CancelledError:
+            return
+        await self._fire_graced_response(trigger)
+
+    async def _fire_graced_response(self, trigger: str) -> None:
+        """Send response.create after the quiet window held. Best-effort."""
+        self._grace_task = None
+        if self._ws is None or not self._session_ready.is_set() or self._response_in_flight:
+            return
+        # Mark in-flight before sending so a racing turn-end signal can't queue
+        # a second response.create before Inworld's response.created echoes back.
+        self._response_in_flight = True
+        try:
+            await self._ws.send_json(build_response_create())
+            logger.info(
+                "inworld_graced_response_created=true trigger=%s grace_ms=%s",
+                trigger, self.settings.response_grace_ms,
+            )
+        except Exception as exc:  # noqa: BLE001 - a send failure must not kill the bridge
+            self._response_in_flight = False
+            logger.error(
+                "inworld_graced_response_error=true error_type=%s error=%s",
+                type(exc).__name__, exc,
+            )
         logger.info(
             "inworld_session_update_sent=true inworld_session_model=%s inworld_stt_model=%s inworld_tts_model=%s inworld_tts_voice=%s inworld_turn_detection_type=%s tts_delivery_mode=%s tts_segmenter_strategy=%s tts_steering_handling=%s effective_voice_profile_enabled=%s memory_preload_note_present=%s",
             self.settings.model,
