@@ -319,21 +319,26 @@ class MiniCPMOVisionSession:
     def wants_frames(self) -> bool:
         """True while capturing frames is worthwhile — including BEFORE connect.
 
-        Deliberately wider than ``active``: the camera sampler is started from
-        the transport, which may subscribe an already-published camera track
-        before start() has run. Gating that on ``active`` would skip the sampler
-        for a user who had their camera on at session start. The queue is
-        bounded, so buffering a handful of frames across the connect window
-        costs at most VISION_MAX_QUEUE_SIZE frames and makes the first frame
-        available the moment the Gateway is ready.
+        Deliberately wider than ``active``: the session connects lazily, on the
+        first frame (see offer_frame), so frames must be welcome while it is
+        still idle. The camera sampler is also started from the transport, which
+        may subscribe an already-published camera track before any frame has
+        flowed; gating that on ``active`` would skip sampling entirely for a
+        user who joined with their camera already on.
 
-        False once the provider has settled into a state where nothing will
-        consume frames (unavailable/degraded/stopped), so a pending Gateway
-        genuinely means no camera is touched.
+        False once the provider has settled somewhere nothing will consume
+        frames — stopped, terminal, degraded, unavailable, out of connect
+        budget, or with no Gateway configured — so none of those states costs a
+        single frame encode.
         """
         if not self.config.enabled or self._terminal or self._stopped.is_set():
             return False
         if self._connects_used >= self.config.max_total_connects:
+            return False
+        # Determined without any network call, so a pending Gateway means the
+        # camera is never sampled or encoded at all — not sampled, offered, and
+        # then discarded once start() discovers there is nowhere to send it.
+        if self.config.gateway_state is not GatewayState.CONFIGURED:
             return False
         return self._state not in (
             VisionProviderState.UNAVAILABLE,
@@ -412,7 +417,15 @@ class MiniCPMOVisionSession:
             return False
 
         self._set_state(VisionProviderState.CONNECTING, "connect_requested")
-        self._run_task = asyncio.create_task(self._run())
+        try:
+            self._run_task = asyncio.create_task(self._run())
+        except RuntimeError:
+            # No running loop. start() is reached from offer_frame(), which
+            # promises never to raise into the camera path, so this degrades
+            # instead of propagating.
+            self._set_state(VisionProviderState.DEGRADED, "no_event_loop")
+            self._started = False
+            return False
         return True
 
     async def _run(self) -> None:
@@ -586,6 +599,11 @@ class MiniCPMOVisionSession:
         # no-op on every subsequent frame.
         if not self._started:
             self.start()
+            # start() can settle straight into a state where nothing will
+            # consume frames (no event loop, budget exhausted). Re-check rather
+            # than queueing into a session that will never drain.
+            if not self.wants_frames:
+                return False
         now = self._clock()
         # FPS gate first: pointless to enqueue faster than the configured target
         # only to drop it a moment later.

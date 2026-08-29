@@ -222,7 +222,7 @@ async def _client_receive_loop(websocket: Any, session: ArcheRealtimeSession) ->
             # here would stall the user's microphone for that whole time —
             # exactly the "vision must never affect voice" rule.
             stop_task = asyncio.create_task(
-                session.stop_live_vision(reason="client_vision_stop")
+                session.stop_vision(reason="client_vision_stop")
             )
             vision_stop_tasks.add(stop_task)
             stop_task.add_done_callback(vision_stop_tasks.discard)

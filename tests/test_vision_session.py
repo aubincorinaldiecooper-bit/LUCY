@@ -940,3 +940,14 @@ class HardeningTests(unittest.TestCase):
         self.assertEqual(a.session_id, "lucy-same-id")
         self.assertEqual(b.session_id, "lucy-same-id")
         self.assertTrue(id_a.startswith("lucy-same-id-"))
+
+    def test_offer_frame_never_raises_without_a_running_loop(self):
+        # offer_frame self-starts, and start() creates a task. It is always
+        # called from async context in production, but the "never raises into
+        # the camera path" promise must hold regardless.
+        session = vsn.MiniCPMOVisionSession(
+            "lucy-1", config=_config(), connection_factory=_factory()
+        )
+        self.assertFalse(session.offer_frame(FRAME))
+        self.assertIs(session.state, VisionProviderState.DEGRADED)
+        self.assertEqual(session.reason, "no_event_loop")

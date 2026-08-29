@@ -672,7 +672,7 @@ class LiveKitTransport(ArcheTransport):
         session = self._session
         if session is None:
             return
-        task = asyncio.create_task(session.stop_live_vision(reason="camera_track_unsubscribed"))
+        task = asyncio.create_task(session.stop_vision(reason="camera_track_unsubscribed"))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
@@ -978,24 +978,34 @@ class ArcheRealtimeSession:
             )
             return False
 
-    async def stop_live_vision(self, reason: str = "camera_stopped") -> None:
-        """Tear down live vision (camera off / user left). Never raises.
+    async def stop_vision(self, reason: str = "camera_stopped") -> None:
+        """Camera off: stop ALL visual context for this session. Never raises.
 
-        Clears the rolling visual state too, then refreshes instructions so the
-        stale visual note actually disappears from Arche's prompt rather than
-        lingering after the camera is gone.
+        Covers both providers deliberately. Stopping only MiniCPM-o would leave
+        the OpenRouter path holding the last frame and its last summary, so the
+        next time the user spoke Arche would describe a room whose camera has
+        been off for minutes — and with only OpenRouter enabled, a camera-off
+        would have been a complete no-op.
+
+        The instructions refresh at the end is what actually removes the note:
+        build_instructions_session_update always recomposes from the base
+        prompt, so a cleared summary genuinely disappears.
         """
-        if self._live_vision is None:
-            return
-        try:
-            await self._live_vision.stop(reason=reason)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "minicpmo_vision_stop_failed=true error_type=%s error=%s",
-                type(exc).__name__, exc,
-            )
+        if self._live_vision is not None:
+            try:
+                await self._live_vision.stop(reason=reason)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "minicpmo_vision_stop_failed=true error_type=%s error=%s",
+                    type(exc).__name__, exc,
+                )
         self.latest_live_visual_state = None
-        await self._send_instructions_update(reason="live_vision_stopped")
+        # The OpenRouter path: drop the held frame so nothing can be described
+        # after the camera is gone, and the summary so it leaves the prompt.
+        self._latest_video_frame_data_url = None
+        self.latest_vision_summary = None
+        self._last_vision_context_sent_at = 0.0
+        await self._send_instructions_update(reason="vision_stopped")
 
     async def handle_input_pcm(self, pcm: bytes) -> None:
         """Feed one chunk of caller audio (PCM16 @ 24 kHz mono) toward Inworld.
@@ -1081,21 +1091,15 @@ class ArcheRealtimeSession:
             self.settings.turn_detection_type,
             self.settings.voice_profile_enabled,
         )
-        # Before transport.start(): that subscribes already-published tracks, and
-        # the camera sampler's gate reads this session's vision state. Starting
-        # vision first means a user who joined with their camera already on is
-        # sampled from the first frame rather than not at all.
-        #
-        # Non-blocking: start() spawns its own task and returns immediately, so
-        # a Modal cold start (minutes, from scale-to-zero) delays visual context
-        # only — never the Inworld connect below, and never the first word the
-        # user speaks.
-        self.start_live_vision()
+        # Live vision is NOT started here. It connects lazily, on the first
+        # camera frame (MiniCPMOVisionSession.offer_frame self-starts), because
+        # an eager connect would open a Gateway session — and wake an L40S that
+        # stays pinned for up to MINICPMO_SESSION_TIMEOUT_SECONDS — for every
+        # audio-only conversation and every API client that never sends an
+        # image. The sampler gate (wants_camera_frames) still admits frames
+        # while the provider is idle, so a user who joins with their camera
+        # already on is sampled from the first frame.
         try:
-            # Inside the try: start_live_vision() above may already have a
-            # Gateway connect in flight, so a transport failure here must still
-            # reach the handlers below that call aclose() — otherwise the
-            # socket and its Modal GPU session leak.
             await self.transport.start()
             timeout = aiohttp.ClientTimeout(total=None, sock_connect=20, sock_read=None)
             async with aiohttp.ClientSession(timeout=timeout) as session:

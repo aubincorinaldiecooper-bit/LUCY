@@ -79,7 +79,7 @@ class DisabledByDefaultTests(unittest.TestCase):
     def test_start_and_stop_are_no_ops_when_disabled(self):
         session = _make_session({})
         self.assertFalse(session.start_live_vision())
-        asyncio.run(session.stop_live_vision())  # must not raise
+        asyncio.run(session.stop_vision())  # must not raise
 
     def test_frames_still_reach_the_openrouter_path_when_disabled(self):
         # The pre-existing behaviour must be untouched with MiniCPM-o off.
@@ -146,16 +146,18 @@ class FrameFanoutTests(unittest.TestCase):
     def test_sample_interval_speeds_up_for_the_live_provider(self):
         # A live provider that wants frames pulls the sampler up to its target
         # FPS (0.25s at 4 FPS), rather than the lazy 2s OpenRouter default.
-        session = _make_session(_minicpmo_env(VISION_TARGET_FPS="4"))
+        session = _make_session(_minicpmo_env(
+            VISION_TARGET_FPS="4",
+            MINICPMO_REALTIME_URL="wss://gw.example.com/v1/realtime?mode=video",
+        ))
         self.assertTrue(session._live_vision.wants_frames)
         self.assertAlmostEqual(session.frame_sample_interval_seconds(), 0.25)
 
     def test_sample_interval_reverts_when_the_provider_stops_wanting_frames(self):
-        # Gateway pending -> the provider settles to unavailable, and the
-        # sampler must fall back to the pre-existing OpenRouter cadence rather
-        # than burning CPU encoding frames nothing will consume.
+        # Gateway pending -> nothing will consume frames, so the sampler must
+        # fall back to the pre-existing OpenRouter cadence rather than burning
+        # CPU encoding frames that go nowhere.
         session = _make_session(_minicpmo_env(VISION_TARGET_FPS="4"))
-        session.start_live_vision()
         self.assertFalse(session._live_vision.wants_frames)
         self.assertEqual(
             session.frame_sample_interval_seconds(),
@@ -164,6 +166,13 @@ class FrameFanoutTests(unittest.TestCase):
 
     def test_camera_is_not_sampled_at_all_when_both_providers_are_off(self):
         session = _make_session({})
+        self.assertFalse(session.wants_camera_frames)
+
+    def test_pending_gateway_never_touches_the_camera(self):
+        # Determined with no network call, so a pending Gateway costs zero
+        # frame encodes rather than sampling and then discarding.
+        session = _make_session(_minicpmo_env())
+        self.assertFalse(session._live_vision.wants_frames)
         self.assertFalse(session.wants_camera_frames)
 
     def test_camera_is_sampled_before_connect_completes(self):
@@ -176,7 +185,6 @@ class FrameFanoutTests(unittest.TestCase):
 
     def test_pending_gateway_stops_the_camera_being_touched(self):
         session = _make_session(_minicpmo_env())
-        session.start_live_vision()
         self.assertFalse(session.wants_camera_frames)
 
 
@@ -247,7 +255,7 @@ class LiveUpdateFlowTests(unittest.TestCase):
         self.assertEqual(reasons, ["minicpmo_live_vision"])
         self.assertIsNotNone(session.latest_live_visual_state)
 
-    def test_stop_live_vision_clears_state_and_refreshes_instructions(self):
+    def test_stop_vision_clears_state_and_refreshes_instructions(self):
         session = _make_session(_minicpmo_env())
         reasons = []
 
@@ -258,11 +266,11 @@ class LiveUpdateFlowTests(unittest.TestCase):
         session._send_instructions_update = fake_send
         session._live_vision.rolling.ingest({"scene_summary": "A red book."}, now=1.0)
 
-        asyncio.run(session.stop_live_vision(reason="camera_stopped"))
+        asyncio.run(session.stop_vision(reason="camera_stopped"))
 
         self.assertIsNone(session.latest_live_visual_state)
         self.assertIsNone(session._effective_vision_summary())
-        self.assertIn("live_vision_stopped", reasons)
+        self.assertIn("vision_stopped", reasons)
 
     def test_start_live_vision_survives_a_provider_fault(self):
         session = _make_session(_minicpmo_env())
@@ -273,7 +281,7 @@ class LiveUpdateFlowTests(unittest.TestCase):
         session._live_vision.start = explode
         self.assertFalse(session.start_live_vision())  # must not raise
 
-    def test_stop_live_vision_survives_a_provider_fault(self):
+    def test_stop_vision_survives_a_provider_fault(self):
         session = _make_session(_minicpmo_env())
 
         async def explode(reason="x"):
@@ -281,7 +289,7 @@ class LiveUpdateFlowTests(unittest.TestCase):
 
         session._live_vision.stop = explode
         session._send_instructions_update = lambda reason: asyncio.sleep(0)
-        asyncio.run(session.stop_live_vision())  # must not raise
+        asyncio.run(session.stop_vision())  # must not raise
 
 
 class TeardownTests(unittest.TestCase):
@@ -314,3 +322,103 @@ class TeardownTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LazyConnectTests(unittest.TestCase):
+    """An audio-only conversation must never wake a Modal GPU.
+
+    Connecting eagerly at session start would open a Gateway session — and pin
+    an L40S for up to MINICPMO_SESSION_TIMEOUT_SECONDS — for every voice-only
+    call and every API client that never sends an image.
+    """
+
+    def _gateway_env(self, **overrides):
+        return _minicpmo_env(
+            MINICPMO_REALTIME_URL="wss://gw.example.com/v1/realtime?mode=video",
+            **overrides,
+        )
+
+    def test_run_does_not_start_vision(self):
+        # The eager start was removed from run(); connection happens on the
+        # first frame instead.
+        import inspect
+        source = inspect.getsource(bridge.ArcheRealtimeSession.run)
+        self.assertNotIn("start_live_vision()", source)
+
+    def test_no_frames_means_no_connection(self):
+        session = _make_session(self._gateway_env())
+        started = []
+        session._live_vision.start = lambda: started.append(True) or True
+        # A whole conversation's worth of audio, no video at all.
+        for _ in range(50):
+            asyncio.run(session.handle_input_pcm(b""))
+        self.assertEqual(started, [], "an audio-only session must not connect")
+
+    def test_the_first_frame_starts_the_session(self):
+        session = _make_session(self._gateway_env())
+        started = []
+        real_start = session._live_vision.start
+        session._live_vision.start = lambda: (started.append(True), real_start())[1]
+        async def scenario():
+            session.set_video_frame(FRAME)
+
+        asyncio.run(scenario())
+        self.assertEqual(len(started), 1, "the first frame must connect")
+
+    def test_pending_gateway_still_never_connects_on_a_frame(self):
+        session = _make_session(_minicpmo_env())  # no MINICPMO_REALTIME_URL
+        started = []
+        session._live_vision.start = lambda: started.append(True) or True
+        async def scenario():
+            session.set_video_frame(FRAME)
+
+        asyncio.run(scenario())
+        self.assertEqual(started, [], "no Gateway configured: nothing to connect to")
+
+
+class CameraStopClearsBothProvidersTests(unittest.TestCase):
+    """Camera off must stop ALL visual context, not just MiniCPM-o."""
+
+    def test_openrouter_state_is_cleared_on_camera_stop(self):
+        session = _make_session(_minicpmo_env())
+        session._send_instructions_update = lambda reason: asyncio.sleep(0)
+        session.set_video_frame(FRAME)
+        session.latest_vision_summary = "a desk with a lamp"
+
+        asyncio.run(session.stop_vision())
+
+        self.assertIsNone(session._latest_video_frame_data_url,
+                          "the held frame must not survive camera-off")
+        self.assertIsNone(session.latest_vision_summary)
+        self.assertIsNone(session._effective_vision_summary())
+
+    def test_camera_stop_works_with_only_the_openrouter_provider(self):
+        # Previously this returned early when MiniCPM-o was off, making a
+        # camera-off a complete no-op for the OpenRouter path.
+        session = _make_session({})
+        self.assertIsNone(session._live_vision)
+        reasons = []
+
+        async def fake_send(reason):
+            reasons.append(reason)
+            return True
+
+        session._send_instructions_update = fake_send
+        session.set_video_frame(FRAME)
+        session.latest_vision_summary = "a desk with a lamp"
+
+        asyncio.run(session.stop_vision())
+
+        self.assertIsNone(session.latest_vision_summary)
+        self.assertIsNone(session._latest_video_frame_data_url)
+        self.assertIn("vision_stopped", reasons)
+
+    def test_no_frame_can_be_described_after_camera_stop(self):
+        session = _make_session({})
+        session._send_instructions_update = lambda reason: asyncio.sleep(0)
+        session.set_video_frame(FRAME)
+        asyncio.run(session.stop_vision())
+        # _maybe_send_vision_context_update bails without a held frame, so a
+        # later speech turn cannot re-describe the last frame before camera-off.
+        asyncio.run(session._maybe_send_vision_context_update())
+        self.assertFalse(session._vision_call_in_flight)
