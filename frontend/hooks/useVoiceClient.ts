@@ -3,7 +3,7 @@
 import { RemoteTrack, Room, RoomEvent, Track } from "livekit-client";
 import { useCallback, useEffect, useRef, useState } from "react";
 
-export type VoiceState = "idle" | "initializing" | "connecting" | "connected" | "muted";
+type VoiceState = "idle" | "initializing" | "connecting" | "connected" | "muted";
 
 type SessionResponse = { room_url: string; token: string };
 
@@ -21,9 +21,11 @@ const FRONTEND_BUILD = { id: "2026-07-09-inworld-realtime-state-machine", audioP
 // proven via console logs without polluting logs from any other remote audio.
 const INWORLD_REALTIME_TRACK_NAME = "arche-inworld-realtime";
 
-// Mirrors the flag gating the Camera button in ListeningPage: with vision off,
-// the hook must never auto-publish a camera track either.
-const VISION_ENABLED = process.env.NEXT_PUBLIC_VISION_ENABLED === "true";
+// One owner for the vision flag: gates the Camera button in ListeningPage and
+// auto-publish here — with vision off, the hook must never publish a camera
+// track and the UI must not offer the button. (The env access stays a literal
+// so Next.js can inline it at build time.)
+export const VISION_ENABLED = process.env.NEXT_PUBLIC_VISION_ENABLED === "true";
 
 // Turning the camera on is sticky: it stays on (including across sessions on
 // this device) until the user explicitly turns it off. Stored client-side only.
@@ -50,24 +52,15 @@ function writeCameraPreference(on: boolean) {
 function logInworldRealtime(
   event: string,
   extra?: Record<string, unknown>,
-  level: "info" | "warn" | "error" = "info",
+  level: "info" | "warn" = "info",
 ) {
-  const fn =
-    level === "error" ? console.error : level === "warn" ? console.warn : console.info;
+  const fn = level === "warn" ? console.warn : console.info;
   const payload = `[LUCY inworld-realtime] ${event}` + (extra ? ` ${JSON.stringify(extra)}` : "");
   fn(payload);
 }
 
 function getClientTimezone() {
   return Intl.DateTimeFormat().resolvedOptions().timeZone;
-}
-
-function resolveSessionUrl() {
-  // Call our same-origin BFF route (app/api/livekit/session). It validates the
-  // Better Auth session here — where the cookie is readable — then forwards to
-  // the Python backend with the verified user_id. Same-origin also means the
-  // session cookie is sent automatically and no CORS is involved.
-  return "/api/livekit/session";
 }
 
 async function createSession(model?: string): Promise<SessionResponse> {
@@ -79,7 +72,11 @@ async function createSession(model?: string): Promise<SessionResponse> {
       session_payload_keys: Object.keys(payload),
     });
   }
-  const response = await fetch(resolveSessionUrl(), {
+  // Same-origin BFF route (app/api/livekit/session): it validates the Better
+  // Auth session where the cookie is readable, then forwards to the Python
+  // backend with the verified user_id. Same-origin also means the session
+  // cookie is sent automatically and no CORS is involved.
+  const response = await fetch("/api/livekit/session", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -110,8 +107,10 @@ export function useVoiceClient(options?: { onServerDisconnect?: () => void }) {
   // element and a MediaStream source for the same WebRTC track played two
   // overlapping, slightly-offset copies (the "duplicated voice" bug) whose tails
   // desynced and sounded clipped (the "tail cutoff" bug). One element == one copy
-  // == a clean tail. Loudness is left at the source level; if a boost is needed it
-  // must be added without introducing a second audible stream.
+  // == a clean tail. Loudness IS boosted, but without a second audible stream:
+  // setupAudioGainForElement re-routes each element through a single GainNode
+  // (createMediaElementSource replaces the element's direct output rather than
+  // duplicating it), to NEXT_PUBLIC_REMOTE_AUDIO_GAIN.
   const remoteAudioElsRef = useRef<Set<HTMLMediaElement>>(new Set());
   const remoteTrackAudioElsRef = useRef<Map<RemoteTrack, Set<HTMLMediaElement>>>(new Map());
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -240,16 +239,11 @@ export function useVoiceClient(options?: { onServerDisconnect?: () => void }) {
     connectAttemptRef.current += 1;
     userInitiatedDisconnectRef.current = true;
     const room = roomRef.current;
-    if (!room) {
-      clearRemoteAudioElements();
-      setState("idle");
-      setIsMuted(false);
-      setIsCameraOn(false);
-      return;
+    if (room) {
+      await room.disconnect();
+      roomRef.current = null;
     }
-    await room.disconnect();
     clearRemoteAudioElements();
-    roomRef.current = null;
     setState("idle");
     setIsMuted(false);
     setIsCameraOn(false);
@@ -299,18 +293,22 @@ export function useVoiceClient(options?: { onServerDisconnect?: () => void }) {
         const isInworldRealtime = trackName === INWORLD_REALTIME_TRACK_NAME;
 
         if (isInworldRealtime) {
+          const trackSid =
+            (publication as unknown as { trackSid?: string } | undefined)?.trackSid ?? "unknown";
+          const participantIdentity =
+            (participant as unknown as { identity?: string } | undefined)?.identity ?? "unknown";
           logInworldRealtime("track_subscribed", {
             track_name: trackName,
             track_kind: remoteTrack.kind,
             track_id: (remoteTrack as unknown as { id?: string }).id ?? "unknown",
-            track_sid: (publication as unknown as { trackSid?: string } | undefined)?.trackSid ?? "unknown",
-            participant_identity: (participant as unknown as { identity?: string } | undefined)?.identity ?? "unknown",
+            track_sid: trackSid,
+            participant_identity: participantIdentity,
           });
           // Standalone alias for easy log-grep — matches the convention used by
           // the backend's ``inworld_arche_*`` flag names.
           logInworldRealtime("frontend_arche_audio_track_detected=true", {
-            track_sid: (publication as unknown as { trackSid?: string } | undefined)?.trackSid ?? "unknown",
-            participant_identity: (participant as unknown as { identity?: string } | undefined)?.identity ?? "unknown",
+            track_sid: trackSid,
+            participant_identity: participantIdentity,
           });
         }
 
