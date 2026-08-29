@@ -9,6 +9,7 @@ second front door into the same engine.
 Protocol (client -> server):
   {"type": "input_audio_buffer.append", "audio": "<base64 PCM16 @ 24 kHz mono>"}
   {"type": "input_image", "image": "data:image/jpeg;base64,..."}   (vision frame)
+  {"type": "vision.stop"}                                          (camera off)
 
 Protocol (server -> client):
   {"type": "response.output_audio.delta", "delta": "<base64 PCM16 @ 24 kHz mono>"}
@@ -202,8 +203,16 @@ async def _client_receive_loop(websocket: Any, session: ArcheRealtimeSession) ->
         elif msg_type == "input_image":
             image = data.get("image")
             if isinstance(image, str) and len(image) <= MAX_INPUT_IMAGE_CHARS:
-                # set_video_frame validates the data:image/ prefix itself.
+                # set_video_frame validates the data:image/ prefix itself, and
+                # fans the frame into the live MiniCPM-o session when one is
+                # running (bounded queue + FPS gate live there, so a client
+                # streaming faster than VISION_TARGET_FPS costs nothing).
                 session.set_video_frame(image)
+        elif msg_type in ("vision.stop", "input_video.stop"):
+            # Explicit camera-off from the client. Without this a client that
+            # simply stops sending frames would hold the Gateway socket (and a
+            # Modal GPU session) until the whole conversation ended.
+            await session.stop_live_vision(reason="client_vision_stop")
         else:
             ignored_count += 1
             if ignored_count <= 5:
