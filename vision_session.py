@@ -40,6 +40,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
+from uuid import uuid4
 
 from minicpmo_provider import (
     COLD_START_THRESHOLD_MS,
@@ -249,6 +250,14 @@ class MiniCPMOVisionSession:
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.session_id = session_id
+        # Identity sent to the Gateway. NOT session_id: Lucy derives that from
+        # INWORLD_REALTIME_SESSION_ID / LIVEKIT_ROOM_NAME / a millisecond
+        # timestamp (inworld_realtime_bridge.load_inworld_realtime_settings), so
+        # two conversations can share one. The Gateway is shared infrastructure
+        # keyed on whatever we send it, so a collision there could cross two
+        # users' video. A per-instance suffix makes that impossible while
+        # session_id stays the Lucy-side association used for logs and status.
+        self.stream_id = f"{session_id}-{uuid4().hex[:8]}"
         self.config = config if config is not None else load_minicpmo_config()
         self._on_visual_update = on_visual_update
         # Injectable so tests exercise the full lifecycle without a GPU, a
@@ -256,6 +265,8 @@ class MiniCPMOVisionSession:
         self._connection_factory = connection_factory or (
             lambda cfg, sid: MiniCPMORealtimeConnection(cfg, session_id=sid)
         )
+        # Every connection this session opens is created with stream_id, never
+        # the (possibly shared) Lucy session id.
         self._clock = clock
 
         self.queue = BoundedFrameQueue(self.config.max_queue_size)
@@ -476,7 +487,7 @@ class MiniCPMOVisionSession:
                 )
                 return None
             self._connects_used += 1
-            connection = self._connection_factory(self.config, self.session_id)
+            connection = self._connection_factory(self.config, self.stream_id)
             started = self._clock()
             # Session-level mark (first attempt only) drives the user-facing
             # "how long until visual context" number; `started` is per-attempt

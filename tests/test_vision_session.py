@@ -231,7 +231,10 @@ class VisionSessionLifecycleTests(unittest.TestCase):
 
         asyncio.run(scenario())
         self.assertEqual(session.session_id, "lucy-abc123")
-        self.assertEqual(factory.made[0].session_id, "lucy-abc123")
+        # The Gateway gets a per-session stream id derived from (and traceable
+        # to) the Lucy session id — see stream_id in MiniCPMOVisionSession.
+        self.assertTrue(factory.made[0].session_id.startswith("lucy-abc123-"))
+        self.assertEqual(session.stream_id, factory.made[0].session_id)
 
     def test_pending_gateway_is_unavailable_and_opens_no_socket(self):
         # The expected state today. Must cost nothing and wake no GPU.
@@ -912,3 +915,28 @@ class HardeningTests(unittest.TestCase):
         self.assertEqual(cls, "warm", "a retry must not make a warm container look cold")
         self.assertEqual(last_ms, 200.0)
         self.assertGreater(total_ms, last_ms, "total wait still spans the failed attempt")
+
+    def test_gateway_identity_is_unique_per_session_even_on_a_shared_lucy_id(self):
+        # Lucy's session id can be a process-wide env var or a millisecond
+        # timestamp, so two conversations can share one. The Gateway is shared
+        # infrastructure keyed on what we send it, so it must get a unique id
+        # or two users' video could be conflated.
+        factory_a, factory_b = _factory(), _factory()
+        a = vsn.MiniCPMOVisionSession("lucy-same-id", config=_config(),
+                                      connection_factory=factory_a)
+        b = vsn.MiniCPMOVisionSession("lucy-same-id", config=_config(),
+                                      connection_factory=factory_b)
+
+        async def scenario():
+            a.start(); b.start()
+            await _settle(10)
+            ids = (factory_a.made[0].session_id, factory_b.made[0].session_id)
+            await a.aclose(); await b.aclose()
+            return ids
+
+        id_a, id_b = asyncio.run(scenario())
+        self.assertNotEqual(id_a, id_b, "Gateway identities must not collide")
+        # Lucy-side association is still the real session id, for logs/status.
+        self.assertEqual(a.session_id, "lucy-same-id")
+        self.assertEqual(b.session_id, "lucy-same-id")
+        self.assertTrue(id_a.startswith("lucy-same-id-"))
