@@ -407,6 +407,20 @@ class SessionRequest(BaseModel):
     # after Better Auth validated the session). Never trust this from the browser.
     user_id: str | None = None
 
+def _internal_auth_ok(request: Request) -> tuple[bool, bool, bool]:
+    """Check the BFF shared-secret header. Returns (ok, secret_configured, header_present).
+
+    The one owner of the internal-auth gate (SESSION_IDENTITY_SHARED_SECRET vs
+    x-internal-auth, constant-time compare). Auth gates drift worse than most
+    duplication, so both endpoints that trust the Next.js BFF go through here;
+    each keeps its own warning log and failure semantics.
+    """
+    expected = os.getenv("SESSION_IDENTITY_SHARED_SECRET", "")
+    provided = request.headers.get("x-internal-auth", "")
+    ok = bool(expected and provided and hmac.compare_digest(provided, expected))
+    return ok, bool(expected), bool(provided)
+
+
 def _trusted_user_id_from_request(request: Request, payload_user_id: str | None) -> str | None:
     """Return payload.user_id only if the caller proved it's our trusted server.
 
@@ -415,14 +429,13 @@ def _trusted_user_id_from_request(request: Request, payload_user_id: str | None)
     """
     if not payload_user_id:
         return None
-    expected = os.getenv("SESSION_IDENTITY_SHARED_SECRET", "")
-    provided = request.headers.get("x-internal-auth", "")
-    if expected and provided and hmac.compare_digest(provided, expected):
+    ok, secret_configured, header_present = _internal_auth_ok(request)
+    if ok:
         return payload_user_id
     logger.warning(
         "LiveKit session ignored untrusted user_id: secret_configured=%s header_present=%s",
-        bool(expected),
-        bool(provided),
+        secret_configured,
+        header_present,
     )
     return None
 
@@ -679,10 +692,12 @@ async def submit_feedback(
     # Trust comes from the frontend BFF route, which verified the Better Auth
     # session before forwarding. Require the shared secret so the public endpoint
     # can't be driven directly.
-    expected = os.getenv("SESSION_IDENTITY_SHARED_SECRET", "")
-    provided = request.headers.get("x-internal-auth", "")
-    if not (expected and provided and hmac.compare_digest(provided, expected)):
-        logger.warning("feedback rejected: secret_configured=%s header_present=%s", bool(expected), bool(provided))
+    ok, secret_configured, header_present = _internal_auth_ok(request)
+    if not ok:
+        logger.warning(
+            "feedback rejected: secret_configured=%s header_present=%s",
+            secret_configured, header_present,
+        )
         raise HTTPException(status_code=401, detail="unauthorized")
 
     email = (payload.email or "").strip()

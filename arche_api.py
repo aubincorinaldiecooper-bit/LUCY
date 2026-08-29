@@ -49,9 +49,8 @@ from inworld_realtime_bridge import (
 from memory_layer import (
     MemoryIdentity,
     MemoryLayer,
-    emotional_pattern_preload_note,
     memory_enabled,
-    partition_emotional_patterns,
+    preload_with_note,
 )
 from system_prompt import SYSTEM_PROMPT
 from vision_context import load_vision_context_config
@@ -162,14 +161,9 @@ async def _build_api_memory(user_ref: str, session_id: str) -> tuple[MemoryLayer
             return None, None
         identity = MemoryIdentity(guest_id=f"api:{user_ref}")
         layer = MemoryLayer(identity, session_id=session_id)
-        try:
-            memories = await asyncio.wait_for(layer.preload(), timeout=2.0)
-        except asyncio.TimeoutError:
-            memories = []
+        memories, note, timed_out = await preload_with_note(layer)
+        if timed_out:
             logger.warning("memory_preload status=timeout timeout_seconds=2.0 engine=arche_api")
-        general, emotional = partition_emotional_patterns(memories)
-        notes = [MemoryLayer.preload_note(general), emotional_pattern_preload_note(emotional)]
-        note = "\n\n".join(n for n in notes if n) or None
         logger.info(
             "arche_api_memory_ready=true user_ref_present=true preloaded=%s note_present=%s",
             len(memories), bool(note),

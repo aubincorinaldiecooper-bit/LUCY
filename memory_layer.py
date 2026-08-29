@@ -521,3 +521,24 @@ def emotional_pattern_preload_note(patterns: list[str]) -> str | None:
         "say you detected anything, and let what they say now override it.\n"
         f"{lines}"
     )
+
+
+async def preload_with_note(
+    layer: "MemoryLayer", *, timeout_seconds: float = 2.0
+) -> tuple[list[str], str | None, bool]:
+    """Preload memories and build the standard instructions note.
+
+    The one owner of the preload policy shared by both front doors (the
+    LiveKit worker entry in agent.py and the API entry in arche_api.py): cap
+    the Postgres preload, partition emotional patterns, build the general +
+    emotional notes, join or None. Returns (memories, note, timed_out);
+    callers keep their own engine-tagged logging.
+    """
+    try:
+        memories = await asyncio.wait_for(layer.preload(), timeout=timeout_seconds)
+        timed_out = False
+    except asyncio.TimeoutError:
+        memories, timed_out = [], True
+    general, emotional = partition_emotional_patterns(memories)
+    notes = [MemoryLayer.preload_note(general), emotional_pattern_preload_note(emotional)]
+    return memories, "\n\n".join(n for n in notes if n) or None, timed_out

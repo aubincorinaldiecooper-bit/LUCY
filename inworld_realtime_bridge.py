@@ -582,7 +582,15 @@ class ArcheTransport:
     Adapters push caller audio into session.handle_input_pcm() / camera frames
     into session.set_video_frame(), and receive Arche's audio + a scrubbed
     event stream back through this interface.
+
+    ``relays_events`` declares whether emit_event actually delivers anywhere.
+    The core checks it before scrubbing: the scrub is a full recursive copy
+    run per relayed event (per transcript token during every assistant turn),
+    and paying it to feed a no-op would waste work for the life of every
+    conversation on a transport that discards events.
     """
+
+    relays_events = True
 
     def bind(self, session: "ArcheRealtimeSession") -> None:
         raise NotImplementedError
@@ -605,6 +613,10 @@ class ArcheTransport:
 
 class LiveKitTransport(ArcheTransport):
     """LiveKit room adapter: mic/camera tracks in, published audio track out."""
+
+    # Media-plane transport: events stay server-side (emit_event is a no-op),
+    # so the core skips the scrub copy entirely.
+    relays_events = False
 
     def __init__(self, room: rtc.Room) -> None:
         self.room = room
@@ -1198,9 +1210,11 @@ class ArcheRealtimeSession:
         msg_type = str(payload.get("type") or "")
 
         # API clients get a scrubbed subset of the event stream (transcripts,
-        # lifecycle, VAD). No-op for LiveKit sessions. Audio reaches clients
-        # via transport.write_output_pcm, not here.
-        if msg_type in _CLIENT_RELAY_EVENT_TYPES:
+        # lifecycle, VAD). Skipped wholesale for LiveKit sessions
+        # (relays_events=False) so the scrub's recursive copy is never paid to
+        # feed a no-op. Audio reaches clients via transport.write_output_pcm,
+        # not here.
+        if msg_type in _CLIENT_RELAY_EVENT_TYPES and self.transport.relays_events:
             try:
                 await self.transport.emit_event(scrub_event_for_client(payload))
             except Exception as exc:  # noqa: BLE001 - a client hiccup must not break the session

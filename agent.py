@@ -12,10 +12,9 @@ from livekit.agents import JobContext, WorkerOptions, cli
 from inworld_realtime_bridge import run_inworld_realtime_bridge
 from memory_layer import (
     MemoryLayer,
-    emotional_pattern_preload_note,
     identity_from_metadata,
     memory_enabled,
-    partition_emotional_patterns,
+    preload_with_note,
 )
 
 load_dotenv()
@@ -153,21 +152,16 @@ async def _build_memory_layer_for_realtime(ctx: JobContext) -> tuple[MemoryLayer
         room_name = _room_name_from_context(ctx)
         memory_identity = identity_from_metadata(metadata_candidates, fallback_guest_id=room_name)
         memory_layer_instance = MemoryLayer(memory_identity)
-        try:
-            preloaded_memories = await asyncio.wait_for(memory_layer_instance.preload(), timeout=2.0)
-        except asyncio.TimeoutError:
-            preloaded_memories = []
+        preloaded_memories, memory_preload_note, timed_out = await preload_with_note(
+            memory_layer_instance
+        )
+        if timed_out:
             logger.warning("memory_preload status=timeout timeout_seconds=2.0 engine=inworld_realtime")
-        general_memories, emotional_patterns = partition_emotional_patterns(preloaded_memories)
-        general_note = MemoryLayer.preload_note(general_memories)
-        emotional_note = emotional_pattern_preload_note(emotional_patterns)
-        memory_preload_note = "\n\n".join(n for n in (general_note, emotional_note) if n) or None
         logger.info(
-            "Memory layer startup: memory_enabled=true engine=inworld_realtime memory_scope=%s memory_identity_present=%s preloaded_memory_count=%s emotional_pattern_count=%s preload_note_present=%s",
+            "Memory layer startup: memory_enabled=true engine=inworld_realtime memory_scope=%s memory_identity_present=%s preloaded_memory_count=%s preload_note_present=%s",
             memory_identity.scope,
             memory_identity.present,
-            len(general_memories),
-            len(emotional_patterns),
+            len(preloaded_memories),
             bool(memory_preload_note),
         )
         _active_memory_layer = memory_layer_instance

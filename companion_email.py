@@ -5,7 +5,16 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from agent import SYSTEM_PROMPT
+from dotenv import load_dotenv
+
+# Before importing system_prompt: it reads SYSTEM_PROMPT from the environment
+# at import time, and previously the `import agent` here ran load_dotenv()
+# first as a side effect. Importing from system_prompt directly keeps the
+# LiveKit worker machinery (livekit.agents, the bridge, PIL) out of the web
+# process — system_prompt.py exists precisely for that (see its docstring).
+load_dotenv()
+
+from system_prompt import SYSTEM_PROMPT  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
