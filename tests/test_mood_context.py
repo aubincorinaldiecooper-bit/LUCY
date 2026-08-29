@@ -10,11 +10,11 @@ Pins the product rules:
 """
 
 import asyncio
-import types
 import unittest
 from unittest import mock
 
 import mood_context as mc
+from vision_fixtures import FakeResponse as _FakeResponse, FakeSession as _FakeSession, patch_aiohttp
 
 
 def _config(**overrides):
@@ -61,50 +61,8 @@ class BuildMessageTests(unittest.TestCase):
         self.assertIn("none available", msg)
 
 
-class _FakeResponse:
-    def __init__(self, status, json_body=None, text_body=""):
-        self.status = status
-        self._json_body = json_body
-        self._text_body = text_body
-
-    async def json(self):
-        return self._json_body
-
-    async def text(self):
-        return self._text_body
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc):
-        return False
-
-
-class _FakeSession:
-    def __init__(self, response=None, raise_on_post=None):
-        self._response = response
-        self._raise_on_post = raise_on_post
-        self.last_request = None
-
-    def post(self, url, headers=None, json=None):
-        if self._raise_on_post is not None:
-            raise self._raise_on_post
-        self.last_request = {"url": url, "headers": headers, "json": json}
-        return self._response
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc):
-        return False
-
-
 def _patch_aiohttp(fake_session):
-    fake_aiohttp = types.SimpleNamespace(
-        ClientSession=lambda timeout=None: fake_session,
-        ClientTimeout=lambda **k: None,
-    )
-    return mock.patch.object(mc, "aiohttp", fake_aiohttp)
+    return patch_aiohttp(mc, fake_session)
 
 
 def _reply(content):

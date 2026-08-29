@@ -17,6 +17,7 @@ import unittest
 
 import emotional_dataset as ed
 import inworld_realtime_bridge as irb
+from bridge_fixtures import FakeWs, make_realtime_settings
 from inworld_voice_profile import NormalizedVoiceProfile
 
 
@@ -245,38 +246,10 @@ class CalibrationTrackerTests(unittest.TestCase):
 
 
 def _settings():
-    return irb.InworldRealtimeSettings(
-        api_key="k",
-        session_id="room-1",
-        websocket_url="wss://example.test/session",
-        model="openai/gpt-4o-mini",
-        stt_model="assemblyai/u3-rt-pro",
-        tts_model="inworld-tts-2",
-        voice="Luna",
-        speed=1.0,
-        turn_detection_type="semantic_vad",
-        turn_detection_eagerness="medium",
-        turn_detection_create_response=True,
-        turn_detection_interrupt_response=True,
-        instructions="Be concise.",
-        timeout_seconds=60.0,
-        voice_profile_enabled=True,
-        input_format="pcm16",
-        output_format="pcm16",
-        auth_scheme="basic",
-        tts_delivery_mode="CREATIVE",
-        tts_segmenter_strategy="full_turn",
-        tts_steering_handling="emit_once",
-        emotion_confidence_floor=0.5,
-    )
+    return make_realtime_settings(session_id="room-1")
 
 
-class _FakeWs:
-    def __init__(self):
-        self.sent = []
-
-    async def send_json(self, payload):
-        self.sent.append(payload)
+_FakeWs = FakeWs
 
 
 class _FakeWriter:

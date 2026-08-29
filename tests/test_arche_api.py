@@ -18,6 +18,7 @@ from unittest import mock
 
 import arche_api
 import inworld_realtime_bridge as irb
+from bridge_fixtures import make_realtime_settings
 
 
 class ApiAuthTests(unittest.TestCase):
@@ -129,33 +130,7 @@ class ScrubEventTests(unittest.TestCase):
         self.assertIn("voiceProfile", payload)
 
 
-def _settings(**overrides):
-    kwargs = dict(
-        api_key="k",
-        session_id="s",
-        websocket_url="wss://example.test/session",
-        model="openai/gpt-4o-mini",
-        stt_model="assemblyai/u3-rt-pro",
-        tts_model="inworld-tts-2",
-        voice="Luna",
-        speed=1.0,
-        turn_detection_type="semantic_vad",
-        turn_detection_eagerness="medium",
-        turn_detection_create_response=True,
-        turn_detection_interrupt_response=True,
-        instructions="Be concise.",
-        timeout_seconds=60.0,
-        voice_profile_enabled=True,
-        input_format="pcm16",
-        output_format="pcm16",
-        auth_scheme="basic",
-        tts_delivery_mode="CREATIVE",
-        tts_segmenter_strategy="full_turn",
-        tts_steering_handling="emit_once",
-        emotion_confidence_floor=0.5,
-    )
-    kwargs.update(overrides)
-    return irb.InworldRealtimeSettings(**kwargs)
+_settings = make_realtime_settings
 
 
 class _RecordingTransport(irb.ArcheTransport):

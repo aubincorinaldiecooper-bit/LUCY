@@ -1,7 +1,8 @@
-"""Shared fixtures for the MiniCPM-o vision test files.
+"""Shared fixtures for the vision and OpenRouter-context test files.
 
 One home for the constants, config/env factories, and aiohttp-boundary fakes
-that the vision tests share — previously copied per file, where the copies had
+that the MiniCPM-o tests and the OpenRouter vision/mood tests share —
+previously copied per file (four copies at peak), where the copies had
 already begun to drift (get vs post fakes, closed-tracking vs not).
 
 Importable by bare name because pytest, with no __init__.py in tests/, inserts
@@ -78,13 +79,20 @@ class FakeResponse:
 
 
 class FakeSession:
-    """aiohttp session fake for GET-based probes, with close tracking."""
+    """aiohttp session fake covering both usage shapes in the codebase.
 
-    def __init__(self, response=None, raise_on_get=None):
+    GET with close-tracking (the worker health probe), and POST with
+    last-request recording inside ``async with`` (the OpenRouter
+    vision/mood describe calls).
+    """
+
+    def __init__(self, response=None, raise_on_get=None, raise_on_post=None):
         self._response = response if response is not None else FakeResponse()
         self._raise_on_get = raise_on_get
+        self._raise_on_post = raise_on_post
         self.closed = False
         self.last_url = None
+        self.last_request = None
 
     def get(self, url):
         self.last_url = url
@@ -92,8 +100,21 @@ class FakeSession:
             raise self._raise_on_get
         return self._response
 
+    def post(self, url, headers=None, json=None):
+        self.last_url = url
+        if self._raise_on_post is not None:
+            raise self._raise_on_post
+        self.last_request = {"url": url, "headers": headers, "json": json}
+        return self._response
+
     async def close(self):
         self.closed = True
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
 
 
 class HangingSession(FakeSession):
