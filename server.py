@@ -33,8 +33,20 @@ load_dotenv()
 # no-op if a root handler already exists, and uvicorn's loggers don't
 # propagate, so nothing is duplicated. (The worker path is unaffected: the
 # LiveKit CLI configures logging itself.)
+def _log_level_from_env() -> str:
+    """LOG_LEVEL, normalized and validated.
+
+    basicConfig raises ValueError on an unknown level string — and lowercase
+    ("info") or an empty platform variable both count as unknown. This runs at
+    import time, so an unvalidated value would stop the web service booting;
+    anything unrecognized falls back to INFO instead.
+    """
+    raw = (os.getenv("LOG_LEVEL") or "").strip().upper()
+    return raw if raw in {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"} else "INFO"
+
+
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
+    level=_log_level_from_env(),
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 

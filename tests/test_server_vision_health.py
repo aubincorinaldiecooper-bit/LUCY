@@ -115,3 +115,38 @@ class StartupProbeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LogLevelFromEnvTests(unittest.TestCase):
+    """A bad or empty LOG_LEVEL must fall back to INFO, never raise at import.
+
+    basicConfig raises ValueError on unknown level strings — including
+    lowercase "info" and the empty string a platform variable can hold — and
+    this runs at import time, where an exception stops the web service booting.
+    """
+
+    def _resolve(self, value):
+        import server
+        env = {} if value is None else {"LOG_LEVEL": value}
+        with mock.patch.dict(os.environ, env, clear=True):
+            return server._log_level_from_env()
+
+    def test_unset_defaults_to_info(self):
+        self.assertEqual(self._resolve(None), "INFO")
+
+    def test_lowercase_and_padded_values_normalize(self):
+        self.assertEqual(self._resolve("info"), "INFO")
+        self.assertEqual(self._resolve(" debug "), "DEBUG")
+        self.assertEqual(self._resolve("Warning"), "WARNING")
+
+    def test_empty_and_garbage_fall_back_to_info(self):
+        self.assertEqual(self._resolve(""), "INFO")
+        self.assertEqual(self._resolve("verbose"), "INFO")
+        self.assertEqual(self._resolve("15"), "INFO")
+
+    def test_resolved_levels_are_accepted_by_basicConfig(self):
+        import logging as _logging
+        for value in (None, "info", "", "garbage", "ERROR"):
+            _logging.getLevelName(self._resolve(value))  # must not be "Level ..."
+            self.assertIn(self._resolve(value),
+                          {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"})
