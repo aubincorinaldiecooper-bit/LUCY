@@ -35,6 +35,7 @@ def _config(**overrides):
         enabled=True,
         worker_url=WORKER_URL,
         realtime_url="",
+        gateway_token="",
         connect_timeout_seconds=120.0,
         session_timeout_seconds=900.0,
         health_timeout_seconds=10.0,
@@ -297,6 +298,47 @@ class WorkerHealthTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertFalse(cfg.realtime_ready)
         self.assertIs(cfg.gateway_state, mp.GatewayState.PENDING_DEPLOYMENT)
+
+
+class GatewayCredentialTests(unittest.TestCase):
+    """The backend -> Gateway leg must be able to authenticate.
+
+    Every connect wakes an L40S, so an unauthenticated Gateway is a GPU-cost
+    DoS, not just a data exposure. Blank today (no Gateway), but the slot and
+    the wiring must exist so deploying one is config, not code.
+    """
+
+    def test_token_is_blank_by_default(self):
+        with mock.patch.dict("os.environ", _env(), clear=True):
+            self.assertEqual(mp.load_minicpmo_config().gateway_token, "")
+
+    def test_token_is_read_from_env(self):
+        with mock.patch.dict("os.environ", _env(MINICPMO_GATEWAY_TOKEN="  s3cret  "), clear=True):
+            self.assertEqual(mp.load_minicpmo_config().gateway_token, "s3cret")
+
+    def test_no_auth_header_when_unset(self):
+        conn = mp.MiniCPMORealtimeConnection(_config(gateway_token=""), session_id="s-1")
+        self.assertEqual(conn.auth_headers(), {})
+
+    def test_bearer_header_when_set(self):
+        conn = mp.MiniCPMORealtimeConnection(_config(gateway_token="s3cret"), session_id="s-1")
+        self.assertEqual(conn.auth_headers(), {"Authorization": "Bearer s3cret"})
+
+    def test_token_travels_as_a_header_not_a_query_param(self):
+        # A token in a URL lands in proxy and access logs.
+        cfg = _config(gateway_token="s3cret",
+                      realtime_url="wss://gw.example.com/v1/realtime?mode=video")
+        conn = mp.MiniCPMORealtimeConnection(cfg, session_id="s-1")
+        self.assertNotIn("s3cret", cfg.realtime_url)
+        self.assertIn("Authorization", conn.auth_headers())
+
+    def test_token_never_appears_in_a_connection_error(self):
+        cfg = _config(gateway_token="s3cret", realtime_url="")
+        conn = mp.MiniCPMORealtimeConnection(cfg, session_id="s-1")
+        with self.assertRaises(mp.MiniCPMOConnectionError) as ctx:
+            asyncio.run(conn.connect())
+        self.assertNotIn("s3cret", str(ctx.exception))
+        self.assertNotIn("s3cret", ctx.exception.detail)
 
 
 class RealtimeConnectionTests(unittest.TestCase):

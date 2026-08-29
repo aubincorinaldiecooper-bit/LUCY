@@ -692,7 +692,7 @@ class LiveKitTransport(ArcheTransport):
         session = self._session
         if session is None:
             return
-        if not session.vision_enabled and not session.live_vision_enabled:
+        if not session.wants_camera_frames:
             return
         if getattr(track, "kind", None) != rtc.TrackKind.KIND_VIDEO:
             return
@@ -904,7 +904,7 @@ class ArcheRealtimeSession:
         vision off, this returns exactly the value it always did.
         """
         interval = self._vision_config.frame_sample_interval_seconds
-        if self._live_vision is not None and self._live_vision.active:
+        if self._live_vision is not None and self._live_vision.wants_frames:
             interval = min(interval, self._live_vision.config.frame_interval_seconds)
         return interval
 
@@ -912,6 +912,19 @@ class ArcheRealtimeSession:
     def live_vision_enabled(self) -> bool:
         """True when a MiniCPM-o live-video session is running for this session."""
         return self._live_vision is not None and self._live_vision.active
+
+    @property
+    def wants_camera_frames(self) -> bool:
+        """True when EITHER vision provider still has a use for camera frames.
+
+        The sampler gate must not use live_vision_enabled: that requires a
+        completed connect, but the transport can subscribe an already-published
+        camera track before the connect finishes — which would skip sampling
+        entirely for a user who joined with their camera already on.
+        """
+        if self.vision_enabled:
+            return True
+        return self._live_vision is not None and self._live_vision.wants_frames
 
     @property
     def live_vision_status(self) -> dict[str, Any] | None:
@@ -1068,12 +1081,17 @@ class ArcheRealtimeSession:
             self.settings.turn_detection_type,
             self.settings.voice_profile_enabled,
         )
-        await self.transport.start()
+        # Before transport.start(): that subscribes already-published tracks, and
+        # the camera sampler's gate reads this session's vision state. Starting
+        # vision first means a user who joined with their camera already on is
+        # sampled from the first frame rather than not at all.
+        #
         # Non-blocking: start() spawns its own task and returns immediately, so
         # a Modal cold start (minutes, from scale-to-zero) delays visual context
         # only — never the Inworld connect below, and never the first word the
         # user speaks.
         self.start_live_vision()
+        await self.transport.start()
         try:
             timeout = aiohttp.ClientTimeout(total=None, sock_connect=20, sock_read=None)
             async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -1460,6 +1478,12 @@ class ArcheRealtimeSession:
         duplicate a turn.
         """
         if not self._vision_config.enabled or self._vision_call_in_flight:
+            return
+        # Skip the paid OpenRouter call while MiniCPM-o has a live read:
+        # _effective_vision_summary() would discard its result anyway, so the
+        # call would be pure spend. If live vision degrades, context_line()
+        # goes empty and this resumes on the next speech-start by itself.
+        if self._live_vision is not None and self._live_vision.context_line():
             return
         if self._latest_video_frame_data_url is None:
             return

@@ -17,6 +17,11 @@ Two DIFFERENT endpoints, and we currently have only the second one:
   MINICPMO_REALTIME_URL  wss://.../v1/realtime?mode=video — the browser-facing
                          realtime Gateway. NOT DEPLOYED YET, so this is blank.
 
+  MINICPMO_GATEWAY_TOKEN Bearer credential for the Gateway leg. Blank today.
+                         Should be set when the Gateway is deployed: every
+                         connect wakes an L40S, so an unauthenticated Gateway
+                         is a GPU-cost DoS.
+
 The worker is NOT a realtime endpoint and must never be used as one. Pointing
 MINICPMO_REALTIME_URL at the worker would produce a provider that looks
 configured, fails at connect time on every session, and buries the real cause
@@ -154,6 +159,11 @@ class MiniCPMOConfig:
     enabled: bool
     worker_url: str
     realtime_url: str
+    # Bearer credential for the Gateway leg. Blank today because the Gateway is
+    # not deployed; it matters as soon as it is, because every connect wakes an
+    # L40S — an unauthenticated Gateway is a GPU-cost DoS, not just a data
+    # exposure. Server-side only; never reaches a browser.
+    gateway_token: str
     connect_timeout_seconds: float
     session_timeout_seconds: float
     health_timeout_seconds: float
@@ -221,6 +231,7 @@ def load_minicpmo_config() -> MiniCPMOConfig:
         # Intentionally blank until the official OpenBMB realtime Gateway is
         # deployed. Never defaulted to the worker URL — see module docstring.
         realtime_url=(os.getenv("MINICPMO_REALTIME_URL") or "").strip(),
+        gateway_token=(os.getenv("MINICPMO_GATEWAY_TOKEN") or "").strip(),
         connect_timeout_seconds=_env_float(
             "MINICPMO_CONNECT_TIMEOUT_SECONDS", DEFAULT_CONNECT_TIMEOUT_SECONDS
         ),
@@ -353,6 +364,17 @@ class MiniCPMORealtimeConnection:
     docstring — and are isolated here for exactly that reason.
     """
 
+    def auth_headers(self) -> dict[str, str]:
+        """Credential for the Gateway leg, or {} when none is configured.
+
+        Returned as headers rather than a query param on purpose: a token in a
+        URL lands in proxy and access logs. Never logged, never included in a
+        MiniCPMOConnectionError detail.
+        """
+        if not self.config.gateway_token:
+            return {}
+        return {"Authorization": f"Bearer {self.config.gateway_token}"}
+
     def __init__(self, config: MiniCPMOConfig, *, session_id: str) -> None:
         self.config = config
         self.session_id = session_id
@@ -386,7 +408,11 @@ class MiniCPMORealtimeConnection:
             )
             self._session = aiohttp.ClientSession(timeout=timeout)
             self._ws = await asyncio.wait_for(
-                self._session.ws_connect(self.config.realtime_url, heartbeat=20),
+                self._session.ws_connect(
+                    self.config.realtime_url,
+                    headers=self.auth_headers(),
+                    heartbeat=20,
+                ),
                 timeout=self.config.connect_timeout_seconds,
             )
         except asyncio.TimeoutError:

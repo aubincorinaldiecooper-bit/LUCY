@@ -33,6 +33,7 @@ def _config(**overrides):
         enabled=True,
         worker_url=WORKER_URL,
         realtime_url=GATEWAY_URL,
+        gateway_token="",
         connect_timeout_seconds=120.0,
         session_timeout_seconds=900.0,
         health_timeout_seconds=10.0,
@@ -659,7 +660,53 @@ class CleanupTests(unittest.TestCase):
 
         self.assertEqual(asyncio.run(scenario()), [])
 
-    def test_frames_are_rejected_after_stop(self):
+    def test_frames_are_rejected_after_terminal_close(self):
+        # aclose() ends the conversation: nothing may resurrect vision after it.
+        factory = _factory()
+        session = vsn.MiniCPMOVisionSession("lucy-1", config=_config(),
+                                            connection_factory=factory)
+
+        async def scenario():
+            session.start()
+            await _settle()
+            await session.aclose()
+            return session.offer_frame(FRAME), session.start(), session.wants_frames
+
+        offered, restarted, wants = asyncio.run(scenario())
+        self.assertFalse(offered)
+        self.assertFalse(restarted)
+        self.assertFalse(wants)
+
+    def test_camera_off_then_on_restores_live_vision(self):
+        # The bug this guards: stop() used to leave the session permanently
+        # spent, so a user toggling their camera got the OpenRouter path back
+        # but MiniCPM-o stayed silently dark for the rest of the conversation.
+        clock = {"t": 0.0}
+        factory = _factory()
+        session = vsn.MiniCPMOVisionSession(
+            "lucy-1", config=_config(), connection_factory=factory,
+            clock=lambda: clock["t"],
+        )
+
+        async def scenario():
+            session.start()
+            await _settle()
+            await session.stop(reason="camera_stopped")
+            # Camera comes back on: a frame alone must revive the session.
+            clock["t"] = 100.0
+            accepted = session.offer_frame(FRAME)
+            await _settle(20)
+            state = session.state
+            await session.aclose()
+            return accepted, state
+
+        accepted, state = asyncio.run(scenario())
+        self.assertTrue(accepted, "a frame after camera-off must be accepted")
+        self.assertIs(state, VisionProviderState.READY, "vision must reconnect")
+        self.assertEqual(len(factory.made), 2, "a fresh connection is opened")
+        self.assertTrue(factory.made[0].closed, "the first connection is released")
+
+    def test_stop_resets_telemetry_for_the_next_camera_session(self):
         factory = _factory()
         session = vsn.MiniCPMOVisionSession("lucy-1", config=_config(),
                                             connection_factory=factory)
@@ -668,9 +715,11 @@ class CleanupTests(unittest.TestCase):
             session.start()
             await _settle()
             await session.stop()
-            return session.offer_frame(FRAME)
+            return session.telemetry
 
-        self.assertFalse(asyncio.run(scenario()))
+        t = asyncio.run(scenario())
+        self.assertIsNone(t.modal_connected_at,
+                          "stale timings must not describe the next session")
 
 
 class StatusReportingTests(unittest.TestCase):

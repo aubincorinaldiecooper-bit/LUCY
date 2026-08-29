@@ -144,16 +144,40 @@ class FrameFanoutTests(unittest.TestCase):
         self.assertEqual(offered, [])
 
     def test_sample_interval_speeds_up_for_the_live_provider(self):
+        # A live provider that wants frames pulls the sampler up to its target
+        # FPS (0.25s at 4 FPS), rather than the lazy 2s OpenRouter default.
         session = _make_session(_minicpmo_env(VISION_TARGET_FPS="4"))
-        # Live vision inactive -> unchanged.
+        self.assertTrue(session._live_vision.wants_frames)
+        self.assertAlmostEqual(session.frame_sample_interval_seconds(), 0.25)
+
+    def test_sample_interval_reverts_when_the_provider_stops_wanting_frames(self):
+        # Gateway pending -> the provider settles to unavailable, and the
+        # sampler must fall back to the pre-existing OpenRouter cadence rather
+        # than burning CPU encoding frames nothing will consume.
+        session = _make_session(_minicpmo_env(VISION_TARGET_FPS="4"))
+        session.start_live_vision()
+        self.assertFalse(session._live_vision.wants_frames)
         self.assertEqual(
             session.frame_sample_interval_seconds(),
             session.vision_config.frame_sample_interval_seconds,
         )
-        # Active -> fast enough to feed 4 FPS (0.25s), not the lazy 2s default.
-        with mock.patch.object(type(session._live_vision), "active",
-                               property(lambda self: True)):
-            self.assertAlmostEqual(session.frame_sample_interval_seconds(), 0.25)
+
+    def test_camera_is_not_sampled_at_all_when_both_providers_are_off(self):
+        session = _make_session({})
+        self.assertFalse(session.wants_camera_frames)
+
+    def test_camera_is_sampled_before_connect_completes(self):
+        # The bug this guards: gating the sampler on a *completed* connect would
+        # skip a user who joined with their camera already on, because the
+        # transport subscribes existing tracks during the connect window.
+        session = _make_session(_minicpmo_env(MINICPMO_REALTIME_URL="wss://gw.example.com/v1/realtime"))
+        self.assertTrue(session.wants_camera_frames)
+        self.assertFalse(session.live_vision_enabled, "not connected yet")
+
+    def test_pending_gateway_stops_the_camera_being_touched(self):
+        session = _make_session(_minicpmo_env())
+        session.start_live_vision()
+        self.assertFalse(session.wants_camera_frames)
 
 
 class VisionSummarySelectionTests(unittest.TestCase):

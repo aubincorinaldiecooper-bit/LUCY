@@ -260,6 +260,12 @@ class MiniCPMOVisionSession:
         self._stopped = asyncio.Event()
         self._last_frame_accepted_at = 0.0
         self._started = False
+        # Reentrancy guard for stop(); distinct from _stopped, which also acts
+        # as the send loop's exit signal and is cleared again on re-arm.
+        self._stopping = False
+        # Set only by aclose(): the conversation is over, so unlike a
+        # camera-off this must NOT re-arm.
+        self._terminal = False
 
     # --- observable state -------------------------------------------------
 
@@ -273,11 +279,34 @@ class MiniCPMOVisionSession:
 
     @property
     def active(self) -> bool:
-        """True while frames are worth capturing at all."""
+        """True while a connection is being established or is live."""
         return self._state in (
             VisionProviderState.CONNECTING,
             VisionProviderState.COLD_START,
             VisionProviderState.READY,
+        )
+
+    @property
+    def wants_frames(self) -> bool:
+        """True while capturing frames is worthwhile — including BEFORE connect.
+
+        Deliberately wider than ``active``: the camera sampler is started from
+        the transport, which may subscribe an already-published camera track
+        before start() has run. Gating that on ``active`` would skip the sampler
+        for a user who had their camera on at session start. The queue is
+        bounded, so buffering a handful of frames across the connect window
+        costs at most VISION_MAX_QUEUE_SIZE frames and makes the first frame
+        available the moment the Gateway is ready.
+
+        False once the provider has settled into a state where nothing will
+        consume frames (unavailable/degraded/stopped), so a pending Gateway
+        genuinely means no camera is touched.
+        """
+        if not self.config.enabled or self._terminal or self._stopped.is_set():
+            return False
+        return self._state not in (
+            VisionProviderState.UNAVAILABLE,
+            VisionProviderState.DEGRADED,
         )
 
     @property
@@ -319,6 +348,8 @@ class MiniCPMOVisionSession:
         expected outcome today, not an error: the voice conversation proceeds
         identically either way.
         """
+        if self._terminal:
+            return False
         if self._started:
             return self.active
         self._started = True
@@ -464,10 +495,17 @@ class MiniCPMOVisionSession:
         Never raises and never blocks the caller — on the LiveKit path this runs
         on the same event loop as audio forwarding.
         """
-        if not self.active:
+        if not self.wants_frames:
             return False
         if not isinstance(image_data_url, str) or not image_data_url.startswith("data:image/"):
             return False
+        # A frame on an armed-but-idle session means the camera just came (back)
+        # on. Self-starting here is what makes camera-off -> camera-on restore
+        # live vision on BOTH transports, without either needing restart logic
+        # of its own. start() is non-blocking and idempotent, so this is a
+        # no-op on every subsequent frame.
+        if not self._started:
+            self.start()
         now = self._clock()
         # FPS gate first: pointless to enqueue faster than the configured target
         # only to drop it a moment later.
@@ -547,8 +585,9 @@ class MiniCPMOVisionSession:
         behind: no pending frames, no visual state feeding the prompt, no
         socket, no task, no GPU session.
         """
-        if self._stopped.is_set():
+        if self._stopping:
             return
+        self._stopping = True
         self._stopped.set()
 
         for task in list(self._tasks):
@@ -573,13 +612,34 @@ class MiniCPMOVisionSession:
         if self._state is not VisionProviderState.DISABLED:
             self._set_state(VisionProviderState.DISABLED, reason)
         logger.info(
-            "minicpmo_vision_stopped=true session_id=%s reason=%s frames=%s %s",
+            "minicpmo_vision_stopped=true session_id=%s reason=%s frames=%s %s terminal=%s",
             self.session_id, reason, self.queue.stats(), self.telemetry.log_fields(),
+            self._terminal,
         )
 
+        # Re-arm unless the conversation itself ended. A user who turns the
+        # camera off and back on mid-conversation must get live vision back;
+        # without this, start() would short-circuit on _started forever and
+        # MiniCPM-o would stay silently dark while the OpenRouter path resumed.
+        # Telemetry is reset too, so the next session's cold/warm and
+        # first-visual-context numbers describe that session, not the old one.
+        self._stopping = False
+        if not self._terminal:
+            self._started = False
+            self._stopped.clear()
+            self.telemetry = VisionLatencyTelemetry()
+            self._last_frame_accepted_at = 0.0
+
     async def aclose(self) -> None:
-        """Alias for stop(), matching the repo's aclose() teardown convention."""
+        """Terminal teardown for the end of the conversation.
+
+        Unlike stop() (a camera-off, which re-arms), this marks the session
+        spent: a later start() is refused and no frames are wanted, so nothing
+        can resurrect a vision session after the conversation is over.
+        """
+        self._terminal = True
         await self.stop(reason="session_closed")
+        self._stopped.set()
 
     async def _teardown_connection(self) -> None:
         connection, self._connection = self._connection, None
