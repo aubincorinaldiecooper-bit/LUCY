@@ -30,6 +30,22 @@ The bridge normalizes it with inworld_voice_profile.normalize_from_message()
 — which never lets raw emotion labels out — stores the latest profile, and
 feeds profile.planner_summary() back into the session instructions as a
 private, never-user-facing perception note.
+
+Visual context has two independent providers, and they share one output slot:
+
+  - vision_context.py (OpenRouter): a single frame described on demand at
+    speech-start. Cheap, stateless, always available.
+  - vision_session.py (MiniCPM-o 4.5 on Modal): a *live* video session holding
+    a continuously-updated rolling visual state. Higher fidelity, and currently
+    gated on a realtime Gateway that is not yet deployed (see
+    minicpmo_provider.py).
+
+Both end up in the same private perception note via
+_effective_vision_summary() -> build_instructions_session_update(vision_summary=...),
+so nothing downstream needs to know which produced it, and the live provider
+failing simply falls back to the OpenRouter one — or to no visual note at all.
+Neither can interrupt or duplicate a voice turn: visual context is only ever
+folded into instructions, never emitted as a conversation item.
 """
 
 from __future__ import annotations
@@ -70,6 +86,8 @@ from vision_context import (
     describe_frame,
     load_vision_context_config,
 )
+from vision_session import MiniCPMOVisionSession, build_vision_session
+from visual_state import VisualState
 
 logger = logging.getLogger(__name__)
 
@@ -615,6 +633,7 @@ class LiveKitTransport(ArcheTransport):
         await self._publish_output_track()
         self._subscribe_existing_tracks()
         self.room.on("track_subscribed", self._on_track_subscribed)
+        self.room.on("track_unsubscribed", self._on_track_unsubscribed)
         self._listening = True
 
     async def _publish_output_track(self) -> None:
@@ -639,6 +658,24 @@ class LiveKitTransport(ArcheTransport):
         self._maybe_start_audio_forwarder(track)
         self._maybe_start_video_sampler(track)
 
+    def _on_track_unsubscribed(self, track, publication=None, participant=None) -> None:
+        """User turned the camera off — stop ingestion and release the session.
+
+        Sync callback (LiveKit's event emitter is not awaitable), so the async
+        teardown is scheduled. Without this a camera-off would leave the Gateway
+        socket, its tasks and the GPU session alive until the whole conversation
+        ended.
+        """
+        if getattr(track, "kind", None) != rtc.TrackKind.KIND_VIDEO:
+            return
+        self._video_sampler_started = False
+        session = self._session
+        if session is None:
+            return
+        task = asyncio.create_task(session.stop_vision(reason="camera_track_unsubscribed"))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
     def _maybe_start_audio_forwarder(self, track: Any) -> None:
         if getattr(track, "kind", None) != rtc.TrackKind.KIND_AUDIO:
             return
@@ -647,12 +684,15 @@ class LiveKitTransport(ArcheTransport):
         task.add_done_callback(self._tasks.discard)
 
     def _maybe_start_video_sampler(self, track: Any) -> None:
-        # Gated on the feature flag, not just track kind: with vision context
-        # disabled (the default) we never touch a published camera track at
-        # all, so there is zero CPU/behavior change unless deliberately
-        # enabled.
+        # Gated on the feature flags, not just track kind: with BOTH vision
+        # providers disabled (the default) we never touch a published camera
+        # track at all, so there is zero CPU/behavior change unless deliberately
+        # enabled. Either provider on is enough to justify sampling — they
+        # consume the same encoded frame.
         session = self._session
-        if session is None or not session.vision_enabled:
+        if session is None:
+            return
+        if not session.wants_camera_frames:
             return
         if getattr(track, "kind", None) != rtc.TrackKind.KIND_VIDEO:
             return
@@ -678,7 +718,7 @@ class LiveKitTransport(ArcheTransport):
         try:
             async for event in stream:
                 now = time.monotonic()
-                if now - last_sampled_at < session.vision_config.frame_sample_interval_seconds:
+                if now - last_sampled_at < session.frame_sample_interval_seconds():
                     continue
                 frame = getattr(event, "frame", None)
                 if frame is None:
@@ -728,6 +768,10 @@ class LiveKitTransport(ArcheTransport):
         if self._listening:
             try:
                 self.room.off("track_subscribed", self._on_track_subscribed)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                self.room.off("track_unsubscribed", self._on_track_unsubscribed)
             except Exception:  # noqa: BLE001
                 pass
             self._listening = False
@@ -825,6 +869,16 @@ class ArcheRealtimeSession:
         self.latest_mood_summary: str | None = None
         self._last_mood_context_sent_at = 0.0
         self._mood_call_in_flight = False
+        # Live visual understanding (MiniCPM-o 4.5 on Modal). None unless
+        # MINICPMO_ENABLED=true; started lazily in run() so constructing a
+        # session never touches the network. Bound to this session's id, so a
+        # vision stream can only ever belong to the conversation that owns it.
+        # Entirely independent of the OpenRouter vision path above: either,
+        # both, or neither may be enabled.
+        self._live_vision: MiniCPMOVisionSession | None = build_vision_session(
+            settings.session_id, on_visual_update=self._on_live_visual_update
+        )
+        self.latest_live_visual_state: VisualState | None = None
         # OpenRouter spend metering: one persisted row per vision/mood call,
         # attributed to the user (billing key) and session. Off unless
         # OPENROUTER_METERING_ENABLED=true (and DATABASE_URL set); inert
@@ -838,6 +892,120 @@ class ArcheRealtimeSession:
     @property
     def vision_config(self) -> VisionContextConfig:
         return self._vision_config
+
+    def frame_sample_interval_seconds(self) -> float:
+        """How often the camera track should be encoded, for whichever provider needs it soonest.
+
+        The OpenRouter path samples lazily (VISION_FRAME_SAMPLE_INTERVAL_SECONDS,
+        default 2s) because it uses at most one frame per
+        VISION_CONTEXT_MIN_INTERVAL_SECONDS. Live MiniCPM-o wants
+        VISION_TARGET_FPS (default 2/s). Taking the smaller interval keeps the
+        live provider fed without ever slowing the existing path — and with live
+        vision off, this returns exactly the value it always did.
+        """
+        interval = self._vision_config.frame_sample_interval_seconds
+        if self._live_vision is not None and self._live_vision.wants_frames:
+            interval = min(interval, self._live_vision.config.frame_interval_seconds)
+        return interval
+
+    @property
+    def live_vision_enabled(self) -> bool:
+        """True when a MiniCPM-o live-video session is running for this session."""
+        return self._live_vision is not None and self._live_vision.active
+
+    @property
+    def wants_camera_frames(self) -> bool:
+        """True when EITHER vision provider still has a use for camera frames.
+
+        The sampler gate must not use live_vision_enabled: that requires a
+        completed connect, but the transport can subscribe an already-published
+        camera track before the connect finishes — which would skip sampling
+        entirely for a user who joined with their camera already on.
+        """
+        if self.vision_enabled:
+            return True
+        return self._live_vision is not None and self._live_vision.wants_frames
+
+    @property
+    def live_vision_status(self) -> dict[str, Any] | None:
+        """Provider state/telemetry for this session, or None when not configured."""
+        if self._live_vision is None:
+            return None
+        return self._live_vision.status().as_dict()
+
+    def _effective_vision_summary(self) -> str | None:
+        """The visual note to fold into instructions, from whichever provider has one.
+
+        MiniCPM-o wins when it has a live read: it is continuous and current,
+        while the OpenRouter summary is a single frame described at some earlier
+        speech-start. When the live provider is degraded or has nothing yet,
+        this falls through to the OpenRouter summary — which is precisely the
+        voice-only-safe degradation path: a missing visual note changes the
+        prompt, never the conversation.
+        """
+        if self._live_vision is not None:
+            line = self._live_vision.context_line()
+            if line:
+                return line
+        return self.latest_vision_summary
+
+    async def _on_live_visual_update(self, state: VisualState) -> None:
+        """Called by the vision session when the scene materially changed.
+
+        Only a *notable change* reaches here (see visual_state.RollingVisualState),
+        so this is not per-frame: a static scene at 2 FPS produces no updates at
+        all. The refresh goes through the same instructions path as voice/mood
+        context, so it can never interrupt or duplicate a turn.
+        """
+        self.latest_live_visual_state = state
+        await self._send_instructions_update(reason="minicpmo_live_vision")
+
+    def start_live_vision(self) -> bool:
+        """Begin live visual understanding for this session. Never raises.
+
+        Returns False when it will not run (disabled, or the realtime Gateway is
+        not deployed yet) — an expected outcome today, and never an error: the
+        voice conversation is identical either way.
+        """
+        if self._live_vision is None:
+            return False
+        try:
+            return self._live_vision.start()
+        except Exception as exc:  # noqa: BLE001 - vision must never break the voice session
+            logger.warning(
+                "minicpmo_vision_start_failed=true error_type=%s error=%s",
+                type(exc).__name__, exc,
+            )
+            return False
+
+    async def stop_vision(self, reason: str = "camera_stopped") -> None:
+        """Camera off: stop ALL visual context for this session. Never raises.
+
+        Covers both providers deliberately. Stopping only MiniCPM-o would leave
+        the OpenRouter path holding the last frame and its last summary, so the
+        next time the user spoke Arche would describe a room whose camera has
+        been off for minutes — and with only OpenRouter enabled, a camera-off
+        would have been a complete no-op.
+
+        The instructions refresh at the end is what actually removes the note:
+        build_instructions_session_update always recomposes from the base
+        prompt, so a cleared summary genuinely disappears.
+        """
+        if self._live_vision is not None:
+            try:
+                await self._live_vision.stop(reason=reason)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "minicpmo_vision_stop_failed=true error_type=%s error=%s",
+                    type(exc).__name__, exc,
+                )
+        self.latest_live_visual_state = None
+        # The OpenRouter path: drop the held frame so nothing can be described
+        # after the camera is gone, and the summary so it leaves the prompt.
+        self._latest_video_frame_data_url = None
+        self.latest_vision_summary = None
+        self._last_vision_context_sent_at = 0.0
+        await self._send_instructions_update(reason="vision_stopped")
 
     async def handle_input_pcm(self, pcm: bytes) -> None:
         """Feed one chunk of caller audio (PCM16 @ 24 kHz mono) toward Inworld.
@@ -876,6 +1044,14 @@ class ArcheRealtimeSession:
         """
         if isinstance(data_url, str) and data_url.startswith("data:image/"):
             self._latest_video_frame_data_url = data_url
+            # Fan the same frame into the live MiniCPM-o session. offer_frame is
+            # synchronous, non-blocking and non-raising: it applies the
+            # VISION_TARGET_FPS gate and the bounded queue itself, so a live
+            # session that is slow, degraded, or absent costs this call nothing
+            # and can never stall the camera sampler (which on the LiveKit path
+            # shares an event loop with audio forwarding).
+            if self._live_vision is not None:
+                self._live_vision.offer_frame(data_url)
 
     async def _ensure_memory_resolved(self) -> None:
         """Await the background memory-resolution task exactly once.
@@ -915,8 +1091,16 @@ class ArcheRealtimeSession:
             self.settings.turn_detection_type,
             self.settings.voice_profile_enabled,
         )
-        await self.transport.start()
+        # Live vision is NOT started here. It connects lazily, on the first
+        # camera frame (MiniCPMOVisionSession.offer_frame self-starts), because
+        # an eager connect would open a Gateway session — and wake an L40S that
+        # stays pinned for up to MINICPMO_SESSION_TIMEOUT_SECONDS — for every
+        # audio-only conversation and every API client that never sends an
+        # image. The sampler gate (wants_camera_frames) still admits frames
+        # while the provider is idle, so a user who joins with their camera
+        # already on is sampled from the first frame.
         try:
+            await self.transport.start()
             timeout = aiohttp.ClientTimeout(total=None, sock_connect=20, sock_read=None)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.ws_connect(self.settings.connection_url, headers=self.settings.auth_headers, heartbeat=20) as ws:
@@ -982,6 +1166,14 @@ class ArcheRealtimeSession:
             try:
                 await self._memory_layer.aclose()
             except Exception:
+                pass
+        # Release the live-vision session before the transport: stops frame
+        # ingestion, closes the Gateway socket, cancels its tasks and drops the
+        # queued frames, so nothing outlives the conversation.
+        if self._live_vision is not None:
+            try:
+                await self._live_vision.aclose()
+            except Exception:  # noqa: BLE001 - teardown must never raise
                 pass
         try:
             await self._spend_meter.aclose()
@@ -1236,7 +1428,7 @@ class ArcheRealtimeSession:
             self.settings,
             voice_context_summary=summary,
             calibration_question=self._active_calibration_question,
-            vision_summary=self.latest_vision_summary,
+            vision_summary=self._effective_vision_summary(),
             mood_summary=self.latest_mood_summary,
         )
 
@@ -1294,6 +1486,12 @@ class ArcheRealtimeSession:
         duplicate a turn.
         """
         if not self._vision_config.enabled or self._vision_call_in_flight:
+            return
+        # Skip the paid OpenRouter call while MiniCPM-o has a live read:
+        # _effective_vision_summary() would discard its result anyway, so the
+        # call would be pure spend. If live vision degrades, context_line()
+        # goes empty and this resumes on the next speech-start by itself.
+        if self._live_vision is not None and self._live_vision.context_line():
             return
         if self._latest_video_frame_data_url is None:
             return

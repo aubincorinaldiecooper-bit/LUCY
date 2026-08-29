@@ -806,11 +806,122 @@ def _trusted_user_id_from_request(request: Request, payload_user_id: str | None)
 
 
 
+# --- MiniCPM-o live vision: startup probe + cached provider snapshot ----------
+# Verifying that the deployed backend can actually read its vision env vars and
+# reach the Modal worker is otherwise guesswork, so the probe runs once at
+# startup and its result is cached here. /health then reports it without ever
+# making a network call — the Railway healthcheck must stay instant, and Modal
+# cold-starting from scale-to-zero can take minutes.
+
+_vision_provider_snapshot: dict[str, Any] = {"state": "unknown", "checked": False}
+_vision_probe_tasks: set[Any] = set()
+
+
+def _vision_provider_public_snapshot() -> dict[str, Any]:
+    """Non-secret provider view for /health.
+
+    Deliberately booleans and state names only — never MINICPMO_WORKER_URL or
+    MINICPMO_REALTIME_URL. /health is unauthenticated, and infrastructure
+    endpoints are server-side configuration, not something to publish.
+    """
+    return dict(_vision_provider_snapshot)
+
+
+async def _probe_vision_provider() -> None:
+    """One-shot startup connectivity probe. Never raises, never blocks startup.
+
+    Runs as a detached task so a slow or unreachable Modal endpoint delays
+    nothing: not app startup, not the Railway healthcheck, not a voice session.
+    """
+    global _vision_provider_snapshot
+    try:
+        from minicpmo_provider import (
+            GatewayState,
+            check_worker_health,
+            gateway_reason,
+            load_minicpmo_config,
+        )
+
+        config = load_minicpmo_config()
+        gateway = config.gateway_state
+        snapshot: dict[str, Any] = {
+            "checked": True,
+            "enabled": config.enabled,
+            "gateway": gateway.value,
+            "gateway_reason": gateway_reason(gateway),
+            "worker_configured": bool(config.worker_url),
+            "target_fps": config.target_fps,
+            "max_queue_size": config.max_queue_size,
+        }
+
+        # Log the parsed config so the deployed service's own view of its env is
+        # visible in Railway logs. Host only — never the full URL.
+        from urllib.parse import urlsplit
+
+        worker_host = urlsplit(config.worker_url).hostname or "" if config.worker_url else ""
+        logger.info(
+            "minicpmo_config_loaded=true enabled=%s worker_configured=%s worker_host=%s "
+            "gateway=%s gateway_reason=%s connect_timeout_seconds=%s "
+            "session_timeout_seconds=%s target_fps=%s max_queue_size=%s",
+            config.enabled, bool(config.worker_url), worker_host, gateway.value,
+            gateway_reason(gateway), config.connect_timeout_seconds,
+            config.session_timeout_seconds, config.target_fps, config.max_queue_size,
+        )
+
+        if not config.enabled or not config.worker_url:
+            snapshot["state"] = "disabled" if not config.enabled else "unavailable"
+            snapshot["worker_reachable"] = None
+            _vision_provider_snapshot = snapshot
+            return
+
+        result = await check_worker_health(config)
+        snapshot["worker_reachable"] = result.ok
+        # Worker reachable is NOT the same as live vision working: without the
+        # realtime Gateway there is no video path at all. Say so explicitly so a
+        # green worker probe can never be misread as a working integration.
+        if result.ok and gateway is GatewayState.CONFIGURED:
+            snapshot["state"] = "ready"
+        elif result.ok:
+            snapshot["state"] = "unavailable"
+        else:
+            snapshot["state"] = "degraded"
+        _vision_provider_snapshot = snapshot
+
+        logger.info(
+            "minicpmo_worker_health_probe=true %s gateway=%s provider_state=%s "
+            "realtime_available=%s",
+            result.log_fields(), gateway.value, snapshot["state"],
+            gateway is GatewayState.CONFIGURED and result.ok,
+        )
+        if not result.ok:
+            logger.warning(
+                "minicpmo_worker_unreachable=true reason=%s detail=%s "
+                "(vision degrades to voice-only; conversation unaffected)",
+                result.reason, result.detail,
+            )
+    except Exception as exc:  # noqa: BLE001 - a probe fault must never affect the app
+        logger.warning(
+            "minicpmo_probe_failed=true error_type=%s error=%s", type(exc).__name__, exc
+        )
+        _vision_provider_snapshot = {"state": "unknown", "checked": True, "error": type(exc).__name__}
+
+
+@app.on_event("startup")
+async def _startup_vision_probe() -> None:
+    # Detached on purpose: awaiting this would put a Modal round trip in front
+    # of the app becoming ready, and Railway's healthcheck would fail the deploy
+    # on a cold GPU. Held in a module-level set because asyncio keeps only a
+    # weak reference — an unreferenced task can be collected mid-probe.
+    task = asyncio.create_task(_probe_vision_provider())
+    _vision_probe_tasks.add(task)
+    task.add_done_callback(_vision_probe_tasks.discard)
+
+
 @app.get("/health")
 
 async def health() -> JSONResponse:
 
-    return JSONResponse({"status": "ok"})
+    return JSONResponse({"status": "ok", "vision": _vision_provider_public_snapshot()})
 
 
 
