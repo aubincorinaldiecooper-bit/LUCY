@@ -28,6 +28,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+
+from env_utils import env_bool as _env_bool
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -52,13 +54,6 @@ INSERT INTO emotional_calibration_moments
      user_confirmed_or_corrected, inferred_emotional_pattern, normalized_profile)
 VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)
 """
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    raw = os.getenv(name)
-    if raw is None or not raw.strip():
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 @dataclass

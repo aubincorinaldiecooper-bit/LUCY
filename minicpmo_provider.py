@@ -55,6 +55,8 @@ from urllib.parse import urlsplit
 
 import aiohttp
 
+from env_utils import env_bool as _env_bool
+
 logger = logging.getLogger(__name__)
 
 # Cold-start on an L40S pulling MiniCPM-o 4.5 into GPU memory is minutes, not
@@ -111,14 +113,6 @@ class GatewayState(str, Enum):
     INVALID_WORKER_URL = "invalid_worker_url"
     # Set to something that is not a ws:// or wss:// URL at all.
     INVALID_SCHEME = "invalid_scheme"
-
-
-def _env_bool(name: str, default: bool = False) -> bool:
-    """Match inworld_realtime_bridge._env_bool / vision_context semantics exactly."""
-    raw = (os.getenv(name) or "").strip().lower()
-    if not raw:
-        return default
-    return raw in {"1", "true", "yes", "on"}
 
 
 def _env_float(name: str, default: float) -> float:

@@ -22,6 +22,7 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 
+from env_utils import env_bool  # noqa: E402
 from system_prompt import SYSTEM_PROMPT  # noqa: E402
 
 
@@ -53,12 +54,6 @@ def _deployment_git_commit_sha() -> str:
     except Exception:
         return "n/a"
 
-
-def env_bool(name: str, default: bool = False) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    return value.strip().lower() in ("1", "true", "yes", "on")
 
 RUN_DB_MIGRATIONS_ON_STARTUP = env_bool("RUN_DB_MIGRATIONS_ON_STARTUP", False)
 

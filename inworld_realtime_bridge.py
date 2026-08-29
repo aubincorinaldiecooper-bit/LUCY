@@ -65,6 +65,7 @@ import aiohttp
 from livekit import rtc
 from PIL import Image
 
+from env_utils import env_bool as _env_bool
 from emotional_dataset import (
     CalibrationTracker,
     EmotionalDatasetWriter,
@@ -95,13 +96,6 @@ INWORLD_INPUT_SAMPLE_RATE = 24000
 INWORLD_OUTPUT_SAMPLE_RATE = 24000
 INWORLD_CHANNELS = 1
 INWORLD_FRAME_MS = 60
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    raw = os.getenv(name)
-    if raw is None or not raw.strip():
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def inworld_realtime_session_timeout_seconds() -> float:
