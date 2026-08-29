@@ -563,12 +563,13 @@ async def create_livekit_session(payload: SessionRequest, request: Request):
     }
     metadata = json.dumps(metadata_payload)
     metadata_keys = sorted(metadata_payload.keys())
+    # Room and token carry the SAME metadata string, so one containment check
+    # covers both.
     logger.info(
-        "LiveKit session metadata prepared: client_timezone_present=%s client_timezone_value=%s metadata_payload_keys=%s room_metadata_includes_client_timezone=%s token_metadata_includes_client_timezone=%s session_user_id_attached=%s",
+        "LiveKit session metadata prepared: client_timezone_present=%s client_timezone_value=%s metadata_payload_keys=%s metadata_includes_client_timezone=%s session_user_id_attached=%s",
         bool(payload.client_timezone),
         payload.client_timezone or "none",
         metadata_keys,
-        "client_timezone" in metadata_payload,
         "client_timezone" in metadata_payload,
         bool(trusted_user_id),
     )

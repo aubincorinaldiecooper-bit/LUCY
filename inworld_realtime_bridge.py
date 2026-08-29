@@ -429,11 +429,6 @@ def build_instructions_session_update(
     }
 
 
-def build_voice_context_session_update(settings: InworldRealtimeSettings, summary: str) -> dict[str, Any]:
-    """Partial session.update carrying only the voice-context note."""
-    return build_instructions_session_update(settings, voice_context_summary=summary)
-
-
 def _encode_video_frame_jpeg(frame: Any, *, max_dimension: int, quality: int = 70) -> str | None:
     """Downscale + JPEG-encode a LiveKit video frame into a data URL, or None.
 
@@ -807,11 +802,6 @@ class ArcheRealtimeSession:
         self.settings = settings
         self.transport = transport
         transport.bind(self)
-        # Vision gating is transport-specific: the product camera path stays
-        # behind VISION_CONTEXT_ENABLED (ambient capture needs a deliberate
-        # flag), while API sessions inject a forced-enabled config — a client
-        # explicitly sending input_image IS the opt-in (see arche_api).
-        self._vision_config_override = vision_config
         self._tasks: set[asyncio.Task[Any]] = set()
         self._closed = asyncio.Event()
         self._ws: aiohttp.ClientWebSocketResponse | None = None
@@ -849,10 +839,12 @@ class ArcheRealtimeSession:
         # a camera track (if the user publishes one) is sampled at a fixed
         # cadence and described via vision_context.describe_frame(). See
         # vision_context.py for the model-agnostic OpenRouter call.
+        # Vision gating is transport-specific: the product camera path stays
+        # behind VISION_CONTEXT_ENABLED (ambient capture needs a deliberate
+        # flag), while API sessions inject a forced-enabled config — a client
+        # explicitly sending input_image IS the opt-in (see arche_api).
         self._vision_config: VisionContextConfig = (
-            self._vision_config_override
-            if self._vision_config_override is not None
-            else load_vision_context_config()
+            vision_config if vision_config is not None else load_vision_context_config()
         )
         self.latest_vision_summary: str | None = None
         self._last_vision_context_sent_at = 0.0
@@ -1634,7 +1626,6 @@ class InworldRealtimeLiveKitBridge(ArcheRealtimeSession):
             calibration_enabled=calibration_enabled,
             memory_task=memory_task,
         )
-        self.room = room
 
 
 async def run_inworld_realtime_bridge(

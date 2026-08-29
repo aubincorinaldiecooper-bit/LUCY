@@ -77,7 +77,6 @@ class NormalizedVoiceProfile:
         return ", ".join(parts)
 
 
-NEUTRAL_PROFILE = NormalizedVoiceProfile()
 
 def _profile_node(message: dict) -> dict | None:
     """Find the voiceProfile object regardless of camel/snake nesting."""

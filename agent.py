@@ -11,7 +11,6 @@ from dotenv import load_dotenv
 from livekit.agents import JobContext, WorkerOptions, cli
 from inworld_realtime_bridge import run_inworld_realtime_bridge
 from memory_layer import (
-    EMOTIONAL_PATTERN_PREFIX,  # noqa: F401 - re-exported for calibration tests + callers
     MemoryLayer,
     emotional_pattern_preload_note,
     identity_from_metadata,
@@ -23,7 +22,7 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 
-from system_prompt import DEFAULT_SYSTEM_PROMPT, SYSTEM_PROMPT  # noqa: E402,F401
+from system_prompt import SYSTEM_PROMPT  # noqa: E402
 
 
 _active_memory_layer: MemoryLayer | None = None

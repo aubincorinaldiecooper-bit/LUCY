@@ -161,7 +161,7 @@ async def describe_mood(
     text = str(content or "").strip()
     # The model returns "neutral" when nothing notable stands out — treat that
     # as "no read this turn" so we don't inject an empty/uninformative note.
-    if not text or text.strip().lower().rstrip(".") == "neutral":
+    if not text or text.lower().rstrip(".") == "neutral":
         return None
     return text
 

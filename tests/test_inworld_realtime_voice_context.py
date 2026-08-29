@@ -239,7 +239,9 @@ class BuilderTests(unittest.TestCase):
         self.assertIn("never mention", note.lower())
 
     def test_session_update_builder_keeps_base_instructions(self):
-        update = irb.build_voice_context_session_update(_settings(), "energy low, tension low, certainty medium")
+        update = irb.build_instructions_session_update(
+            _settings(), voice_context_summary="energy low, tension low, certainty medium"
+        )
         self.assertEqual(update["session"]["type"], "realtime")
         self.assertTrue(update["session"]["instructions"].startswith("Be concise."))
         self.assertIn("energy low", update["session"]["instructions"])

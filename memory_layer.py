@@ -38,10 +38,6 @@ DEFAULT_MEMORY_EMBEDDING_MODEL = "text-embedding-3-small"
 DEFAULT_MEMORY_EMBEDDING_DIMENSIONS = 1536
 
 
-class _SemanticUnavailable(Exception):
-    """Internal: semantic recall can't run (no embedding) -> fall back to recency."""
-
-
 def memory_enabled() -> bool:
     return os.getenv("MEMORY_ENABLED", "false").strip().lower() in {"true", "1", "yes"}
 
@@ -184,11 +180,9 @@ class MemoryLayer:
                 semantic_on = bool(semantic_enabled)
             self._semantic_enabled = semantic_on
             self._vector_enabled = semantic_on
-            self._embed_fn = embed_fn or embedder or embed_text
-            self._embedder = self._embed_fn
+            self._embedder = embed_fn or embedder or embed_text
             self._semantic_timeout_ms = semantic_timeout_ms_override or semantic_timeout_ms()
             self._embedding_model = memory_embedding_model()
-            self._embedding_dimensions = memory_embedding_dimensions()
         except Exception as exc:
             logger.warning(
                 "memory_semantic_config_invalid=true degraded_to_non_semantic=true error_type=%s error=%s",
@@ -197,11 +191,9 @@ class MemoryLayer:
             )
             self._semantic_enabled = False
             self._vector_enabled = False
-            self._embed_fn = embed_fn or embedder or embed_text
-            self._embedder = self._embed_fn
+            self._embedder = embed_fn or embedder or embed_text
             self._semantic_timeout_ms = self._retrieval_timeout_ms
             self._embedding_model = DEFAULT_MEMORY_EMBEDDING_MODEL
-            self._embedding_dimensions = DEFAULT_MEMORY_EMBEDDING_DIMENSIONS
         self._vector_status = "not_checked" if self._vector_enabled else "disabled"
         self._background_tasks: set[asyncio.Task] = set()
 
@@ -426,11 +418,8 @@ class MemoryLayer:
             )
 
     async def _embed_and_store(self, compact: str, role: str, turn_id: int | None, modality: str, media_url: str | None) -> None:
-        """Store durable memory with optional embedding, degrading to text-only writes. Never raises for semantic failures."""
-        try:
-            await self._write_postgres_memory(compact, role, turn_id, modality, media_url)
-        except Exception:
-            raise
+        """Delegate to _write_postgres_memory. Kept as the seam tests monkeypatch."""
+        await self._write_postgres_memory(compact, role, turn_id, modality, media_url)
 
     async def _write_postgres_memory(self, compact: str, role: str, turn_id: int | None, modality: str, media_url: str | None) -> None:
         metadata = json.dumps({"role": role, "turn_id": turn_id})
@@ -448,7 +437,7 @@ class MemoryLayer:
             media_url,
             metadata,
         )
-        if self._pgvector_available():
+        if await self._pgvector_available_async():
             try:
                 embedding = await self._embed_text(compact)
                 await asyncio.to_thread(

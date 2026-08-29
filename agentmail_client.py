@@ -105,23 +105,3 @@ def reply_to_email(
         payload["html"] = html
 
     return _post_json(f"/inboxes/{inbox_id}/messages/{quoted_message_id}/reply", payload)
-
-
-# Keep camelCase aliases because the integration task explicitly named this helper API.
-def sendEmail(
-    *,
-    to: str | list[str],
-    subject: str,
-    text: str | None = None,
-    html: str | None = None,
-) -> dict[str, Any]:
-    return send_email(to=to, subject=subject, text=text, html=html)
-
-
-def replyToEmail(
-    *,
-    messageId: str,
-    text: str | None = None,
-    html: str | None = None,
-) -> dict[str, Any]:
-    return reply_to_email(message_id=messageId, text=text, html=html)
