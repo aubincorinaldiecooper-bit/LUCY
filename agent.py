@@ -94,15 +94,11 @@ def _run_db_migrations_on_startup() -> None:
 def _realtime_metadata_candidates(ctx: JobContext) -> list[Any]:
     """Gather job/room/participant metadata for identity resolution.
 
-    Deliberately does NOT reuse ``_metadata_candidates_from_context`` /
-    ``_metadata_debug_entries_from_context``: both route every lookup through
-    ``_safe_attr``, which is a logging helper that ``str()``-converts
-    whatever it fetches. Chaining it (``_safe_attr(_safe_attr(ctx, "job"),
-    "metadata")``) calls ``getattr`` on the *stringified* job object, which
-    always fails and silently falls back to the default — so those two
-    helpers never actually return real metadata. Uses plain ``getattr`` here
-    so job-level metadata (how the signed-in user id actually arrives, per
-    SESSION_IDENTITY_SHARED_SECRET) is genuinely read.
+    Plain ``getattr`` chains on purpose: metadata must be read as real
+    objects, never stringified along the way, so job-level metadata (how the
+    signed-in user id actually arrives, per SESSION_IDENTITY_SHARED_SECRET)
+    is genuinely read. The legacy helpers that once wrapped this in a
+    str()-converting logging shim are gone.
     """
     candidates: list[Any] = []
     job = getattr(ctx, "job", None)
@@ -134,10 +130,10 @@ def _room_name_from_context(ctx: JobContext) -> str | None:
 async def _build_memory_layer_for_realtime(ctx: JobContext) -> tuple[MemoryLayer | None, str | None]:
     """Resolve identity + preload long-term memory for the Inworld Realtime path.
 
-    Mirrors entrypoint()'s legacy-pipeline memory setup (identity resolution,
-    preload, emotional-pattern note split) so a returning user gets the same
-    continuity on the realtime engine. Never raises — a resolution failure
-    degrades to no memory for this session rather than blocking voice startup.
+    Identity resolution + preload + emotional-pattern note split (the note
+    itself is built by memory_layer.preload_with_note, shared with the API
+    front door). Never raises — a resolution failure degrades to no memory
+    for this session rather than blocking voice startup.
     """
     global _active_memory_layer
     # Reset unconditionally first: a pre-warmed worker process handles many

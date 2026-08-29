@@ -2,8 +2,9 @@
 
 This path is selected with VOICE_ENGINE=inworld_realtime and keeps LiveKit as
 Arche's browser media transport while Inworld owns STT, TTS, and semantic VAD /
-turn detection. The legacy cascaded LiveKit AgentSession remains available by
-leaving VOICE_ENGINE unset.
+turn detection. It is the ONLY voice engine: the legacy cascaded LiveKit
+AgentSession has been removed, and agent.py refuses to start with any other
+VOICE_ENGINE value.
 
 Architecture (OpenAI-style: one engine, pluggable transports):
 

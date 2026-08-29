@@ -6,8 +6,8 @@ global _active_memory_layer never leaks a previous session's instance forward
 into a session where memory is disabled or setup fails, and a resolution
 failure degrades to (None, None) rather than raising.
 
-Uses the real MemoryLayer (no DATABASE_URL in the test env, so preload() and
-rebuild_index_if_empty() safely no-op) rather than a fake, so this exercises
+Uses the real MemoryLayer (no DATABASE_URL in the test env, so preload()
+safely no-ops) rather than a fake, so this exercises
 the actual identity-resolution + note-composition code path.
 """
 
