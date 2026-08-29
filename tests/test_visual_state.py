@@ -318,3 +318,46 @@ class ParsingHardeningTests(unittest.TestCase):
         line = state.to_context_line()
         self.assertNotIn("Just changed:", line,
                          "the change is just the clamped summary; do not print it twice")
+
+
+class PendingChangeTests(unittest.TestCase):
+    """A change inside the rate-limit window must be delayed, never dropped."""
+
+    def test_change_during_the_window_publishes_afterwards(self):
+        rolling = vs.RollingVisualState(min_update_interval_seconds=4.0)
+        rolling.ingest({"scene_summary": "A desk.", "objects": ["desk"]}, now=0.0)
+        # The interesting moment happens 1s in — inside the window.
+        self.assertFalse(rolling.ingest(
+            {"scene_summary": "User picked up a red book.",
+             "objects": ["desk", "red book"], "actions": ["picked up"]}, now=1.0))
+        # The scene then holds steady. The change must still reach the prompt.
+        published = rolling.ingest(
+            {"scene_summary": "User picked up a red book.",
+             "objects": ["desk", "red book"], "actions": ["picked up"]}, now=6.0)
+        self.assertTrue(published, "a held-back change must not be lost")
+        self.assertIn("red book", rolling.context_line())
+
+    def test_a_genuinely_static_scene_still_never_publishes_twice(self):
+        rolling = vs.RollingVisualState(min_update_interval_seconds=4.0)
+        rolling.ingest({"scene_summary": "A desk.", "objects": ["desk"]}, now=0.0)
+        for i in range(20):
+            self.assertFalse(
+                rolling.ingest({"scene_summary": "A desk.", "objects": ["desk"]},
+                               now=10.0 + i * 5.0), i)
+        self.assertEqual(rolling.updates_published, 1)
+
+    def test_clear_drops_a_pending_change(self):
+        rolling = vs.RollingVisualState(min_update_interval_seconds=4.0)
+        rolling.ingest({"scene_summary": "A desk.", "objects": ["desk"]}, now=0.0)
+        rolling.ingest({"scene_summary": "A lamp.", "objects": ["lamp"]}, now=1.0)
+        rolling.clear()
+        self.assertFalse(rolling._change_pending)
+
+    def test_nested_list_fields_do_not_become_python_repr(self):
+        state = vs.visual_state_from_payload(
+            {"scene_summary": "x", "objects": [["red", "book"], "mug", {"bad": 1}, None]},
+            previous=None, timestamp=1.0,
+        )
+        for obj in state.objects:
+            self.assertNotIn("[", obj)
+            self.assertNotIn("'", obj)

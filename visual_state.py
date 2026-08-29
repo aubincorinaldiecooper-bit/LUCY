@@ -101,6 +101,12 @@ def _clamp_list(value: Any) -> tuple[str, ...]:
         if isinstance(item, dict):
             # e.g. {"label": "red book", "confidence": 0.9} -> "red book"
             item = item.get("label") or item.get("name") or item.get("text") or ""
+        elif isinstance(item, (list, tuple, set)):
+            # A nested container would otherwise be str()'d into Python repr
+            # ("['a', 'b']") and shown to Arche as an object name.
+            item = ", ".join(str(x) for x in item if isinstance(x, (str, int, float)))
+        elif not isinstance(item, (str, int, float)):
+            continue
         if isinstance(item, str) and _looks_like_media(item):
             continue
         text = _clamp(item, MAX_LIST_ITEM_CHARS)
@@ -386,6 +392,10 @@ class RollingVisualState:
     updates_ingested: int = 0
     updates_published: int = 0
     _last_published_at: float = field(default=0.0, repr=False)
+    # A change detected but held back by the rate limit. Without this the
+    # change would be lost for good: `current` has already moved on, so the
+    # next comparison sees no delta and the prompt never learns about it.
+    _change_pending: bool = field(default=False, repr=False)
 
     def ingest(self, payload: Any, *, now: float) -> bool:
         state = visual_state_from_payload(payload, previous=self.current, timestamp=now)
@@ -395,14 +405,19 @@ class RollingVisualState:
         self.current = state
         self.updates_ingested += 1
 
-        if state.notable_change is None:
+        if state.notable_change is not None:
+            self._change_pending = True
+        if not self._change_pending:
             return False
         # First observation always publishes; after that, rate-limit so a busy
-        # scene can't push an instructions update every frame.
+        # scene can't push an instructions update every frame. A change held
+        # back here stays pending and publishes on the first ingest after the
+        # window, rather than being dropped.
         if previous is not None and (now - self._last_published_at) < self.min_update_interval_seconds:
             return False
         self._last_published_at = now
         self.updates_published += 1
+        self._change_pending = False
         return True
 
     def context_line(self) -> str | None:
@@ -420,3 +435,4 @@ class RollingVisualState:
         """
         self.current = None
         self._last_published_at = 0.0
+        self._change_pending = False
