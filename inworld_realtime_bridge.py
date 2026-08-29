@@ -672,9 +672,7 @@ class LiveKitTransport(ArcheTransport):
         session = self._session
         if session is None:
             return
-        task = asyncio.create_task(session.stop_vision(reason="camera_track_unsubscribed"))
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        session.request_stop_vision(reason="camera_track_unsubscribed")
 
     def _maybe_start_audio_forwarder(self, track: Any) -> None:
         if getattr(track, "kind", None) != rtc.TrackKind.KIND_AUDIO:
@@ -860,6 +858,9 @@ class ArcheRealtimeSession:
         self._last_vision_context_sent_at = 0.0
         self._latest_video_frame_data_url: str | None = None
         self._vision_call_in_flight = False
+        # Bumped by _clear_openrouter_vision (camera off); a describe_frame
+        # call started under an older epoch discards its result.
+        self._vision_epoch = 0
         self._last_vision_summary_remembered: str | None = None
         # Mood context: off unless MOOD_CONTEXT_ENABLED=true. On each completed
         # user transcript it fuses the words + the current vocal dials into one
@@ -870,15 +871,16 @@ class ArcheRealtimeSession:
         self._last_mood_context_sent_at = 0.0
         self._mood_call_in_flight = False
         # Live visual understanding (MiniCPM-o 4.5 on Modal). None unless
-        # MINICPMO_ENABLED=true; started lazily in run() so constructing a
-        # session never touches the network. Bound to this session's id, so a
+        # MINICPMO_ENABLED=true; connects lazily on the first camera frame
+        # (offer_frame self-starts), so constructing a session — or running an
+        # audio-only conversation — never touches the network or wakes a GPU.
+        # Bound to this session's id, so a
         # vision stream can only ever belong to the conversation that owns it.
         # Entirely independent of the OpenRouter vision path above: either,
         # both, or neither may be enabled.
         self._live_vision: MiniCPMOVisionSession | None = build_vision_session(
             settings.session_id, on_visual_update=self._on_live_visual_update
         )
-        self.latest_live_visual_state: VisualState | None = None
         # OpenRouter spend metering: one persisted row per vision/mood call,
         # attributed to the user (billing key) and session. Off unless
         # OPENROUTER_METERING_ENABLED=true (and DATABASE_URL set); inert
@@ -909,29 +911,19 @@ class ArcheRealtimeSession:
         return interval
 
     @property
-    def live_vision_enabled(self) -> bool:
-        """True when a MiniCPM-o live-video session is running for this session."""
-        return self._live_vision is not None and self._live_vision.active
-
-    @property
     def wants_camera_frames(self) -> bool:
         """True when EITHER vision provider still has a use for camera frames.
 
-        The sampler gate must not use live_vision_enabled: that requires a
-        completed connect, but the transport can subscribe an already-published
-        camera track before the connect finishes — which would skip sampling
-        entirely for a user who joined with their camera already on.
+        Deliberately not gated on a *completed* connect (the provider's
+        ``active``): the transport can subscribe an already-published camera
+        track before any frame has flowed, and the live session connects
+        lazily on the first frame — so "wants" has to be true while it is
+        still idle, or a user who joined with their camera already on would
+        never be sampled.
         """
         if self.vision_enabled:
             return True
         return self._live_vision is not None and self._live_vision.wants_frames
-
-    @property
-    def live_vision_status(self) -> dict[str, Any] | None:
-        """Provider state/telemetry for this session, or None when not configured."""
-        if self._live_vision is None:
-            return None
-        return self._live_vision.status().as_dict()
 
     def _effective_vision_summary(self) -> str | None:
         """The visual note to fold into instructions, from whichever provider has one.
@@ -957,26 +949,33 @@ class ArcheRealtimeSession:
         all. The refresh goes through the same instructions path as voice/mood
         context, so it can never interrupt or duplicate a turn.
         """
-        self.latest_live_visual_state = state
         await self._send_instructions_update(reason="minicpmo_live_vision")
 
-    def start_live_vision(self) -> bool:
-        """Begin live visual understanding for this session. Never raises.
+    def _clear_openrouter_vision(self) -> None:
+        """Drop the OpenRouter path's visual state — its owner method.
 
-        Returns False when it will not run (disabled, or the realtime Gateway is
-        not deployed yet) — an expected outcome today, and never an error: the
-        voice conversation is identical either way.
+        Bumping the epoch invalidates any describe_frame call already in
+        flight: one that captured the frame before camera-off would otherwise
+        complete up to VISION_CONTEXT_TIMEOUT_SECONDS later and resurrect a
+        visual note about a room the camera can no longer see.
         """
-        if self._live_vision is None:
-            return False
-        try:
-            return self._live_vision.start()
-        except Exception as exc:  # noqa: BLE001 - vision must never break the voice session
-            logger.warning(
-                "minicpmo_vision_start_failed=true error_type=%s error=%s",
-                type(exc).__name__, exc,
-            )
-            return False
+        self._vision_epoch += 1
+        self._latest_video_frame_data_url = None
+        self.latest_vision_summary = None
+        self._last_vision_context_sent_at = 0.0
+
+    def request_stop_vision(self, reason: str = "camera_stopped") -> None:
+        """Schedule stop_vision without blocking the caller. Never raises.
+
+        The one sanctioned way to stop vision from a hot or synchronous
+        context: the API's audio-ingest loop and LiveKit's sync event callback
+        both must not await a Gateway close handshake (seconds, against an
+        unresponsive peer). The task lands in the session's own _tasks, so the
+        session's teardown — already the leak backstop — cancels and awaits it.
+        """
+        task = asyncio.create_task(self.stop_vision(reason=reason))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
 
     async def stop_vision(self, reason: str = "camera_stopped") -> None:
         """Camera off: stop ALL visual context for this session. Never raises.
@@ -999,12 +998,7 @@ class ArcheRealtimeSession:
                     "minicpmo_vision_stop_failed=true error_type=%s error=%s",
                     type(exc).__name__, exc,
                 )
-        self.latest_live_visual_state = None
-        # The OpenRouter path: drop the held frame so nothing can be described
-        # after the camera is gone, and the summary so it leaves the prompt.
-        self._latest_video_frame_data_url = None
-        self.latest_vision_summary = None
-        self._last_vision_context_sent_at = 0.0
+        self._clear_openrouter_vision()
         await self._send_instructions_update(reason="vision_stopped")
 
     async def handle_input_pcm(self, pcm: bytes) -> None:
@@ -1505,6 +1499,7 @@ class ArcheRealtimeSession:
         task.add_done_callback(self._tasks.discard)
 
     async def _run_vision_context_update(self) -> None:
+        epoch = self._vision_epoch
         try:
             frame = self._latest_video_frame_data_url
             if frame is None:
@@ -1517,6 +1512,11 @@ class ArcheRealtimeSession:
                 ),
             )
             if not summary:
+                return
+            if epoch != self._vision_epoch:
+                # Camera turned off while this call was in flight: the frame it
+                # described no longer represents anything in view. Discarding
+                # here is what makes stop_vision's promise real.
                 return
             self.latest_vision_summary = summary
             # Optionally persist what was seen (VISION_MEMORY_ENABLED) so Arche

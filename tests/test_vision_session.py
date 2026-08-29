@@ -17,35 +17,19 @@ here needs a GPU, Modal, or a socket.
 
 import asyncio
 import unittest
-from unittest import mock
 
 import minicpmo_provider as mp
 import vision_session as vsn
 from minicpmo_provider import VisionProviderState
-
-WORKER_URL = "https://aubincorinaldiecooper--minicpmo45-realtime-minicpmo-worker.modal.run"
-GATEWAY_URL = "wss://minicpmo-gateway.example.com/v1/realtime?mode=video"
-FRAME = "data:image/jpeg;base64,AAAA"
+from vision_fixtures import FRAME, GATEWAY_URL, WORKER_URL, make_minicpmo_config
 
 
 def _config(**overrides):
-    kwargs = dict(
-        enabled=True,
-        worker_url=WORKER_URL,
-        realtime_url=GATEWAY_URL,
-        gateway_token="",
-        connect_timeout_seconds=120.0,
-        session_timeout_seconds=900.0,
-        health_timeout_seconds=10.0,
-        target_fps=2.0,
-        max_queue_size=4,
-        max_connect_attempts=2,
-        max_total_connects=6,
-        reconnect_backoff_seconds=0.0,
-        min_state_update_interval_seconds=0.0,
-    )
-    kwargs.update(overrides)
-    return mp.MiniCPMOConfig(**kwargs)
+    # This file's sessions default to a configured Gateway and no test delays.
+    overrides.setdefault("realtime_url", GATEWAY_URL)
+    overrides.setdefault("reconnect_backoff_seconds", 0.0)
+    overrides.setdefault("min_state_update_interval_seconds", 0.0)
+    return make_minicpmo_config(**overrides)
 
 
 class FakeConnection:
@@ -291,7 +275,7 @@ class VisionSessionLifecycleTests(unittest.TestCase):
 class FailureDegradationTests(unittest.TestCase):
     """Vision failure must always degrade to voice-only, never raise."""
 
-    def test_connect_timeout_degrades_to_unavailable(self):
+    def test_connect_timeout_reports_unavailable_then_cleans_up(self):
         factory = _factory(fail_with=mp.MiniCPMOConnectionError("connect_timeout", "cold"))
         session = vsn.MiniCPMOVisionSession(
             "lucy-1", config=_config(max_connect_attempts=1), connection_factory=factory
@@ -300,14 +284,23 @@ class FailureDegradationTests(unittest.TestCase):
         async def scenario():
             session.start()
             await _settle(20)
+            live_state, live_reason = session.state, session.reason
             await session.aclose()
+            return live_state, live_reason
 
-        asyncio.run(scenario())
+        state, reason = asyncio.run(scenario())
+        self.assertIs(state, VisionProviderState.UNAVAILABLE)
+        self.assertEqual(reason, "connect_timeout")
         self.assertIs(session.state, VisionProviderState.DISABLED)  # after aclose
         self.assertTrue(factory.made[0].closed)
 
-    def test_connect_timeout_reports_unavailable_before_teardown(self):
-        factory = _factory(fail_with=mp.MiniCPMOConnectionError("connect_timeout", "cold"))
+    def test_config_refusal_classifies_unavailable_via_the_error_flag(self):
+        # ACT: the UNAVAILABLE-vs-DEGRADED split rides on
+        # MiniCPMOConnectionError.config_error, not a re-encoded reason list —
+        # a new Gateway state added in the provider classifies correctly here.
+        factory = _factory(fail_with=mp.MiniCPMOConnectionError(
+            "some_future_gateway_refusal", "x", config_error=True
+        ))
         session = vsn.MiniCPMOVisionSession(
             "lucy-1", config=_config(max_connect_attempts=1), connection_factory=factory
         )
@@ -319,7 +312,7 @@ class FailureDegradationTests(unittest.TestCase):
 
         state, reason = asyncio.run(scenario())
         self.assertIs(state, VisionProviderState.UNAVAILABLE)
-        self.assertEqual(reason, "connect_timeout")
+        self.assertEqual(reason, "some_future_gateway_refusal")
 
     def test_provider_unavailable_degrades(self):
         factory = _factory(fail_with=mp.MiniCPMOConnectionError("connect_failed", "refused"))
@@ -521,7 +514,7 @@ class VisualStateFlowTests(unittest.TestCase):
         async def scenario():
             session.start()
             await _settle(30)
-            state, line = session.latest_state, session.context_line()
+            state, line = session.rolling.current, session.context_line()
             await session.aclose()
             return state, line
 
@@ -626,7 +619,7 @@ class CleanupTests(unittest.TestCase):
         s = asyncio.run(scenario())
         self.assertTrue(factory.made[0].closed, "Gateway socket must be closed")
         self.assertEqual(len(s.queue), 0, "queued frames must be dropped")
-        self.assertIsNone(s.latest_state, "visual state must be cleared")
+        self.assertIsNone(s.rolling.current, "visual state must be cleared")
         self.assertIsNone(s.context_line())
         self.assertIs(s.state, VisionProviderState.DISABLED)
         self.assertEqual(s.reason, "camera_stopped")
