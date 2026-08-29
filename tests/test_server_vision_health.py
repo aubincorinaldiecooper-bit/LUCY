@@ -18,7 +18,7 @@ import types
 import unittest
 from unittest import mock
 
-WORKER_URL = "https://aubincorinaldiecooper--minicpmo45-realtime-minicpmo-worker.modal.run"
+from vision_fixtures import WORKER_URL, FakeResponse, FakeSession, HangingSession, patch_aiohttp
 
 # The exact variable set configured on the Railway backend service.
 RAILWAY_ENV = {
@@ -32,51 +32,6 @@ RAILWAY_ENV = {
 }
 
 
-class _Resp:
-    def __init__(self, status=200, body="ok"):
-        self.status = status
-        self._body = body
-
-    async def text(self):
-        return self._body
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc):
-        return False
-
-
-class _OkSession:
-    def __init__(self, response=None):
-        self._response = response or _Resp()
-
-    def get(self, url):
-        return self._response
-
-    async def close(self):
-        return
-
-
-class _HangingSession:
-    """Modal unreachable: every probe runs out its timeout."""
-
-    def get(self, url):
-        import asyncio
-
-        raise asyncio.TimeoutError()
-
-    async def close(self):
-        return
-
-
-def _fake_aiohttp(session):
-    return types.SimpleNamespace(
-        ClientSession=lambda timeout=None: session,
-        ClientTimeout=lambda **k: None,
-    )
-
-
 def _probe(env, session):
     """Run the app through startup with a faked network, return (/health json, timings)."""
     import minicpmo_provider as mp
@@ -84,7 +39,7 @@ def _probe(env, session):
     from fastapi.testclient import TestClient
 
     with mock.patch.dict(os.environ, env, clear=False), \
-            mock.patch.object(mp, "aiohttp", _fake_aiohttp(session)), \
+            patch_aiohttp(mp, session), \
             mock.patch.object(server, "_vision_provider_snapshot",
                               {"state": "unknown", "checked": False}):
         started = time.monotonic()
@@ -106,7 +61,7 @@ class StartupProbeTests(unittest.TestCase):
     def test_unreachable_modal_never_delays_startup_or_health(self):
         # Railway fails a deploy whose healthcheck is slow, and a cold L40S can
         # take minutes — so neither startup nor /health may wait on Modal.
-        body, first, startup_seconds, health_seconds = _probe(RAILWAY_ENV, _HangingSession())
+        body, first, startup_seconds, health_seconds = _probe(RAILWAY_ENV, HangingSession())
         self.assertEqual(first.status_code, 200)
         self.assertEqual(first.json()["status"], "ok")
         self.assertLess(startup_seconds, 2.0, "startup blocked on the vision probe")
@@ -116,12 +71,12 @@ class StartupProbeTests(unittest.TestCase):
 
     def test_health_still_ok_when_vision_is_broken(self):
         # A broken vision provider must never turn Lucy's healthcheck red.
-        body, first, _, _ = _probe(RAILWAY_ENV, _HangingSession())
+        body, first, _, _ = _probe(RAILWAY_ENV, HangingSession())
         self.assertEqual(first.json()["status"], "ok")
 
     def test_reachable_worker_is_not_reported_ready_while_gateway_pending(self):
         # THE rule: worker connectivity is not evidence that live video works.
-        body, _, _, _ = _probe(RAILWAY_ENV, _OkSession())
+        body, _, _, _ = _probe(RAILWAY_ENV, FakeSession(FakeResponse(200, "ok")))
         vision = body["vision"]
         self.assertTrue(vision["worker_reachable"])
         self.assertEqual(vision["gateway"], "pending_deployment")
@@ -132,7 +87,7 @@ class StartupProbeTests(unittest.TestCase):
     def test_railway_variable_set_parses_as_documented(self):
         # Guards the deployed configuration itself: these are the exact values
         # set on the Railway service.
-        body, _, _, _ = _probe(RAILWAY_ENV, _OkSession())
+        body, _, _, _ = _probe(RAILWAY_ENV, FakeSession(FakeResponse(200, "ok")))
         vision = body["vision"]
         self.assertTrue(vision["enabled"])
         self.assertTrue(vision["worker_configured"])
@@ -141,7 +96,7 @@ class StartupProbeTests(unittest.TestCase):
 
     def test_health_leaks_no_infrastructure_urls(self):
         # /health is unauthenticated; Modal endpoints are server-side config.
-        _, first, _, _ = _probe(RAILWAY_ENV, _OkSession())
+        _, first, _, _ = _probe(RAILWAY_ENV, FakeSession(FakeResponse(200, "ok")))
         raw = first.text
         self.assertNotIn("modal.run", raw)
         self.assertNotIn("MINICPMO", raw)

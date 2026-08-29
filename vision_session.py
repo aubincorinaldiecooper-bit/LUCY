@@ -1,7 +1,9 @@
 """Per-Lucy-session live vision: bounded ingestion, lifecycle, telemetry.
 
 One MiniCPMOVisionSession is bound to one ArcheRealtimeSession (same session id)
-and exists ONLY while camera understanding is on. It owns the whole live-video
+and lives for the whole conversation — it carries the per-conversation GPU
+connect budget across camera on/off cycles — while the Gateway CONNECTION under
+it exists only while camera understanding is on. It owns the whole live-video
 path so the bridge itself stays a voice bridge:
 
     camera frames -> offer_frame() -> FPS gate -> bounded queue -> Gateway
@@ -38,7 +40,7 @@ import asyncio
 import logging
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
@@ -207,7 +209,12 @@ class VisionLatencyTelemetry:
 
 @dataclass(frozen=True)
 class VisionSessionStatus:
-    """Externally observable provider state for one session (health endpoints, logs)."""
+    """Externally observable provider state for one session.
+
+    The class's observability contract — consumed by tests today, shaped for a
+    per-session debug/health surface later. Process-level health reporting uses
+    server.py's startup-probe snapshot instead.
+    """
 
     state: VisionProviderState
     reason: str
@@ -344,10 +351,6 @@ class MiniCPMOVisionSession:
             VisionProviderState.UNAVAILABLE,
             VisionProviderState.DEGRADED,
         )
-
-    @property
-    def latest_state(self) -> VisualState | None:
-        return self.rolling.current
 
     def context_line(self) -> str | None:
         """Compact visual context for the session instructions, or None."""
@@ -518,13 +521,15 @@ class MiniCPMOVisionSession:
                     self.session_id, attempt, attempts, exc.reason, exc.detail, terminal,
                 )
                 if terminal:
-                    # connect_timeout is the one failure that says "the
-                    # infrastructure never answered" rather than "it broke" —
-                    # keep them distinguishable for operators.
+                    # UNAVAILABLE = it never could work (a config refusal, or
+                    # infrastructure that never answered); DEGRADED = it broke.
+                    # The config-vs-network split comes from the error itself
+                    # (MiniCPMOConnectionError.config_error), so a Gateway state
+                    # added in the provider is classified correctly here for
+                    # free.
                     state = (
                         VisionProviderState.UNAVAILABLE
-                        if exc.reason in ("connect_timeout", "realtime_gateway_not_configured",
-                                          "realtime_url_is_worker_url", "realtime_url_invalid_scheme")
+                        if exc.config_error or exc.reason == "connect_timeout"
                         else VisionProviderState.DEGRADED
                     )
                     self._set_state(state, exc.reason)
@@ -627,7 +632,10 @@ class MiniCPMOVisionSession:
             while not self._stopped.is_set():
                 frame = await self.queue.get()
                 await connection.send_frame(frame)
-                self.telemetry.mark("first_frame_sent", now=self._clock())
+                # One-shot: guard on the plain attribute so the mark's clock
+                # read + reflection don't run per frame forever after.
+                if self.telemetry.first_frame_sent_at is None:
+                    self.telemetry.mark("first_frame_sent", now=self._clock())
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -646,13 +654,15 @@ class MiniCPMOVisionSession:
                 # carries no observation — that is the honest "first visual
                 # event" mark for latency purposes.
                 should_publish = self.rolling.ingest(payload, now=now)
-                if self.rolling.current is not None:
+                if (
+                    self.telemetry.first_visual_event_at is None
+                    and self.rolling.current is not None
+                ):
                     self.telemetry.mark("first_visual_event", now=now)
-                    if self.telemetry.first_visual_event_at == now:
-                        logger.info(
-                            "minicpmo_vision_first_context=true session_id=%s %s",
-                            self.session_id, self.telemetry.log_fields(),
-                        )
+                    logger.info(
+                        "minicpmo_vision_first_context=true session_id=%s %s",
+                        self.session_id, self.telemetry.log_fields(),
+                    )
                 if should_publish and self._on_visual_update is not None:
                     state = self.rolling.current
                     if state is not None:
@@ -763,7 +773,6 @@ class MiniCPMOVisionSession:
         """
         self._terminal = True
         await self.stop(reason="session_closed")
-        self._stopped.set()
 
     async def _teardown_connection(self) -> None:
         connection, self._connection = self._connection, None

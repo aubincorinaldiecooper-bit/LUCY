@@ -837,6 +837,7 @@ async def _probe_vision_provider() -> None:
     try:
         from minicpmo_provider import (
             GatewayState,
+            _host_of,
             check_worker_health,
             gateway_reason,
             load_minicpmo_config,
@@ -856,9 +857,7 @@ async def _probe_vision_provider() -> None:
 
         # Log the parsed config so the deployed service's own view of its env is
         # visible in Railway logs. Host only — never the full URL.
-        from urllib.parse import urlsplit
-
-        worker_host = urlsplit(config.worker_url).hostname or "" if config.worker_url else ""
+        worker_host = _host_of(config.worker_url)
         logger.info(
             "minicpmo_config_loaded=true enabled=%s worker_configured=%s worker_host=%s "
             "gateway=%s gateway_reason=%s connect_timeout_seconds=%s "

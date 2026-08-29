@@ -20,34 +20,14 @@ import unittest
 from unittest import mock
 
 import minicpmo_provider as mp
-
-WORKER_URL = "https://aubincorinaldiecooper--minicpmo45-realtime-minicpmo-worker.modal.run"
-
-
-def _env(**overrides):
-    env = {"MINICPMO_ENABLED": "true", "MINICPMO_WORKER_URL": WORKER_URL}
-    env.update({k: v for k, v in overrides.items() if v is not None})
-    return env
-
-
-def _config(**overrides):
-    kwargs = dict(
-        enabled=True,
-        worker_url=WORKER_URL,
-        realtime_url="",
-        gateway_token="",
-        connect_timeout_seconds=120.0,
-        session_timeout_seconds=900.0,
-        health_timeout_seconds=10.0,
-        target_fps=2.0,
-        max_queue_size=4,
-        max_connect_attempts=2,
-        max_total_connects=6,
-        reconnect_backoff_seconds=5.0,
-        min_state_update_interval_seconds=4.0,
-    )
-    kwargs.update(overrides)
-    return mp.MiniCPMOConfig(**kwargs)
+from vision_fixtures import (
+    WORKER_URL,
+    FakeResponse as _FakeResponse,
+    FakeSession as _FakeSession,
+    make_minicpmo_config as _config,
+    minicpmo_env as _env,
+    patch_aiohttp,
+)
 
 
 class ConfigParsingTests(unittest.TestCase):
@@ -186,49 +166,8 @@ class GatewayStateTests(unittest.TestCase):
         self.assertTrue(_config(realtime_url="wss://gw.example.com/v1/realtime").realtime_ready)
 
 
-# --- aiohttp boundary fakes (same shape as tests/test_vision_context.py) -------
-
-
-class _FakeResponse:
-    def __init__(self, status, text_body=""):
-        self.status = status
-        self._text_body = text_body
-
-    async def text(self):
-        return self._text_body
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc):
-        return False
-
-
-class _FakeSession:
-    def __init__(self, response=None, raise_on_get=None):
-        self._response = response
-        self._raise_on_get = raise_on_get
-        self.closed = False
-        self.last_url = None
-
-    def get(self, url):
-        self.last_url = url
-        if self._raise_on_get is not None:
-            raise self._raise_on_get
-        return self._response
-
-    async def close(self):
-        self.closed = True
-
-
 def _patch_aiohttp(fake_session):
-    # minicpmo_provider imports aiohttp at module level, so the fake must
-    # replace the name bound in that module's namespace.
-    fake = types.SimpleNamespace(
-        ClientSession=lambda timeout=None: fake_session,
-        ClientTimeout=lambda **k: None,
-    )
-    return mock.patch.object(mp, "aiohttp", fake)
+    return patch_aiohttp(mp, fake_session)
 
 
 class WorkerHealthTests(unittest.TestCase):

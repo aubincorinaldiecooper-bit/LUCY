@@ -22,8 +22,7 @@ import inworld_realtime_bridge as bridge
 import minicpmo_provider as mp
 import vision_session as vsn
 
-WORKER_URL = "https://aubincorinaldiecooper--minicpmo45-realtime-minicpmo-worker.modal.run"
-FRAME = "data:image/jpeg;base64,AAAA"
+from vision_fixtures import FRAME, WORKER_URL, minicpmo_env as _minicpmo_env
 
 
 class _NullTransport(bridge.ArcheTransport):
@@ -57,12 +56,6 @@ def _settings(**overrides):
         return bridge.load_inworld_realtime_settings(instructions="BASE PROMPT")
 
 
-def _minicpmo_env(**overrides):
-    env = {"MINICPMO_ENABLED": "true", "MINICPMO_WORKER_URL": WORKER_URL}
-    env.update(overrides)
-    return env
-
-
 def _make_session(env=None):
     settings = _settings()
     with mock.patch.dict("os.environ", env or {}, clear=True):
@@ -73,12 +66,11 @@ class DisabledByDefaultTests(unittest.TestCase):
     def test_no_vision_session_when_minicpmo_disabled(self):
         session = _make_session({})
         self.assertIsNone(session._live_vision)
-        self.assertFalse(session.live_vision_enabled)
-        self.assertIsNone(session.live_vision_status)
+        self.assertFalse(session.wants_camera_frames)
 
-    def test_start_and_stop_are_no_ops_when_disabled(self):
+    def test_stop_is_a_no_op_when_disabled(self):
         session = _make_session({})
-        self.assertFalse(session.start_live_vision())
+        session._send_instructions_update = lambda reason: asyncio.sleep(0)
         asyncio.run(session.stop_vision())  # must not raise
 
     def test_frames_still_reach_the_openrouter_path_when_disabled(self):
@@ -109,13 +101,6 @@ class SessionAssociationTests(unittest.TestCase):
         b = _make_session(_minicpmo_env())
         self.assertIsNot(a._live_vision, b._live_vision)
         self.assertIsNot(a._live_vision.queue, b._live_vision.queue)
-
-    def test_pending_gateway_leaves_the_session_unavailable(self):
-        session = _make_session(_minicpmo_env())
-        self.assertFalse(session.start_live_vision())
-        status = session.live_vision_status
-        self.assertEqual(status["state"], "unavailable")
-        self.assertEqual(status["gateway"], "pending_deployment")
 
     def test_worker_url_is_not_used_as_the_realtime_url(self):
         session = _make_session(_minicpmo_env())
@@ -181,7 +166,7 @@ class FrameFanoutTests(unittest.TestCase):
         # transport subscribes existing tracks during the connect window.
         session = _make_session(_minicpmo_env(MINICPMO_REALTIME_URL="wss://gw.example.com/v1/realtime"))
         self.assertTrue(session.wants_camera_frames)
-        self.assertFalse(session.live_vision_enabled, "not connected yet")
+        self.assertFalse(session._live_vision.active, "not connected yet")
 
     def test_pending_gateway_stops_the_camera_being_touched(self):
         session = _make_session(_minicpmo_env())
@@ -253,7 +238,6 @@ class LiveUpdateFlowTests(unittest.TestCase):
         state.ingest({"scene_summary": "A red book."}, now=1.0)
         asyncio.run(session._on_live_visual_update(state.current))
         self.assertEqual(reasons, ["minicpmo_live_vision"])
-        self.assertIsNotNone(session.latest_live_visual_state)
 
     def test_stop_vision_clears_state_and_refreshes_instructions(self):
         session = _make_session(_minicpmo_env())
@@ -268,18 +252,8 @@ class LiveUpdateFlowTests(unittest.TestCase):
 
         asyncio.run(session.stop_vision(reason="camera_stopped"))
 
-        self.assertIsNone(session.latest_live_visual_state)
         self.assertIsNone(session._effective_vision_summary())
         self.assertIn("vision_stopped", reasons)
-
-    def test_start_live_vision_survives_a_provider_fault(self):
-        session = _make_session(_minicpmo_env())
-
-        def explode():
-            raise RuntimeError("provider blew up")
-
-        session._live_vision.start = explode
-        self.assertFalse(session.start_live_vision())  # must not raise
 
     def test_stop_vision_survives_a_provider_fault(self):
         session = _make_session(_minicpmo_env())
@@ -337,13 +311,6 @@ class LazyConnectTests(unittest.TestCase):
             MINICPMO_REALTIME_URL="wss://gw.example.com/v1/realtime?mode=video",
             **overrides,
         )
-
-    def test_run_does_not_start_vision(self):
-        # The eager start was removed from run(); connection happens on the
-        # first frame instead.
-        import inspect
-        source = inspect.getsource(bridge.ArcheRealtimeSession.run)
-        self.assertNotIn("start_live_vision()", source)
 
     def test_no_frames_means_no_connection(self):
         session = _make_session(self._gateway_env())
@@ -422,3 +389,89 @@ class CameraStopClearsBothProvidersTests(unittest.TestCase):
         # later speech turn cannot re-describe the last frame before camera-off.
         asyncio.run(session._maybe_send_vision_context_update())
         self.assertFalse(session._vision_call_in_flight)
+
+
+class InFlightVisionCallEpochTests(unittest.TestCase):
+    """A describe_frame call in flight at camera-off must discard its result.
+
+    Without the epoch guard, a call that captured the frame before camera-off
+    completes up to VISION_CONTEXT_TIMEOUT_SECONDS later, re-sets the summary,
+    and pushes an instructions update about a room the camera can't see.
+    """
+
+    def test_stale_describe_result_is_discarded_after_camera_stop(self):
+        session = _make_session({})
+        reasons = []
+
+        async def fake_send(reason):
+            reasons.append(reason)
+            return True
+
+        session._send_instructions_update = fake_send
+        session._vision_config = session._vision_config.__class__(
+            **{**session._vision_config.__dict__, "enabled": True, "api_key": "k"}
+        )
+
+        release = asyncio.Event()
+
+        async def slow_describe(frame, config, on_usage=None):
+            await release.wait()          # still in flight when camera stops
+            return "a room seen before camera-off"
+
+        async def scenario():
+            with mock.patch.object(bridge, "describe_frame", slow_describe):
+                session.set_video_frame(FRAME)
+                task = asyncio.create_task(session._run_vision_context_update())
+                await asyncio.sleep(0)     # let it capture the frame + epoch
+                await session.stop_vision(reason="camera_stopped")
+                release.set()              # the stale call now completes
+                await task
+            return session.latest_vision_summary
+
+        summary = asyncio.run(scenario())
+        self.assertIsNone(summary, "a stale in-flight result must not resurrect")
+        self.assertNotIn("vision_context", reasons,
+                         "no instructions push for a discarded result")
+
+    def test_result_lands_normally_without_a_camera_stop(self):
+        session = _make_session({})
+        session._send_instructions_update = lambda reason: asyncio.sleep(0)
+        session._vision_config = session._vision_config.__class__(
+            **{**session._vision_config.__dict__, "enabled": True, "api_key": "k"}
+        )
+
+        async def fast_describe(frame, config, on_usage=None):
+            return "a red book on a desk"
+
+        async def scenario():
+            with mock.patch.object(bridge, "describe_frame", fast_describe):
+                session.set_video_frame(FRAME)
+                await session._run_vision_context_update()
+            return session.latest_vision_summary
+
+        self.assertEqual(asyncio.run(scenario()), "a red book on a desk")
+
+
+class RequestStopVisionTests(unittest.TestCase):
+    """The one sanctioned way to stop vision from sync/hot contexts."""
+
+    def test_schedules_without_blocking_and_lands_in_session_tasks(self):
+        session = _make_session(_minicpmo_env())
+        stopped = []
+
+        async def fake_stop(reason="x"):
+            stopped.append(reason)
+
+        session.stop_vision = fake_stop
+
+        async def scenario():
+            session.request_stop_vision(reason="client_vision_stop")
+            self.assertEqual(stopped, [], "must not run inline")
+            self.assertEqual(len(session._tasks), 1, "session owns the task")
+            for _ in range(4):
+                await asyncio.sleep(0)
+            return list(session._tasks)
+
+        remaining = asyncio.run(scenario())
+        self.assertEqual(stopped, ["client_vision_stop"])
+        self.assertEqual(remaining, [], "done callback must discard the task")

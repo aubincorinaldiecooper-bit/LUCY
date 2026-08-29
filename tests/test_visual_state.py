@@ -361,3 +361,32 @@ class PendingChangeTests(unittest.TestCase):
         for obj in state.objects:
             self.assertNotIn("[", obj)
             self.assertNotIn("'", obj)
+
+
+class ClampIsTheMediaChokepointTests(unittest.TestCase):
+    """The media check lives inside _clamp, so no free-text field can miss it.
+
+    Guards the gap that motivated the move: provider-supplied notable_change
+    went through _clamp with no media check, so a Gateway echoing a frame into
+    that field would have put a base64 prefix into the prompt.
+    """
+
+    def test_media_in_notable_change_is_refused(self):
+        rolling = vs.RollingVisualState(min_update_interval_seconds=0.0)
+        rolling.ingest({"scene_summary": "A desk."}, now=1.0)
+        rolling.ingest(
+            {"scene_summary": "A desk.",
+             "notable_change": "data:image/jpeg;base64,/9j/4AAQSkZJRg"},
+            now=2.0,
+        )
+        line = rolling.context_line()
+        self.assertNotIn("data:image", line)
+        self.assertNotIn("/9j/", line)
+
+    def test_clamp_refuses_media_directly(self):
+        for blob in ("data:image/jpeg;base64,AAAA", "  DATA:image/png;base64,x",
+                     "/9j/" + "A" * 100, "iVBOR" + "B" * 100):
+            self.assertEqual(vs._clamp(blob, 240), "", blob[:16])
+
+    def test_clamp_passes_ordinary_text(self):
+        self.assertEqual(vs._clamp("  A red   book. ", 240), "A red book.")

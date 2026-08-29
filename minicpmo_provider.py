@@ -47,6 +47,7 @@ import logging
 import os
 import re
 import time
+from functools import cached_property
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -194,13 +195,24 @@ class MiniCPMOConfig:
     reconnect_backoff_seconds: float
     min_state_update_interval_seconds: float
 
-    @property
+    @cached_property
     def frame_interval_seconds(self) -> float:
-        """Minimum wall-clock gap between frames handed to the provider."""
+        """Minimum wall-clock gap between frames handed to the provider.
+
+        cached: read on every offered frame and every sampler event, on the
+        event loop shared with audio forwarding, yet constant for a frozen
+        config.
+        """
         return 1.0 / self.target_fps if self.target_fps > 0 else 0.5
 
-    @property
+    @cached_property
     def gateway_state(self) -> GatewayState:
+        """Classification of MINICPMO_REALTIME_URL — see resolve_gateway_state.
+
+        cached for the same reason as frame_interval_seconds: wants_frames
+        reads it per frame, and re-running urlsplit + host normalization per
+        camera frame is pure waste on a frozen config.
+        """
         return resolve_gateway_state(self.realtime_url, self.worker_url)
 
     @property
@@ -300,11 +312,7 @@ class HealthResult:
         )
 
 
-async def check_worker_health(
-    config: MiniCPMOConfig,
-    *,
-    session: Any | None = None,
-) -> HealthResult:
+async def check_worker_health(config: MiniCPMOConfig) -> HealthResult:
     """Probe MINICPMO_WORKER_URL for reachability. Never raises.
 
     Deliberately permissive about the response: this validates that Lucy's
@@ -314,8 +322,9 @@ async def check_worker_health(
     is not guaranteed to be a health route and a 404 from Modal still proves the
     container is up and routing.
 
-    ``session`` lets a caller reuse an aiohttp session (and lets tests inject a
-    fake); when omitted a short-lived one is created and closed here.
+    A short-lived aiohttp session per probe is deliberate: this runs once per
+    process at startup, and tests fake it by patching this module's ``aiohttp``
+    binding.
     """
     if not config.worker_url:
         return HealthResult(
@@ -323,11 +332,9 @@ async def check_worker_health(
         )
 
     started = time.monotonic()
-    owns_session = session is None
     try:
         timeout = aiohttp.ClientTimeout(total=config.health_timeout_seconds)
-        if owns_session:
-            session = aiohttp.ClientSession(timeout=timeout)
+        session = aiohttp.ClientSession(timeout=timeout)
         try:
             async with session.get(config.worker_url) as response:
                 status = getattr(response, "status", None)
@@ -349,8 +356,7 @@ async def check_worker_health(
                     ok=True, status=status, latency_ms=latency_ms, reason="reachable"
                 )
         finally:
-            if owns_session and session is not None:
-                await session.close()
+            await session.close()
     except asyncio.TimeoutError:
         return HealthResult(
             ok=False,
@@ -389,12 +395,20 @@ def _redact_urls(text: str) -> str:
 
 
 class MiniCPMOConnectionError(Exception):
-    """Realtime connection could not be established. Carries a stable reason code."""
+    """Realtime connection could not be established. Carries a stable reason code.
 
-    def __init__(self, reason: str, detail: str = "") -> None:
+    ``config_error`` marks refusals caused by configuration (a missing or
+    invalid Gateway URL) rather than the network. The session layer uses it to
+    classify UNAVAILABLE ("never could work — check env") vs DEGRADED ("worked
+    then broke — check logs") without re-encoding this module's reason strings;
+    a new Gateway state added here is classified correctly there for free.
+    """
+
+    def __init__(self, reason: str, detail: str = "", *, config_error: bool = False) -> None:
         super().__init__(f"{reason}: {detail}" if detail else reason)
         self.reason = reason
         self.detail = detail
+        self.config_error = config_error
 
 
 class MiniCPMORealtimeConnection:
@@ -446,6 +460,7 @@ class MiniCPMORealtimeConnection:
                 _GATEWAY_REASONS[gateway_state],
                 "MINICPMO_REALTIME_URL must point at the deployed OpenBMB realtime "
                 "Gateway (wss://.../v1/realtime?mode=video), never at MINICPMO_WORKER_URL",
+                config_error=True,
             )
 
         started = time.monotonic()

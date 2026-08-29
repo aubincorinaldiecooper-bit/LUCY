@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as _dc_replace
 from typing import Any
 
 # A live model can return a long paragraph; the whole point of this layer is to
@@ -50,7 +50,7 @@ _JSON_FENCE = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.DOTALL | re.I
 # Gateway could send the frame back. Free text that looks like encoded media is
 # dropped rather than described: everything that becomes a scene_summary is
 # forwarded to Inworld, so this is the boundary that keeps user media on-box.
-_MEDIA_PREFIXES = ("data:", "/9j/", "iVBOR", "R0lGOD", "UklGR")
+_MEDIA_PREFIXES = ("/9j/", "iVBOR", "R0lGOD", "UklGR")
 # Longest plausible one-sentence description. Anything longer that arrives as
 # bare text is not a description.
 _MAX_PROSE_CHARS = 2_000
@@ -58,7 +58,7 @@ _MAX_PROSE_CHARS = 2_000
 
 def _looks_like_media(text: str) -> bool:
     stripped = text.lstrip()
-    if stripped[:64].lower().startswith("data:"):
+    if stripped[:5].lower() == "data:":
         return True
     if stripped.startswith(_MEDIA_PREFIXES):
         return True
@@ -71,7 +71,18 @@ def _looks_like_media(text: str) -> bool:
 
 
 def _clamp(value: Any, limit: int) -> str:
+    """Bound one free-text field — and refuse media masquerading as text.
+
+    This is the single ingress every free-text field flows through (summary,
+    notable_change, list items), so the media check lives HERE rather than at
+    each call site: a field added later cannot miss it. Checked before
+    truncation on purpose — clamping a data URL to a short prefix would produce
+    text that no longer looks like media but is still user media, and
+    everything this returns can end up forwarded to Inworld.
+    """
     text = str(value or "").strip()
+    if _looks_like_media(text):
+        return ""
     # Collapse whitespace so a multi-line model answer becomes one clean line.
     text = " ".join(text.split())
     if len(text) > limit:
@@ -106,8 +117,6 @@ def _clamp_list(value: Any) -> tuple[str, ...]:
             # ("['a', 'b']") and shown to Arche as an object name.
             item = ", ".join(str(x) for x in item if isinstance(x, (str, int, float)))
         elif not isinstance(item, (str, int, float)):
-            continue
-        if isinstance(item, str) and _looks_like_media(item):
             continue
         text = _clamp(item, MAX_LIST_ITEM_CHARS)
         if not text:
@@ -202,9 +211,12 @@ def _material_difference(previous: VisualState | None, current: VisualState) -> 
         # The first observation of a session is itself the notable change.
         return current.scene_summary or None
 
-    new_objects = [o for o in current.objects if o.lower() not in {p.lower() for p in previous.objects}]
-    gone_objects = [o for o in previous.objects if o.lower() not in {p.lower() for p in current.objects}]
-    new_actions = [a for a in current.actions if a.lower() not in {p.lower() for p in previous.actions}]
+    prev_objects = {p.lower() for p in previous.objects}
+    cur_objects = {o.lower() for o in current.objects}
+    prev_actions = {a.lower() for a in previous.actions}
+    new_objects = [o for o in current.objects if o.lower() not in prev_objects]
+    gone_objects = [o for o in previous.objects if o.lower() not in cur_objects]
+    new_actions = [a for a in current.actions if a.lower() not in prev_actions]
     people_changed = {p.lower() for p in current.people} != {p.lower() for p in previous.people}
 
     fragments: list[str] = []
@@ -239,8 +251,11 @@ _NO_CHANGE_SENTINELS = {
 }
 
 
+_NORMALIZE_RE = re.compile(r"[^a-z0-9 ]+")
+
+
 def _normalize_summary(text: str) -> str:
-    return re.sub(r"[^a-z0-9 ]+", "", (text or "").lower()).strip()
+    return _NORMALIZE_RE.sub("", (text or "").lower()).strip()
 
 
 def parse_provider_payload(payload: Any) -> dict[str, Any] | None:
@@ -331,18 +346,15 @@ def visual_state_from_payload(
     if data is None:
         return None
 
-    raw_summary = str(
+    summary = _clamp(
         data.get("scene_summary")
         or data.get("summary")
         or data.get("description")
         or data.get("text")
         or data.get("content")
-        or ""
+        or "",
+        MAX_SUMMARY_CHARS,
     )
-    # Checked BEFORE clamping: clamping a data URL to 240 chars would produce a
-    # short string that no longer looks like media but is still user media.
-    # Everything that becomes scene_summary is forwarded to Inworld.
-    summary = "" if _looks_like_media(raw_summary) else _clamp(raw_summary, MAX_SUMMARY_CHARS)
     objects = _clamp_list(data.get("objects"))
     people = _clamp_list(data.get("people"))
     actions = _clamp_list(data.get("actions"))
@@ -371,9 +383,7 @@ def visual_state_from_payload(
         provider_change = ""
     notable_change = provider_change or _material_difference(previous, candidate)
 
-    from dataclasses import replace as _replace
-
-    return _replace(candidate, notable_change=notable_change or None)
+    return _dc_replace(candidate, notable_change=notable_change or None)
 
 
 @dataclass
