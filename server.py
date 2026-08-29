@@ -25,6 +25,19 @@ from companion_email import CompanionEmailError, generate_companion_email_respon
 
 load_dotenv()
 
+# The web service runs under plain `uvicorn server:app`, which configures only
+# uvicorn's own loggers — application loggers otherwise fall through to
+# Python's WARNING+ last-resort handler, so every INFO-level structured log in
+# this process (session lifecycle, memory, the vision probe, and the whole
+# /api/v1/realtime bridge log) was invisible in production. basicConfig is a
+# no-op if a root handler already exists, and uvicorn's loggers don't
+# propagate, so nothing is duplicated. (The worker path is unaffected: the
+# LiveKit CLI configures logging itself.)
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Lucy LiveKit Session API")
