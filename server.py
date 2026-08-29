@@ -814,6 +814,7 @@ def _trusted_user_id_from_request(request: Request, payload_user_id: str | None)
 # cold-starting from scale-to-zero can take minutes.
 
 _vision_provider_snapshot: dict[str, Any] = {"state": "unknown", "checked": False}
+_vision_probe_tasks: set[Any] = set()
 
 
 def _vision_provider_public_snapshot() -> dict[str, Any]:
@@ -909,8 +910,11 @@ async def _probe_vision_provider() -> None:
 async def _startup_vision_probe() -> None:
     # Detached on purpose: awaiting this would put a Modal round trip in front
     # of the app becoming ready, and Railway's healthcheck would fail the deploy
-    # on a cold GPU.
-    asyncio.create_task(_probe_vision_provider())
+    # on a cold GPU. Held in a module-level set because asyncio keeps only a
+    # weak reference — an unreferenced task can be collected mid-probe.
+    task = asyncio.create_task(_probe_vision_provider())
+    _vision_probe_tasks.add(task)
+    task.add_done_callback(_vision_probe_tasks.discard)
 
 
 @app.get("/health")

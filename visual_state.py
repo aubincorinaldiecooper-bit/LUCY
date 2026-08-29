@@ -44,7 +44,30 @@ MAX_LIST_ITEM_CHARS = 48
 
 # Fenced ```json blocks are common in vision-model output; strip the fence
 # before parsing rather than failing the whole message.
-_JSON_FENCE = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.DOTALL)
+_JSON_FENCE = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.DOTALL | re.IGNORECASE)
+
+# A provider is supposed to send descriptions, but a misbehaving or echoing
+# Gateway could send the frame back. Free text that looks like encoded media is
+# dropped rather than described: everything that becomes a scene_summary is
+# forwarded to Inworld, so this is the boundary that keeps user media on-box.
+_MEDIA_PREFIXES = ("data:", "/9j/", "iVBOR", "R0lGOD", "UklGR")
+# Longest plausible one-sentence description. Anything longer that arrives as
+# bare text is not a description.
+_MAX_PROSE_CHARS = 2_000
+
+
+def _looks_like_media(text: str) -> bool:
+    stripped = text.lstrip()
+    if stripped[:64].lower().startswith("data:"):
+        return True
+    if stripped.startswith(_MEDIA_PREFIXES):
+        return True
+    if len(stripped) > _MAX_PROSE_CHARS:
+        # Long, space-free, base64-alphabet text is encoded data, not prose.
+        sample = stripped[:512]
+        if " " not in sample:
+            return True
+    return False
 
 
 def _clamp(value: Any, limit: int) -> str:
@@ -78,6 +101,8 @@ def _clamp_list(value: Any) -> tuple[str, ...]:
         if isinstance(item, dict):
             # e.g. {"label": "red book", "confidence": 0.9} -> "red book"
             item = item.get("label") or item.get("name") or item.get("text") or ""
+        if isinstance(item, str) and _looks_like_media(item):
+            continue
         text = _clamp(item, MAX_LIST_ITEM_CHARS)
         if not text:
             continue
@@ -143,8 +168,13 @@ class VisualState:
         parts: list[str] = []
         if self.scene_summary:
             parts.append(self.scene_summary)
-        if self.notable_change and self.notable_change != self.scene_summary:
+        change = (self.notable_change or "").rstrip("…")
+        if change and not _normalize_summary(self.scene_summary).startswith(
+            _normalize_summary(change)
+        ):
             parts.append(f"Just changed: {self.notable_change}")
+        if self.people:
+            parts.append("People: " + ", ".join(self.people))
         if self.objects:
             parts.append("Visible: " + ", ".join(self.objects))
         if self.actions:
@@ -169,10 +199,15 @@ def _material_difference(previous: VisualState | None, current: VisualState) -> 
     new_objects = [o for o in current.objects if o.lower() not in {p.lower() for p in previous.objects}]
     gone_objects = [o for o in previous.objects if o.lower() not in {p.lower() for p in current.objects}]
     new_actions = [a for a in current.actions if a.lower() not in {p.lower() for p in previous.actions}]
+    people_changed = {p.lower() for p in current.people} != {p.lower() for p in previous.people}
 
     fragments: list[str] = []
     if new_actions:
         fragments.append(", ".join(new_actions))
+    if people_changed and current.people:
+        fragments.append("people: " + ", ".join(current.people))
+    elif people_changed:
+        fragments.append("no one in view")
     if new_objects:
         fragments.append("now visible: " + ", ".join(new_objects))
     if gone_objects and not new_objects:
@@ -189,6 +224,13 @@ def _material_difference(previous: VisualState | None, current: VisualState) -> 
     if _normalize_summary(current.scene_summary) != _normalize_summary(previous.scene_summary):
         return _clamp(current.scene_summary, MAX_CHANGE_CHARS) or None
     return None
+
+
+# Values providers use to mean "nothing changed", normalized by _normalize_summary.
+_NO_CHANGE_SENTINELS = {
+    "", "none", "no change", "nochange", "null", "nil", "n a", "na",
+    "no notable change", "nothing", "no significant change", "unchanged",
+}
 
 
 def _normalize_summary(text: str) -> str:
@@ -229,6 +271,8 @@ def parse_provider_payload(payload: Any) -> dict[str, Any] | None:
             # fragment like '{"scene_summary":' straight into Arche's prompt.
             if text[:1] in ("{", "["):
                 return None
+            if _looks_like_media(text):
+                return None
             # Genuine plain prose from the model is still a usable observation.
             return {"scene_summary": text}
 
@@ -241,12 +285,19 @@ def parse_provider_payload(payload: Any) -> dict[str, Any] | None:
 
     # Unwrap the common realtime envelopes rather than treating them as the
     # observation itself.
+    if any(payload.get(k) for k in ("scene_summary", "summary", "description",
+                                    "objects", "people", "actions", "visible_text")):
+        # The observation is right here — do not descend into an envelope key
+        # (e.g. a "state": "ok" status string) and lose it.
+        return payload
     for key in ("visual_state", "state", "observation", "result", "data", "response"):
         inner = payload.get(key)
         if isinstance(inner, dict):
             payload = inner
             break
         if isinstance(inner, str) and inner.strip():
+            if _looks_like_media(inner):
+                return None
             return {"scene_summary": inner.strip()}
 
     if not any(
@@ -274,15 +325,18 @@ def visual_state_from_payload(
     if data is None:
         return None
 
-    summary = _clamp(
+    raw_summary = str(
         data.get("scene_summary")
         or data.get("summary")
         or data.get("description")
         or data.get("text")
         or data.get("content")
-        or "",
-        MAX_SUMMARY_CHARS,
+        or ""
     )
+    # Checked BEFORE clamping: clamping a data URL to 240 chars would produce a
+    # short string that no longer looks like media but is still user media.
+    # Everything that becomes scene_summary is forwarded to Inworld.
+    summary = "" if _looks_like_media(raw_summary) else _clamp(raw_summary, MAX_SUMMARY_CHARS)
     objects = _clamp_list(data.get("objects"))
     people = _clamp_list(data.get("people"))
     actions = _clamp_list(data.get("actions"))
@@ -304,6 +358,11 @@ def visual_state_from_payload(
     # Prefer the provider's own change sentence when it offers one; otherwise
     # derive it from the delta against the previous state.
     provider_change = _clamp(data.get("notable_change") or "", MAX_CHANGE_CHARS)
+    if _normalize_summary(provider_change) in _NO_CHANGE_SENTINELS:
+        # Providers commonly fill this field with "none" / "no change" rather
+        # than omitting it; publishing that verbatim would announce a change
+        # that did not happen.
+        provider_change = ""
     notable_change = provider_change or _material_difference(previous, candidate)
 
     from dataclasses import replace as _replace

@@ -185,6 +185,9 @@ async def _build_api_memory(user_ref: str, session_id: str) -> tuple[MemoryLayer
 async def _client_receive_loop(websocket: Any, session: ArcheRealtimeSession) -> None:
     """Pump client events into the session until the client disconnects."""
     ignored_count = 0
+    # Strong references to detached teardown tasks: without this the GC can
+    # collect a task mid-flight and the Gateway socket is never closed.
+    vision_stop_tasks: set[Any] = set()
     while True:
         data = await websocket.receive_json()
         if not isinstance(data, dict):
@@ -212,7 +215,17 @@ async def _client_receive_loop(websocket: Any, session: ArcheRealtimeSession) ->
             # Explicit camera-off from the client. Without this a client that
             # simply stops sending frames would hold the Gateway socket (and a
             # Modal GPU session) until the whole conversation ended.
-            await session.stop_live_vision(reason="client_vision_stop")
+            #
+            # Detached, NOT awaited: this loop is the session's audio ingest
+            # path, and the teardown closes a WebSocket whose close handshake
+            # can take seconds against an unresponsive Gateway. Awaiting it
+            # here would stall the user's microphone for that whole time —
+            # exactly the "vision must never affect voice" rule.
+            stop_task = asyncio.create_task(
+                session.stop_live_vision(reason="client_vision_stop")
+            )
+            vision_stop_tasks.add(stop_task)
+            stop_task.add_done_callback(vision_stop_tasks.discard)
         else:
             ignored_count += 1
             if ignored_count <= 5:

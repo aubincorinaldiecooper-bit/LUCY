@@ -42,6 +42,7 @@ def _config(**overrides):
         target_fps=2.0,
         max_queue_size=4,
         max_connect_attempts=2,
+        max_total_connects=6,
         reconnect_backoff_seconds=5.0,
         min_state_update_interval_seconds=4.0,
     )
@@ -395,3 +396,64 @@ class RealtimeConnectionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HardeningTests(unittest.TestCase):
+    """Regression guards for defects found in adversarial review."""
+
+    def test_trailing_dot_host_cannot_bypass_the_worker_guard(self):
+        # "host.modal.run." is the same host to DNS but a different string.
+        candidate = WORKER_URL.replace("https://", "wss://").replace(
+            "modal.run", "modal.run."
+        )
+        self.assertIs(
+            mp.resolve_gateway_state(candidate, WORKER_URL),
+            mp.GatewayState.INVALID_WORKER_URL,
+        )
+
+    def test_guard_still_holds_when_worker_url_is_unset(self):
+        # The guard must not switch itself off exactly when config is confused.
+        self.assertIs(
+            mp.resolve_gateway_state(WORKER_URL.replace("https://", "wss://"), ""),
+            mp.GatewayState.INVALID_WORKER_URL,
+        )
+
+    def test_a_real_gateway_on_modal_is_still_allowed(self):
+        # Only *-worker endpoints are refused; a genuine Gateway may live on Modal.
+        self.assertIs(
+            mp.resolve_gateway_state(
+                "wss://aubincorinaldiecooper--minicpmo45-gateway.modal.run/v1/realtime",
+                WORKER_URL,
+            ),
+            mp.GatewayState.CONFIGURED,
+        )
+
+    def test_target_fps_is_clamped(self):
+        # Each accepted frame costs a synchronous JPEG encode on the audio event
+        # loop, so an absurd FPS is a voice-latency problem, not a vision one.
+        with mock.patch.dict("os.environ", _env(VISION_TARGET_FPS="1000"), clear=True):
+            self.assertEqual(mp.load_minicpmo_config().target_fps, mp.MAX_TARGET_FPS)
+
+    def test_queue_size_is_clamped(self):
+        with mock.patch.dict("os.environ", _env(VISION_MAX_QUEUE_SIZE="100000"), clear=True):
+            self.assertEqual(mp.load_minicpmo_config().max_queue_size, mp.MAX_QUEUE_SIZE)
+
+    def test_session_connect_budget_defaults_and_parses(self):
+        with mock.patch.dict("os.environ", _env(), clear=True):
+            self.assertEqual(mp.load_minicpmo_config().max_total_connects, 6)
+        with mock.patch.dict("os.environ", _env(MINICPMO_MAX_SESSION_CONNECTS="3"), clear=True):
+            self.assertEqual(mp.load_minicpmo_config().max_total_connects, 3)
+
+    def test_connection_errors_never_carry_a_full_url(self):
+        # aiohttp stringifies the request URL into handshake errors; this module
+        # promises host-only logging, and a Gateway URL may carry a credential.
+        redacted = mp._redact_urls(
+            "WSServerHandshakeError: 403, url=wss://gw.example.com/v1/realtime?token=sekret"
+        )
+        self.assertNotIn("sekret", redacted)
+        self.assertNotIn("wss://", redacted)
+        self.assertIn("gw.example.com", redacted)
+
+    def test_redaction_leaves_ordinary_text_alone(self):
+        self.assertEqual(mp._redact_urls("ClientConnectorError: nodename nor servname"),
+                         "ClientConnectorError: nodename nor servname")

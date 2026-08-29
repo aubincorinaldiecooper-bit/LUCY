@@ -1091,8 +1091,12 @@ class ArcheRealtimeSession:
         # only — never the Inworld connect below, and never the first word the
         # user speaks.
         self.start_live_vision()
-        await self.transport.start()
         try:
+            # Inside the try: start_live_vision() above may already have a
+            # Gateway connect in flight, so a transport failure here must still
+            # reach the handlers below that call aclose() — otherwise the
+            # socket and its Modal GPU session leak.
+            await self.transport.start()
             timeout = aiohttp.ClientTimeout(total=None, sock_connect=20, sock_read=None)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.ws_connect(self.settings.connection_url, headers=self.settings.auth_headers, heartbeat=20) as ws:

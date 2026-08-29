@@ -45,6 +45,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -62,6 +63,15 @@ DEFAULT_CONNECT_TIMEOUT_SECONDS = 120.0
 DEFAULT_SESSION_TIMEOUT_SECONDS = 900.0
 DEFAULT_TARGET_FPS = 2.0
 DEFAULT_MAX_QUEUE_SIZE = 4
+# Ceilings, not defaults. Each accepted frame costs a synchronous PIL encode on
+# the event loop that also forwards microphone audio, and each queued frame is
+# a retained JPEG. Both are clamped so a typo in an env var cannot turn a
+# vision knob into a voice-latency or memory problem.
+MAX_TARGET_FPS = 10.0
+MAX_QUEUE_SIZE = 32
+# Largest frame accepted into the queue (~1.3 MB of base64). Comfortably above
+# a 512px JPEG data URL (~50 KB); well below what would let a client pin memory.
+MAX_FRAME_CHARS = 1_400_000
 # Health probes are a liveness signal, not a session — they must never sit
 # behind a cold start, so they get their own short timeout.
 DEFAULT_HEALTH_TIMEOUT_SECONDS = 10.0
@@ -142,10 +152,17 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _host_of(url: str) -> str:
+    """Normalized hostname for comparison, or "" if unparseable.
+
+    The trailing dot matters: "host.modal.run." is the same host to DNS but a
+    different string, so without stripping it the worker-URL guard below can be
+    walked straight past.
+    """
     try:
-        return (urlsplit(url).hostname or "").strip().lower()
+        host = (urlsplit(url).hostname or "").strip().lower()
     except ValueError:
         return ""
+    return host.rstrip(".")
 
 
 @dataclass(frozen=True)
@@ -170,6 +187,10 @@ class MiniCPMOConfig:
     target_fps: float
     max_queue_size: int
     max_connect_attempts: int
+    # Total Gateway connects allowed per CONVERSATION, across every camera
+    # on/off cycle. max_connect_attempts bounds retries within one start;
+    # this bounds how often a whole conversation can wake a GPU.
+    max_total_connects: int
     reconnect_backoff_seconds: float
     min_state_update_interval_seconds: float
 
@@ -212,7 +233,13 @@ def resolve_gateway_state(realtime_url: str, worker_url: str) -> GatewayState:
     # (and swapping https->wss) is the single most likely misconfiguration here,
     # so compare hosts, not raw strings.
     worker_host = _host_of(worker_url)
-    if worker_host and _host_of(realtime_url) == worker_host:
+    realtime_host = _host_of(realtime_url)
+    if worker_host and realtime_host == worker_host:
+        return GatewayState.INVALID_WORKER_URL
+    # Belt and braces: even with MINICPMO_WORKER_URL unset, a Modal *-worker
+    # endpoint is never the realtime Gateway. Without this the guard would
+    # quietly switch itself off exactly when the config is most confused.
+    if realtime_host.endswith(".modal.run") and "-worker" in realtime_host:
         return GatewayState.INVALID_WORKER_URL
 
     return GatewayState.CONFIGURED
@@ -241,11 +268,14 @@ def load_minicpmo_config() -> MiniCPMOConfig:
         health_timeout_seconds=_env_float(
             "MINICPMO_HEALTH_TIMEOUT_SECONDS", DEFAULT_HEALTH_TIMEOUT_SECONDS
         ),
-        target_fps=_env_float("VISION_TARGET_FPS", DEFAULT_TARGET_FPS),
-        max_queue_size=_env_int("VISION_MAX_QUEUE_SIZE", DEFAULT_MAX_QUEUE_SIZE),
+        target_fps=min(_env_float("VISION_TARGET_FPS", DEFAULT_TARGET_FPS), MAX_TARGET_FPS),
+        max_queue_size=min(
+            _env_int("VISION_MAX_QUEUE_SIZE", DEFAULT_MAX_QUEUE_SIZE), MAX_QUEUE_SIZE
+        ),
         # Conservative by default: one retry, then stop. Each attempt can wake
         # an L40S.
         max_connect_attempts=_env_int("MINICPMO_MAX_CONNECT_ATTEMPTS", 2),
+        max_total_connects=_env_int("MINICPMO_MAX_SESSION_CONNECTS", 6),
         reconnect_backoff_seconds=_env_float("MINICPMO_RECONNECT_BACKOFF_SECONDS", 5.0),
         min_state_update_interval_seconds=_env_float(
             "VISION_STATE_MIN_UPDATE_INTERVAL_SECONDS", 4.0
@@ -341,6 +371,23 @@ async def check_worker_health(
         )
 
 
+_URL_IN_TEXT = re.compile(r"\b(?:wss?|https?)://\S+", re.IGNORECASE)
+
+
+def _redact_urls(text: str) -> str:
+    """Replace any URL with its host.
+
+    aiohttp's handshake/connection errors stringify the full request URL. This
+    module promises host-only logging (and a Gateway URL may one day carry a
+    query credential), so the detail we surface must not smuggle one through.
+    """
+    def _host_only(match: "re.Match[str]") -> str:
+        host = _host_of(match.group(0))
+        return f"<{host or 'url'}>"
+
+    return _URL_IN_TEXT.sub(_host_only, text)
+
+
 class MiniCPMOConnectionError(Exception):
     """Realtime connection could not be established. Carries a stable reason code."""
 
@@ -428,7 +475,7 @@ class MiniCPMORealtimeConnection:
         except Exception as exc:  # noqa: BLE001 - any transport failure is a connect failure
             await self._cleanup()
             raise MiniCPMOConnectionError(
-                "connect_failed", f"{type(exc).__name__}: {exc}"[:200]
+                "connect_failed", _redact_urls(f"{type(exc).__name__}: {exc}")[:200]
             ) from exc
 
     async def send_frame(self, image_data_url: str) -> None:

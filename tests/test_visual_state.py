@@ -236,3 +236,85 @@ class ContextLineTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MediaLeakTests(unittest.TestCase):
+    """A Gateway that echoes a frame must not get user media into the prompt.
+
+    Anything that becomes scene_summary is forwarded to Inworld, so this is the
+    boundary that keeps camera data on-box.
+    """
+
+    def test_data_urls_are_never_treated_as_a_description(self):
+        for payload in (
+            "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQ...",
+            "  data:image/png;base64,iVBORw0KGgo...",
+            {"scene_summary": "data:image/jpeg;base64,/9j/4AAQ"},
+        ):
+            state = vs.visual_state_from_payload(payload, previous=None, timestamp=1.0)
+            if state is not None:
+                self.assertNotIn("data:image", state.scene_summary, repr(payload))
+
+    def test_bare_base64_blobs_are_rejected(self):
+        for payload in ("/9j/" + "A" * 400, "iVBOR" + "B" * 400):
+            self.assertIsNone(
+                vs.visual_state_from_payload(payload, previous=None, timestamp=1.0),
+                payload[:20],
+            )
+
+    def test_long_spaceless_blobs_are_rejected(self):
+        self.assertIsNone(
+            vs.visual_state_from_payload("Q" * 3000, previous=None, timestamp=1.0)
+        )
+
+    def test_a_long_genuine_description_still_parses(self):
+        prose = "A person sitting at a wooden desk. " * 60  # long, but real prose
+        state = vs.visual_state_from_payload(prose, previous=None, timestamp=1.0)
+        self.assertIsNotNone(state)
+        self.assertLessEqual(len(state.scene_summary), vs.MAX_SUMMARY_CHARS)
+
+
+class ParsingHardeningTests(unittest.TestCase):
+    def test_uppercase_json_fence_is_stripped(self):
+        state = vs.visual_state_from_payload(
+            '```JSON\n{"scene_summary": "A red book."}\n```', previous=None, timestamp=1.0
+        )
+        self.assertEqual(state.scene_summary, "A red book.")
+
+    def test_envelope_key_does_not_shadow_a_real_observation(self):
+        # {"state": "ok", "scene_summary": ...} must not yield scene_summary="ok".
+        state = vs.visual_state_from_payload(
+            {"state": "ok", "scene_summary": "A red book.", "objects": ["red book"]},
+            previous=None, timestamp=1.0,
+        )
+        self.assertEqual(state.scene_summary, "A red book.")
+        self.assertEqual(state.objects, ("red book",))
+
+    def test_no_change_sentinels_are_not_published_as_changes(self):
+        for sentinel in ("none", "None", "no change", "N/A", "unchanged", "nothing"):
+            rolling = vs.RollingVisualState(min_update_interval_seconds=0.0)
+            rolling.ingest({"scene_summary": "A desk.", "objects": ["desk"]}, now=1.0)
+            published = rolling.ingest(
+                {"scene_summary": "A desk.", "objects": ["desk"],
+                 "notable_change": sentinel},
+                now=2.0,
+            )
+            self.assertFalse(published, sentinel)
+
+    def test_people_reach_the_prompt_and_count_as_a_change(self):
+        rolling = vs.RollingVisualState(min_update_interval_seconds=0.0)
+        rolling.ingest({"scene_summary": "An empty room."}, now=1.0)
+        published = rolling.ingest(
+            {"scene_summary": "An empty room.", "people": ["one adult"]}, now=2.0
+        )
+        self.assertTrue(published, "a person appearing is a material change")
+        self.assertIn("one adult", rolling.context_line())
+
+    def test_context_line_does_not_repeat_a_clamped_summary(self):
+        long_summary = "A person is holding a red book at a wooden desk " * 5
+        state = vs.visual_state_from_payload(
+            {"scene_summary": long_summary}, previous=None, timestamp=1.0
+        )
+        line = state.to_context_line()
+        self.assertNotIn("Just changed:", line,
+                         "the change is just the clamped summary; do not print it twice")

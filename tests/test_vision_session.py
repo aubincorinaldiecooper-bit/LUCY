@@ -40,6 +40,7 @@ def _config(**overrides):
         target_fps=2.0,
         max_queue_size=4,
         max_connect_attempts=2,
+        max_total_connects=6,
         reconnect_backoff_seconds=0.0,
         min_state_update_interval_seconds=0.0,
     )
@@ -742,3 +743,172 @@ class StatusReportingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HardeningTests(unittest.TestCase):
+    """Regression guards for defects found in adversarial review."""
+
+    def test_cancelled_stop_still_releases_the_socket_and_allows_later_teardown(self):
+        # The worst bug class here: a cancelled stop() used to latch _stopping
+        # True forever, so every later stop()/aclose() silently no-opped and the
+        # Gateway socket plus its Modal GPU session leaked for good.
+        factory = _factory(hold_open=True)
+        session = vsn.MiniCPMOVisionSession("lucy-1", config=_config(),
+                                            connection_factory=factory)
+
+        async def scenario():
+            session.start()
+            await _settle()
+            task = asyncio.create_task(session.stop())
+            await asyncio.sleep(0)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            await _settle(10)
+            # Teardown must not be latched shut.
+            await session.aclose()
+            await _settle(10)
+            return factory.made[0].closed, session._stopping
+
+        closed, stopping = asyncio.run(scenario())
+        self.assertTrue(closed, "the Gateway socket must still be released")
+        self.assertFalse(stopping, "_stopping must never stay latched")
+
+    def test_connect_budget_bounds_gpu_wakes_across_camera_toggles(self):
+        # Re-arm must not reset the budget, or toggling the camera would wake an
+        # L40S an unbounded number of times.
+        clock = {"t": 0.0}
+        factory = _factory()
+        session = vsn.MiniCPMOVisionSession(
+            "lucy-1", config=_config(max_total_connects=3),
+            connection_factory=factory, clock=lambda: clock["t"],
+        )
+
+        async def scenario():
+            for i in range(12):
+                clock["t"] = 100.0 * (i + 1)
+                session.offer_frame(FRAME)
+                await _settle(6)
+                await session.stop(reason="camera_off")
+            state, reason = session.state, session.reason
+            await session.aclose()
+            return state, reason
+
+        asyncio.run(scenario())
+        self.assertEqual(len(factory.made), 3, "budget must cap total connects")
+
+    def test_exhausted_budget_stops_wanting_frames(self):
+        factory = _factory(fail_with=mp.MiniCPMOConnectionError("connect_failed", "x"))
+        session = vsn.MiniCPMOVisionSession(
+            "lucy-1", config=_config(max_total_connects=2, max_connect_attempts=2),
+            connection_factory=factory,
+        )
+
+        async def scenario():
+            session.start()
+            await _settle(30)
+            return session.wants_frames
+
+        self.assertFalse(asyncio.run(scenario()))
+
+    def test_degrading_clears_the_stale_visual_note(self):
+        # A frozen last-known scene would shadow the OpenRouter fallback for the
+        # rest of the conversation, because that fallback is only reached when
+        # the live context line is empty.
+        session = vsn.MiniCPMOVisionSession("lucy-1", config=_config())
+        session.rolling.ingest({"scene_summary": "A red book."}, now=1.0)
+        self.assertIsNotNone(session.context_line())
+        session._set_state(VisionProviderState.DEGRADED, "gateway_disconnected")
+        self.assertIsNone(session.context_line(),
+                          "a degraded provider must not keep describing the room")
+
+    def test_clean_gateway_close_degrades_and_cancels_the_sender(self):
+        # asyncio.wait returns on FIRST_COMPLETED; the send loop would otherwise
+        # stay parked on queue.get() forever with state still READY.
+        factory = _factory(messages=['{"scene_summary": "A desk."}'], hold_open=False)
+        session = vsn.MiniCPMOVisionSession("lucy-1", config=_config(),
+                                            connection_factory=factory)
+
+        async def scenario():
+            session.start()
+            await _settle(30)
+            state, reason = session.state, session.reason
+            stray = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+            await session.aclose()
+            return state, reason, len(stray)
+
+        state, reason, stray = asyncio.run(scenario())
+        self.assertIs(state, VisionProviderState.DEGRADED)
+        self.assertEqual(reason, "gateway_closed")
+        self.assertEqual(stray, 0, "no loop may outlive _run()")
+
+    def test_oversized_frames_are_refused(self):
+        # Without a per-frame ceiling an API client could pin tens of megabytes.
+        clock = {"t": 0.0}
+        factory = _factory()
+        session = vsn.MiniCPMOVisionSession(
+            "lucy-1", config=_config(), connection_factory=factory,
+            clock=lambda: clock["t"],
+        )
+
+        async def scenario():
+            session.start()
+            await _settle()
+            clock["t"] = 50.0
+            huge = "data:image/jpeg;base64," + "A" * (mp.MAX_FRAME_CHARS + 1)
+            accepted = session.offer_frame(huge)
+            pending = len(session.queue)
+            await session.aclose()
+            return accepted, pending
+
+        accepted, pending = asyncio.run(scenario())
+        self.assertFalse(accepted)
+        self.assertEqual(pending, 0)
+
+    def test_cleared_frames_are_counted_as_dropped(self):
+        q = vsn.BoundedFrameQueue(4)
+        for i in range(3):
+            q.put(f"f{i}")
+        q.clear()
+        stats = q.stats()
+        self.assertEqual(stats["dropped"], 3)
+        self.assertEqual(
+            stats["offered"], stats["delivered"] + stats["dropped"] + stats["pending"],
+            "frame accounting must balance",
+        )
+
+    def test_cold_warm_is_judged_on_the_successful_attempt_not_the_retries(self):
+        clock = {"t": 0.0}
+        calls = {"n": 0}
+
+        class FlakyThenFast:
+            def __init__(self, cfg, sid):
+                self.closed = False
+                self.session_id = sid
+            async def connect(self):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    clock["t"] += 30.0          # slow failure
+                    raise mp.MiniCPMOConnectionError("connect_failed", "boom")
+                clock["t"] += 0.2               # the real container is warm
+            async def send_frame(self, i): pass
+            async def receive(self):
+                await asyncio.Event().wait()
+                yield None
+            async def aclose(self): self.closed = True
+
+        session = vsn.MiniCPMOVisionSession(
+            "lucy-1", config=_config(), connection_factory=FlakyThenFast,
+            clock=lambda: clock["t"],
+        )
+
+        async def scenario():
+            session.start()
+            await _settle(30)
+            t = session.telemetry
+            await session.aclose()
+            return t.classify(), t.last_attempt_connect_ms, t.modal_connect_ms
+
+        cls, last_ms, total_ms = asyncio.run(scenario())
+        self.assertEqual(cls, "warm", "a retry must not make a warm container look cold")
+        self.assertEqual(last_ms, 200.0)
+        self.assertGreater(total_ms, last_ms, "total wait still spans the failed attempt")
