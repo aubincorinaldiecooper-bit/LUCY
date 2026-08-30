@@ -2,8 +2,9 @@
 
 This path is selected with VOICE_ENGINE=inworld_realtime and keeps LiveKit as
 Arche's browser media transport while Inworld owns STT, TTS, and semantic VAD /
-turn detection. The legacy cascaded LiveKit AgentSession remains available by
-leaving VOICE_ENGINE unset.
+turn detection. It is the ONLY voice engine: the legacy cascaded LiveKit
+AgentSession has been removed, and agent.py refuses to start with any other
+VOICE_ENGINE value.
 
 Architecture (OpenAI-style: one engine, pluggable transports):
 
@@ -65,6 +66,7 @@ import aiohttp
 from livekit import rtc
 from PIL import Image
 
+from env_utils import env_bool as _env_bool
 from emotional_dataset import (
     CalibrationTracker,
     EmotionalDatasetWriter,
@@ -95,13 +97,6 @@ INWORLD_INPUT_SAMPLE_RATE = 24000
 INWORLD_OUTPUT_SAMPLE_RATE = 24000
 INWORLD_CHANNELS = 1
 INWORLD_FRAME_MS = 60
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    raw = os.getenv(name)
-    if raw is None or not raw.strip():
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def inworld_realtime_session_timeout_seconds() -> float:
@@ -429,11 +424,6 @@ def build_instructions_session_update(
     }
 
 
-def build_voice_context_session_update(settings: InworldRealtimeSettings, summary: str) -> dict[str, Any]:
-    """Partial session.update carrying only the voice-context note."""
-    return build_instructions_session_update(settings, voice_context_summary=summary)
-
-
 def _encode_video_frame_jpeg(frame: Any, *, max_dimension: int, quality: int = 70) -> str | None:
     """Downscale + JPEG-encode a LiveKit video frame into a data URL, or None.
 
@@ -593,7 +583,15 @@ class ArcheTransport:
     Adapters push caller audio into session.handle_input_pcm() / camera frames
     into session.set_video_frame(), and receive Arche's audio + a scrubbed
     event stream back through this interface.
+
+    ``relays_events`` declares whether emit_event actually delivers anywhere.
+    The core checks it before scrubbing: the scrub is a full recursive copy
+    run per relayed event (per transcript token during every assistant turn),
+    and paying it to feed a no-op would waste work for the life of every
+    conversation on a transport that discards events.
     """
+
+    relays_events = True
 
     def bind(self, session: "ArcheRealtimeSession") -> None:
         raise NotImplementedError
@@ -616,6 +614,10 @@ class ArcheTransport:
 
 class LiveKitTransport(ArcheTransport):
     """LiveKit room adapter: mic/camera tracks in, published audio track out."""
+
+    # Media-plane transport: events stay server-side (emit_event is a no-op),
+    # so the core skips the scrub copy entirely.
+    relays_events = False
 
     def __init__(self, room: rtc.Room) -> None:
         self.room = room
@@ -807,11 +809,6 @@ class ArcheRealtimeSession:
         self.settings = settings
         self.transport = transport
         transport.bind(self)
-        # Vision gating is transport-specific: the product camera path stays
-        # behind VISION_CONTEXT_ENABLED (ambient capture needs a deliberate
-        # flag), while API sessions inject a forced-enabled config — a client
-        # explicitly sending input_image IS the opt-in (see arche_api).
-        self._vision_config_override = vision_config
         self._tasks: set[asyncio.Task[Any]] = set()
         self._closed = asyncio.Event()
         self._ws: aiohttp.ClientWebSocketResponse | None = None
@@ -849,10 +846,12 @@ class ArcheRealtimeSession:
         # a camera track (if the user publishes one) is sampled at a fixed
         # cadence and described via vision_context.describe_frame(). See
         # vision_context.py for the model-agnostic OpenRouter call.
+        # Vision gating is transport-specific: the product camera path stays
+        # behind VISION_CONTEXT_ENABLED (ambient capture needs a deliberate
+        # flag), while API sessions inject a forced-enabled config — a client
+        # explicitly sending input_image IS the opt-in (see arche_api).
         self._vision_config: VisionContextConfig = (
-            self._vision_config_override
-            if self._vision_config_override is not None
-            else load_vision_context_config()
+            vision_config if vision_config is not None else load_vision_context_config()
         )
         self.latest_vision_summary: str | None = None
         self._last_vision_context_sent_at = 0.0
@@ -1212,9 +1211,11 @@ class ArcheRealtimeSession:
         msg_type = str(payload.get("type") or "")
 
         # API clients get a scrubbed subset of the event stream (transcripts,
-        # lifecycle, VAD). No-op for LiveKit sessions. Audio reaches clients
-        # via transport.write_output_pcm, not here.
-        if msg_type in _CLIENT_RELAY_EVENT_TYPES:
+        # lifecycle, VAD). Skipped wholesale for LiveKit sessions
+        # (relays_events=False) so the scrub's recursive copy is never paid to
+        # feed a no-op. Audio reaches clients via transport.write_output_pcm,
+        # not here.
+        if msg_type in _CLIENT_RELAY_EVENT_TYPES and self.transport.relays_events:
             try:
                 await self.transport.emit_event(scrub_event_for_client(payload))
             except Exception as exc:  # noqa: BLE001 - a client hiccup must not break the session
@@ -1634,7 +1635,6 @@ class InworldRealtimeLiveKitBridge(ArcheRealtimeSession):
             calibration_enabled=calibration_enabled,
             memory_task=memory_task,
         )
-        self.room = room
 
 
 async def run_inworld_realtime_bridge(

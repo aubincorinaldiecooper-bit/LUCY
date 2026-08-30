@@ -11,19 +11,18 @@ from dotenv import load_dotenv
 from livekit.agents import JobContext, WorkerOptions, cli
 from inworld_realtime_bridge import run_inworld_realtime_bridge
 from memory_layer import (
-    EMOTIONAL_PATTERN_PREFIX,  # noqa: F401 - re-exported for calibration tests + callers
     MemoryLayer,
-    emotional_pattern_preload_note,
     identity_from_metadata,
     memory_enabled,
-    partition_emotional_patterns,
+    preload_with_note,
 )
 
 load_dotenv()
 logger = logging.getLogger(__name__)
 
 
-from system_prompt import DEFAULT_SYSTEM_PROMPT, SYSTEM_PROMPT  # noqa: E402,F401
+from env_utils import env_bool  # noqa: E402
+from system_prompt import SYSTEM_PROMPT  # noqa: E402
 
 
 _active_memory_layer: MemoryLayer | None = None
@@ -54,12 +53,6 @@ def _deployment_git_commit_sha() -> str:
     except Exception:
         return "n/a"
 
-
-def env_bool(name: str, default: bool = False) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    return value.strip().lower() in ("1", "true", "yes", "on")
 
 RUN_DB_MIGRATIONS_ON_STARTUP = env_bool("RUN_DB_MIGRATIONS_ON_STARTUP", False)
 
@@ -101,15 +94,11 @@ def _run_db_migrations_on_startup() -> None:
 def _realtime_metadata_candidates(ctx: JobContext) -> list[Any]:
     """Gather job/room/participant metadata for identity resolution.
 
-    Deliberately does NOT reuse ``_metadata_candidates_from_context`` /
-    ``_metadata_debug_entries_from_context``: both route every lookup through
-    ``_safe_attr``, which is a logging helper that ``str()``-converts
-    whatever it fetches. Chaining it (``_safe_attr(_safe_attr(ctx, "job"),
-    "metadata")``) calls ``getattr`` on the *stringified* job object, which
-    always fails and silently falls back to the default — so those two
-    helpers never actually return real metadata. Uses plain ``getattr`` here
-    so job-level metadata (how the signed-in user id actually arrives, per
-    SESSION_IDENTITY_SHARED_SECRET) is genuinely read.
+    Plain ``getattr`` chains on purpose: metadata must be read as real
+    objects, never stringified along the way, so job-level metadata (how the
+    signed-in user id actually arrives, per SESSION_IDENTITY_SHARED_SECRET)
+    is genuinely read. The legacy helpers that once wrapped this in a
+    str()-converting logging shim are gone.
     """
     candidates: list[Any] = []
     job = getattr(ctx, "job", None)
@@ -141,10 +130,10 @@ def _room_name_from_context(ctx: JobContext) -> str | None:
 async def _build_memory_layer_for_realtime(ctx: JobContext) -> tuple[MemoryLayer | None, str | None]:
     """Resolve identity + preload long-term memory for the Inworld Realtime path.
 
-    Mirrors entrypoint()'s legacy-pipeline memory setup (identity resolution,
-    preload, emotional-pattern note split) so a returning user gets the same
-    continuity on the realtime engine. Never raises — a resolution failure
-    degrades to no memory for this session rather than blocking voice startup.
+    Identity resolution + preload + emotional-pattern note split (the note
+    itself is built by memory_layer.preload_with_note, shared with the API
+    front door). Never raises — a resolution failure degrades to no memory
+    for this session rather than blocking voice startup.
     """
     global _active_memory_layer
     # Reset unconditionally first: a pre-warmed worker process handles many
@@ -159,21 +148,16 @@ async def _build_memory_layer_for_realtime(ctx: JobContext) -> tuple[MemoryLayer
         room_name = _room_name_from_context(ctx)
         memory_identity = identity_from_metadata(metadata_candidates, fallback_guest_id=room_name)
         memory_layer_instance = MemoryLayer(memory_identity)
-        try:
-            preloaded_memories = await asyncio.wait_for(memory_layer_instance.preload(), timeout=2.0)
-        except asyncio.TimeoutError:
-            preloaded_memories = []
+        preloaded_memories, memory_preload_note, timed_out = await preload_with_note(
+            memory_layer_instance
+        )
+        if timed_out:
             logger.warning("memory_preload status=timeout timeout_seconds=2.0 engine=inworld_realtime")
-        general_memories, emotional_patterns = partition_emotional_patterns(preloaded_memories)
-        general_note = MemoryLayer.preload_note(general_memories)
-        emotional_note = emotional_pattern_preload_note(emotional_patterns)
-        memory_preload_note = "\n\n".join(n for n in (general_note, emotional_note) if n) or None
         logger.info(
-            "Memory layer startup: memory_enabled=true engine=inworld_realtime memory_scope=%s memory_identity_present=%s preloaded_memory_count=%s emotional_pattern_count=%s preload_note_present=%s",
+            "Memory layer startup: memory_enabled=true engine=inworld_realtime memory_scope=%s memory_identity_present=%s preloaded_memory_count=%s preload_note_present=%s",
             memory_identity.scope,
             memory_identity.present,
-            len(general_memories),
-            len(emotional_patterns),
+            len(preloaded_memories),
             bool(memory_preload_note),
         )
         _active_memory_layer = memory_layer_instance

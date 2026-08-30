@@ -15,8 +15,8 @@ Hard rules baked in here:
   - it's a weak signal: low-confidence emotion collapses to neutral so it can't
     force expressive tags downstream.
 
-Pure (config + message builders + parse + normalize) so it's unit testable without
-a live WebSocket. Inworld voice profiling is English-only today; for other
+Pure parse + normalize (no I/O) so it's unit testable without a live
+WebSocket. Inworld voice profiling is English-only today; for other
 languages this simply yields a neutral profile.
 """
 
@@ -77,7 +77,6 @@ class NormalizedVoiceProfile:
         return ", ".join(parts)
 
 
-NEUTRAL_PROFILE = NormalizedVoiceProfile()
 
 def _profile_node(message: dict) -> dict | None:
     """Find the voiceProfile object regardless of camel/snake nesting."""

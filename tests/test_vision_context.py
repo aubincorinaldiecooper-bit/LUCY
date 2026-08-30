@@ -10,11 +10,11 @@ Pins the product rules:
 """
 
 import asyncio
-import types
 import unittest
 from unittest import mock
 
 import vision_context as vc
+from vision_fixtures import FakeResponse as _FakeResponse, FakeSession as _FakeSession, patch_aiohttp
 
 
 def _config(**overrides):
@@ -63,53 +63,8 @@ class LoadConfigTests(unittest.TestCase):
         self.assertEqual(cfg.max_frame_dimension, 512)
 
 
-class _FakeResponse:
-    def __init__(self, status, json_body=None, text_body=""):
-        self.status = status
-        self._json_body = json_body
-        self._text_body = text_body
-
-    async def json(self):
-        return self._json_body
-
-    async def text(self):
-        return self._text_body
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc):
-        return False
-
-
-class _FakeSession:
-    def __init__(self, response=None, raise_on_post=None):
-        self._response = response
-        self._raise_on_post = raise_on_post
-        self.last_request = None
-
-    def post(self, url, headers=None, json=None):
-        if self._raise_on_post is not None:
-            raise self._raise_on_post
-        self.last_request = {"url": url, "headers": headers, "json": json}
-        return self._response
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc):
-        return False
-
-
 def _patch_aiohttp(fake_session):
-    # vision_context imports aiohttp at module level (not inside the function),
-    # so the fake must replace the name bound in that module's namespace —
-    # patching sys.modules would be a no-op against the already-bound reference.
-    fake_aiohttp = types.SimpleNamespace(
-        ClientSession=lambda timeout=None: fake_session,
-        ClientTimeout=lambda **k: None,
-    )
-    return mock.patch.object(vc, "aiohttp", fake_aiohttp)
+    return patch_aiohttp(vc, fake_session)
 
 
 class DescribeFrameTests(unittest.TestCase):

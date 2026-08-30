@@ -4,14 +4,16 @@ import { motion } from "framer-motion";
 import { Mic, MicOff, PhoneOff, Video, VideoOff } from "lucide-react";
 import { useState } from "react";
 import { SiriWave } from "@/components/ui/siri-wave";
+// One owner for the vision flag (also gates camera auto-publish in the hook);
+// the backend additionally ignores video tracks unless its own
+// VISION_CONTEXT_ENABLED is on, so rendering the button without the flag would
+// be a dead control.
+import { VISION_ENABLED } from "@/hooks/useVoiceClient";
 import { BrandHome } from "./BrandHome";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { PageTransition } from "./PageTransition";
 
-// The camera button only renders when vision context is deliberately enabled —
-// the backend ignores video tracks unless its own VISION_CONTEXT_ENABLED flag
-// is on, so offering the button without it would be a dead control.
-const VISION_ENABLED = process.env.NEXT_PUBLIC_VISION_ENABLED === "true";
+
 
 function formatTime(seconds: number) {
   const minutes = Math.floor(seconds / 60);

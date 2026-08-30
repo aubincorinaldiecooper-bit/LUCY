@@ -20,45 +20,13 @@ import unittest
 from unittest import mock
 
 import inworld_realtime_bridge as irb
+from bridge_fixtures import FakeWs, make_realtime_settings
 from inworld_voice_profile import NormalizedVoiceProfile
 from vision_context import VisionContextConfig
 
 
-def _settings(**overrides):
-    kwargs = dict(
-        api_key="k",
-        session_id="s",
-        websocket_url="wss://example.test/session",
-        model="openai/gpt-4o-mini",
-        stt_model="assemblyai/u3-rt-pro",
-        tts_model="inworld-tts-2",
-        voice="Luna",
-        speed=1.0,
-        turn_detection_type="semantic_vad",
-        turn_detection_eagerness="medium",
-        turn_detection_create_response=True,
-        turn_detection_interrupt_response=True,
-        instructions="Be concise.",
-        timeout_seconds=60.0,
-        voice_profile_enabled=True,
-        input_format="pcm16",
-        output_format="pcm16",
-        auth_scheme="basic",
-        tts_delivery_mode="CREATIVE",
-        tts_segmenter_strategy="full_turn",
-        tts_steering_handling="emit_once",
-        emotion_confidence_floor=0.5,
-    )
-    kwargs.update(overrides)
-    return irb.InworldRealtimeSettings(**kwargs)
-
-
-class _FakeWs:
-    def __init__(self):
-        self.sent = []
-
-    async def send_json(self, payload):
-        self.sent.append(payload)
+_settings = make_realtime_settings
+_FakeWs = FakeWs
 
 
 def _make_bridge():
@@ -239,7 +207,9 @@ class BuilderTests(unittest.TestCase):
         self.assertIn("never mention", note.lower())
 
     def test_session_update_builder_keeps_base_instructions(self):
-        update = irb.build_voice_context_session_update(_settings(), "energy low, tension low, certainty medium")
+        update = irb.build_instructions_session_update(
+            _settings(), voice_context_summary="energy low, tension low, certainty medium"
+        )
         self.assertEqual(update["session"]["type"], "realtime")
         self.assertTrue(update["session"]["instructions"].startswith("Be concise."))
         self.assertIn("energy low", update["session"]["instructions"])

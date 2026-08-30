@@ -16,8 +16,8 @@ dataset), but they are server-side only: nothing in this module flows back to
 the model or the user. Writes are best-effort and happen on a background task
 through a bounded queue so the realtime audio path never blocks on Postgres.
 
-The CalibrationTracker ports the legacy pipeline's calibration heuristics
-(agent.py) to the Inworld Realtime path: at most one pending question at a
+The CalibrationTracker carries the calibration heuristics for the Inworld
+Realtime path: at most one pending question at a
 time, a minimum user-turn cadence, questions only when emotionally useful,
 always phrased as gentle or-questions the user can correct — never "I
 detected" / "you sound".
@@ -28,6 +28,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+
+from env_utils import env_bool as _env_bool
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -52,13 +54,6 @@ INSERT INTO emotional_calibration_moments
      user_confirmed_or_corrected, inferred_emotional_pattern, normalized_profile)
 VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)
 """
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    raw = os.getenv(name)
-    if raw is None or not raw.strip():
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 @dataclass
@@ -223,7 +218,7 @@ def build_emotional_dataset_writer_from_env() -> EmotionalDatasetWriter | None:
 
 
 # ---------------------------------------------------------------------------
-# Calibration (ground truth) — heuristics ported from the legacy pipeline.
+# Calibration (ground truth) heuristics.
 # ---------------------------------------------------------------------------
 
 _EMOTIONALLY_RELEVANT_TOKENS = (
@@ -324,10 +319,10 @@ def remember_confirmed_pattern(memory_layer: Any, moment: dict[str, Any]) -> Non
     """Best-effort durable write of a user-confirmed emotional pattern.
 
     No-ops for a missing memory layer, an unconfirmed/corrected-away moment, or
-    an empty inferred pattern. Shared by the legacy pipeline (agent.py) and the
-    Inworld Realtime bridge so a confirmed calibration moment informs future
-    sessions via the same MemoryLayer.preload() path either way. Never raises —
-    a memory write must not break the turn that triggered it.
+    an empty inferred pattern. Called by the Inworld Realtime bridge so a
+    confirmed calibration moment informs future sessions via the same
+    MemoryLayer.preload() path. Never raises — a memory write must not break
+    the turn that triggered it.
     """
     if memory_layer is None or not moment.get("user_confirmed_or_corrected"):
         return

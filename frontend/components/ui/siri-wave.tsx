@@ -15,7 +15,7 @@ import { cn } from "@/lib/utils"
  * `siriWaveCore` / `siriFluidDotsCore` sources.
  */
 
-export type SiriWaveVariant = "wave" | "fluid-dots"
+type SiriWaveVariant = "wave" | "fluid-dots"
 
 const VERTEX_SHADER = `attribute vec2 aPos; void main(){ gl_Position=vec4(aPos,0.0,1.0); }`
 
@@ -265,7 +265,7 @@ const FRAGMENT_SHADERS: Record<SiriWaveVariant, string> = {
   "fluid-dots": FLUID_DOTS_SHADER,
 }
 
-export interface SiriWaveProps
+interface SiriWaveProps
   extends Omit<React.HTMLAttributes<HTMLCanvasElement>, "children"> {
   /** Which shader to render. */
   variant?: SiriWaveVariant
@@ -379,5 +379,3 @@ export function SiriWave({
     />
   )
 }
-
-export default SiriWave
